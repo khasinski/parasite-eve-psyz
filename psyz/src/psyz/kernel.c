@@ -517,6 +517,10 @@ static void StartIrqThread(void) {
         return;
     }
     KernelInit();
+    if (Psyz_OsVirtualClock()) {
+        irq_thread_state = -1; // timers are polled as the virtual clock moves
+        return;
+    }
     irq_thread_state = Psyz_OsThreadStart(IrqThread, "psyz_irq") ? -1 : 1;
 }
 

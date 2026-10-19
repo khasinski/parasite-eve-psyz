@@ -221,6 +221,10 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
          .buffer_slot = 0,
          .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4,
          .offset = offsetof(Vertex, twin)},
+        {.location = 4,
+         .buffer_slot = 0,
+         .format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4,
+         .offset = offsetof(Vertex, uv_bounds)},
     };
     // the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
     static const SDL_GPUColorTargetBlendState blend[BLEND_COUNT] = {
@@ -1225,6 +1229,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             }
 
             SET_TC_ALL(vertex_cur, tpage, clut);
+            if (isTextured) {
+                Draw_SetUvBounds(vertex_cur, nVertices);
+            }
             Draw_EnqueueBuffer(nVertices, nIndices);
         } else {
             // shouldn't happen on a normal PSX application

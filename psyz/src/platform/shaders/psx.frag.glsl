@@ -12,13 +12,14 @@ layout(location = 8) flat in uint indexMask;
 layout(location = 9) flat in uint dither;
 layout(location = 10) flat in ivec2 pageBase;
 layout(location = 11) flat in uvec4 texWindow;
+layout(location = 12) flat in uvec4 uvBounds;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 
 uvec2 resolveTexel() {
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
     vec2 uv = rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
-    uvec2 texel = uvec2(clamp(floor(uv), vec2(0.0), vec2(255.0)));
+    uvec2 texel = uvec2(clamp(floor(uv), vec2(uvBounds.xy), vec2(uvBounds.zw)));
     return (texel & texWindow.xy) | texWindow.zw;
 }
 

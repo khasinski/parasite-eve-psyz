@@ -10,6 +10,11 @@
 // two readings through their signed difference.
 uint32_t Psyz_OsNowUs(void);
 
+// Deterministic time (PSYZ_VIRTUAL_CLOCK=1): nonzero when enabled; the
+// clock then moves only by Psyz_OsAdvanceClock.
+int Psyz_OsVirtualClock(void);
+void Psyz_OsAdvanceClock(uint64_t ns);
+
 // Identifier of the calling thread, never 0.
 uintptr_t Psyz_OsThreadSelf(void);
 

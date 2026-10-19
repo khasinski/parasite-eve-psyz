@@ -53,3 +53,8 @@ int Psyz_OsThreadStart(void (*fn)(void), const char* name) {
     sceKernelStartThread(thid, sizeof(fn), &fn);
     return 0;
 }
+
+/* The virtual clock is an SDL-host feature for deterministic runs. */
+int Psyz_OsVirtualClock(void) { return 0; }
+
+void Psyz_OsAdvanceClock(uint64_t ns) { (void)ns; }

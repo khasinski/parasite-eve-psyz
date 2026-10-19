@@ -1,4 +1,5 @@
 #include <psyz.h>
+#include "os.h"
 #include <psyz/log.h>
 #include <kernel.h>
 #include <libetc.h>
@@ -68,6 +69,10 @@ int VSync(int mode) {
         now = (unsigned int)Psyz_VideoVSync(-1);
         unsigned int advanced = now - before;
         while (advanced--) {
+            if (Psyz_OsVirtualClock()) {
+                Psyz_OsAdvanceClock(16683350); // one NTSC field
+                Psyz_KernelPoll();
+            }
             ReadPadsOnVsync();
             if (g_PsyzVsyncCb) g_PsyzVsyncCb();
             Psyz_KernelVBlank();

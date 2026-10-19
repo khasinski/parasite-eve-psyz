@@ -2,7 +2,28 @@
 #include <psyz/log.h>
 #include "../psyz/os.h"
 
-uint32_t Psyz_OsNowUs(void) { return (uint32_t)SDL_NS_TO_US(SDL_GetTicksNS()); }
+/* PSYZ_VIRTUAL_CLOCK=1: time advances only with Psyz_OsAdvanceClock (one
+ * NTSC field per blank), so headless runs are deterministic and need not
+ * wait for the wall clock. */
+static int virtual_clock = -1;
+static uint64_t virtual_ns;
+
+int Psyz_OsVirtualClock(void) {
+    if (virtual_clock < 0) {
+        const char* env = SDL_getenv("PSYZ_VIRTUAL_CLOCK");
+        virtual_clock = env && SDL_strcmp(env, "1") == 0;
+    }
+    return virtual_clock;
+}
+
+void Psyz_OsAdvanceClock(uint64_t ns) { virtual_ns += ns; }
+
+uint32_t Psyz_OsNowUs(void) {
+    if (Psyz_OsVirtualClock()) {
+        return (uint32_t)(virtual_ns / 1000);
+    }
+    return (uint32_t)SDL_NS_TO_US(SDL_GetTicksNS());
+}
 
 uintptr_t Psyz_OsThreadSelf(void) {
     return (uintptr_t)SDL_GetCurrentThreadID();

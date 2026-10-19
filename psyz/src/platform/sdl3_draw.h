@@ -31,6 +31,10 @@ typedef struct {
     unsigned short u, v, c, t;
     unsigned char r, g, b, a;
     unsigned int twin;
+    /* Texture coordinate range of the primitive: {u_min, v_min, u_max,
+     * v_max}. The PS1 never samples outside it; GPU interpolation at pixel
+     * corners can, which shows neighbouring texels along polygon edges. */
+    unsigned char uv_bounds[4];
 } Vertex;
 
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====
@@ -74,9 +78,38 @@ static void Draw_EnsureBufferWillNotOverflow(int vertices, int indices) {
         Draw_FlushBuffer();
     }
 }
+static bool uv_bounds_set;
+
+/* Textured polygons record their UV range before enqueueing; other
+ * primitives may sample the whole page. */
+static void Draw_SetUvBounds(Vertex* v, int count) {
+    unsigned u0 = 255, v0 = 255, u1 = 0, v1 = 0;
+    for (int i = 0; i < count; i++) {
+        unsigned u = v[i].u & 0xFF, t = v[i].v & 0xFF;
+        u0 = u < u0 ? u : u0;
+        u1 = u > u1 ? u : u1;
+        v0 = t < v0 ? t : v0;
+        v1 = t > v1 ? t : v1;
+    }
+    for (int i = 0; i < count; i++) {
+        v[i].uv_bounds[0] = (unsigned char)u0;
+        v[i].uv_bounds[1] = (unsigned char)v0;
+        v[i].uv_bounds[2] = (unsigned char)u1;
+        v[i].uv_bounds[3] = (unsigned char)v1;
+    }
+    uv_bounds_set = true;
+}
+
 static void Draw_EnqueueBuffer(int vertices, int indices) {
     assert(n_vertices + vertices <= MAX_VERTEX_COUNT);
     assert(n_indices + indices <= MAX_INDEX_COUNT);
+    if (!uv_bounds_set) {
+        for (int i = 0; i < vertices; i++) {
+            vertex_cur[i].uv_bounds[0] = vertex_cur[i].uv_bounds[1] = 0;
+            vertex_cur[i].uv_bounds[2] = vertex_cur[i].uv_bounds[3] = 255;
+        }
+    }
+    uv_bounds_set = false;
 
     vertex_cur += vertices;
     index_cur += indices;
