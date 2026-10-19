@@ -58,8 +58,9 @@ void SpuNGetVoiceAttr(int vNum, SpuVoiceAttr* arg) {
     arg->volmode.right = (short)volume_mode(&right);
     arg->volume.left = volume_value(left);
     arg->volume.right = volume_value(right);
-    arg->volumex.left = (short)Psyz_SpuRead(0x200 + vNum * 4);
-    arg->volumex.right = (short)Psyz_SpuRead(0x202 + vNum * 4);
+    /* Current voice volumes (0x1F801E00) are not emulated. */
+    arg->volumex.left = 0;
+    arg->volumex.right = 0;
     arg->pitch = SPURV(vNum, pitch);
     u16 center = _spu_voice_centerNote[vNum];
     int note = pitch_to_note(center >> 8, center & 0xFF, arg->pitch);
