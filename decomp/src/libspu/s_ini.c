@@ -3,6 +3,9 @@
 #include <libapi.h>
 #include <libetc.h>
 #include "libspu_private.h"
+#ifdef __psyz
+#include <psyz/audio.h>
+#endif
 
 static int D_800D0B80[] = {0x15117350, 0x0040B49C};
 int _spu_EVdma = 0;
@@ -26,6 +29,11 @@ int _spu_isCalled = 0;
 void _SpuInit(int bHot) {
     int i;
 
+#ifdef __psyz
+    /* Start the host audio device that pulls samples from the SPU emulation;
+     * without it only CD-DA/XA (libcd) would ever open the device. */
+    Psyz_AudioInit();
+#endif
     ResetCallback();
     _spu_init(bHot);
 

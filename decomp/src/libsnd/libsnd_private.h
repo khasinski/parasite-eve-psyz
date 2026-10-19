@@ -206,6 +206,26 @@ extern SPU_RXX* _svm_sreg;
 #endif
 
 extern struct SeqStruct* _ss_score[32];
+#ifdef __psyz
+/* Host-side guard: the score slot for sep/seq, or NULL when the access numbers
+ * are outside the table set up by SsSetTableSize (e.g. sep == -1 when nothing
+ * is open). On PS1 such calls silently scribble memory; here they are no-ops. */
+static inline struct SeqStruct* _SsScore(int sep, int seq) {
+    if (sep < 0 || sep >= _snd_seq_s_max || sep >= 32 || seq < 0 ||
+        seq >= _snd_seq_t_max || _ss_score[sep] == NULL) {
+        return NULL;
+    }
+    return &_ss_score[sep][seq];
+}
+/* Typed views of the SsFCALL slots (declared as unprototyped sCb). */
+typedef void (*SsFnNoteOn)(short, short, unsigned char, unsigned char);
+typedef void (*SsFnEvent)(short, short, unsigned char);
+typedef void (*SsFnEvent2)(short, short);
+typedef void (*SsFnNrpnAttr)(
+    short, short, short, VagAtr, short, unsigned char);
+#define _SsScoreOf(seq_sep_no)                                                 \
+    _SsScore((seq_sep_no) & 0xFF, ((seq_sep_no) >> 8) & 0xFF)
+#endif
 extern s32 _svm_brr_start_addr[];
 extern short kMaxPrograms;
 extern struct struct_svm _svm_cur;
@@ -291,6 +311,24 @@ int _SsVmVSetUp(short vabId, short prog);
 void _SsVmDoAllocate(void);
 
 void _SsNoteOn(short a0, short a1, unsigned char a2, unsigned char a3);
+void _SsGetSeqData(short sep_access_num, short seq_num);
+void _SsSeqGetEof(short sep_access_num, short seq_num);
+void _SsSndNextSep(short sep_access_num, short seq_num);
+short _SsVmKeyOn(int seq_sep_no, short vabId, short prog, short note,
+                 short voll, short pan);
+short _SsVmKeyOff(int seq_sep_no, short vabId, short prog, short note);
+int _SsVmSelectToneAndVag(u8* vag_list, u8* tone_list);
+short _SsVmSetVol(short seq_sep_no, short vabId, short prog, short vol,
+                  short pan);
+short _SsVmPBVoice(short voice, short seq_sep_no, short vabId, short prog,
+                   short pitch);
+short _SsVmPitchBend(short seq_sep_no, short vabId, short prog, short pitch);
+void _SsVmDamperOn(void);
+void _SsVmKeyOffNow(int mode);
+unsigned short note2pitch(void);
+short SsUtGetVagAtr(short vabId, short prog, short toneNum, VagAtr* vagatrptr);
+short SsUtSetVagAtr(short vabId, short prog, short toneNum, VagAtr* vagatrptr);
+short SsUtGetProgAtr(short vabId, short progNum, ProgAtr* progatrptr);
 void _SsSetProgramChange(short a0, short a1, unsigned char a2);
 void _SsGetMetaEvent(short a0, short a1, unsigned char a2);
 void _SsSetPitchBend(short a0, short a1);

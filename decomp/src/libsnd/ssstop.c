@@ -1,6 +1,11 @@
 #include "libsnd_private.h"
 
 void _SsSndStop(short sep_access_num, short seq_num) {
+#ifdef __psyz
+    if (_SsScore(sep_access_num, seq_num) == NULL) {
+        return;
+    }
+#endif
     struct SeqStruct* score;
     int i;
 

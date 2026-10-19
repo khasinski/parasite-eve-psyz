@@ -1,6 +1,7 @@
 #include <psyz.h>
 #include <libapi.h>
 #include <psyz/log.h>
+#include <string.h>
 #include <sys/stat.h>
 #include "../internal.h"
 
@@ -137,7 +138,17 @@ long _card_write(long chan, long block, unsigned char* buf) {
 
 long _card_read(long chan, long block, unsigned char* buf) {
     LOG_ONCE("raw sectors are not emulated, only the completion event");
-    (void)block;
-    (void)buf;
+    /* Cards are host directories and always formatted: the header frame of
+     * block 0 carries the "MC" signature games test for. */
+    if (buf && block == 0 && validate_chan(chan)) {
+        unsigned char checksum = 0;
+        memset(buf, 0, 128);
+        buf[0] = 'M';
+        buf[1] = 'C';
+        for (int i = 0; i < 127; i++) {
+            checksum ^= buf[i];
+        }
+        buf[127] = checksum;
+    }
     return card_op(0, chan);
 }

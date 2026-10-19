@@ -1,6 +1,11 @@
 #include "libsnd_private.h"
 
 void _SsClose(s16 seq_sep_num) {
+#ifdef __psyz
+    if (_SsScore(seq_sep_num, 0) == NULL) {
+        return;
+    }
+#endif
     s32 seq_num;
     _SsVmSetSeqVol(seq_sep_num, 0, 0, 1);
     _SsVmSeqKeyOff(seq_sep_num);

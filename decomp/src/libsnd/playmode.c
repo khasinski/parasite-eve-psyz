@@ -2,6 +2,11 @@
 
 void Snd_SetPlayMode(
     short sep_access_num, short seq_num, u8 play_mode, short l_count) {
+#ifdef __psyz
+    if (_SsScore(sep_access_num, seq_num) == NULL) {
+        return;
+    }
+#endif
     struct SeqStruct* score = &_ss_score[sep_access_num][seq_num];
 
     score->seq_ptr = score->read_pos;

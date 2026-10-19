@@ -2,6 +2,11 @@
 
 void _SsSndSetVolData(
     short sep_access_num, short seq_num, short vol, int v_time) {
+#ifdef __psyz
+    if (_SsScore(sep_access_num, seq_num) == NULL) {
+        return;
+    }
+#endif
     struct SeqStruct* score;
     int vol_abs;
 
@@ -15,6 +20,11 @@ void _SsSndSetVolData(
     if (vol == 0) {
         return;
     }
+#ifdef __psyz
+    if (v_time <= 0) {
+        v_time = 1;
+    }
+#endif
     vol_abs = vol > 0 ? vol : -vol;
     score->vol_l = vol;
     score->v_time_l = v_time;

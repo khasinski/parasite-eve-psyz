@@ -9,7 +9,14 @@ short _SsVmSetSeqVol(short seq_sep_no, u16 voll, u16 volr, short arg3) {
     u8 pan;
     short i;
 
+#ifdef __psyz
+    score = _SsScoreOf(seq_sep_no);
+    if (score == NULL) {
+        return seq_sep_no;
+    }
+#else
     score = &_ss_score[seq_sep_no & 0xFF][(seq_sep_no & 0xFF00) >> 8];
+#endif
     _svm_cur.seq_sep_no = seq_sep_no;
     if (voll == 0) {
         voll = 1;
@@ -75,11 +82,35 @@ short _SsVmSetSeqVol(short seq_sep_no, u16 voll, u16 volr, short arg3) {
     return _svm_cur.seq_sep_no;
 }
 
+#ifndef __psyz
 INCLUDE_ASM("asm/nonmatchings/libsnd/vm_seq", _SsVmGetSeqVol);
 
 INCLUDE_ASM("asm/nonmatchings/libsnd/vm_seq", _SsVmGetSeqLVol);
 
 INCLUDE_ASM("asm/nonmatchings/libsnd/vm_seq", _SsVmGetSeqRVol);
+#else
+void _SsVmGetSeqVol(short seq_sep_no, short* voll, short* volr) {
+    struct SeqStruct* score = _SsScoreOf(seq_sep_no);
+
+    if (score == NULL) {
+        *voll = 0;
+        *volr = 0;
+        return;
+    }
+    *voll = score->voll;
+    *volr = score->volr;
+}
+
+short _SsVmGetSeqLVol(short seq_sep_no) {
+    struct SeqStruct* score = _SsScoreOf(seq_sep_no);
+    return score ? score->voll : 0;
+}
+
+short _SsVmGetSeqRVol(short seq_sep_no) {
+    struct SeqStruct* score = _SsScoreOf(seq_sep_no);
+    return score ? score->volr : 0;
+}
+#endif
 
 void _SsVmSeqKeyOff(s16 seq_sep_num) {
     u8 i;

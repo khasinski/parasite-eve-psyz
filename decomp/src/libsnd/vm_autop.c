@@ -1,6 +1,35 @@
 #include "libsnd_private.h"
 
+#ifndef __psyz
 INCLUDE_ASM("asm/nonmatchings/libsnd/vm_autop", SeAutoPan);
+#else
+/* Set up an automatic pan sweep from start_pan to end_pan over delta_time
+ * VSync ticks; SetAutoPan advances it from _SsVmFlush. */
+void SeAutoPan(short voice, short start_pan, short end_pan, short delta_time) {
+    int diff = end_pan - start_pan;
+    int adiff = diff < 0 ? -diff : diff;
+
+    _svm_voice[voice].start_pan = start_pan;
+    _svm_voice[voice].end_pan = end_pan;
+    if (diff == 0 || delta_time <= 0) {
+        _svm_voice[voice].start_pan = end_pan;
+        _svm_voice[voice].unk2a = diff;
+        _svm_voice[voice].unk2c = 0;
+        _svm_voice[voice].unk2e = 0;
+        _svm_voice[voice].auto_pan = diff != 0;
+        return;
+    }
+    if (adiff < delta_time) {
+        _svm_voice[voice].unk2a = diff > 0 ? 1 : -1;
+        _svm_voice[voice].unk2c = delta_time / adiff;
+    } else {
+        _svm_voice[voice].unk2a = diff / delta_time;
+        _svm_voice[voice].unk2c = 0;
+    }
+    _svm_voice[voice].unk2e = _svm_voice[voice].unk2c;
+    _svm_voice[voice].auto_pan = 1;
+}
+#endif
 
 void SetAutoPan(short voice) {
     unsigned voll_t, volr_t;
