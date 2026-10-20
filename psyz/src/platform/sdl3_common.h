@@ -157,7 +157,13 @@ static void SetWindowSizeInPixels(int width, int height) {
     SDL_SetWindowSize(sdl3_window, actual_width, actual_height);
 }
 
+static float aspect_override;
+void Psyz_VideoSetAspectRatio(float ratio) { aspect_override = ratio > 0.0f ? ratio : 0.0f; }
+
 static float GetCurrentGameAspectRatio(int disp_w, int disp_h) {
+    if (aspect_override > 0.0f) {
+        return aspect_override;
+    }
     if (aspect_mode == PSYZ_ASPECT_DISPLAY) {
         float vref = is_pal ? 288.0f : 240.0f;
         return (4.0f / 3.0f) * ((float)set_disp_horiz / 256.0f) /
@@ -394,6 +400,11 @@ static bool Sdl3Common_IsInBackground(void) {
 }
 
 int Psyz_QuitRequested(void) { return SDL_GetAtomicInt(&quit_requested) != 0; }
+
+static SDL_AtomicInt escape_is_menu;
+static SDL_AtomicInt escape_pressed;
+void Psyz_EscapeIsMenu(int enable) { SDL_SetAtomicInt(&escape_is_menu, enable != 0); }
+int Psyz_EscapePressed(void) { return SDL_SetAtomicInt(&escape_pressed, 0) != 0; }
 
 // Initialize the timing/vsync state. Call once at the end of InitPlatform.
 static void Sdl3Common_TimingInit(void) {
@@ -928,7 +939,12 @@ static void PollEvents(void) {
 #ifndef PLATFORM_IOS
         case SDL_EVENT_KEY_DOWN:
             if (event.key.scancode == SDL_SCANCODE_ESCAPE) {
-                SDL_SetAtomicInt(&quit_requested, 1);
+                if (SDL_GetAtomicInt(&escape_is_menu)) {
+                    if (!event.key.repeat)
+                        SDL_SetAtomicInt(&escape_pressed, 1);
+                } else {
+                    SDL_SetAtomicInt(&quit_requested, 1);
+                }
             }
             if (event.key.scancode == SDL_SCANCODE_F6) {
                 debug_show_vram ^= 1;

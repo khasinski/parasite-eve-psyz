@@ -138,6 +138,14 @@ PsyzAspectMode Psyz_VideoGetAspectMode(void);
 int Psyz_VideoSetAspectMode(PsyzAspectMode mode);
 
 /**
+ * @brief Force the presented aspect ratio (width / height), e.g. 16.0f / 9.0f
+ *
+ * Overrides the aspect mode on SDL targets. Zero restores the automatic
+ * choice.
+ */
+void Psyz_VideoSetAspectRatio(float ratio);
+
+/**
  * @brief Get the resolution a game should target to render pixel-perfect
  *
  * Fixed-display targets (PSP, and future NDS/Saturn) return a physical size

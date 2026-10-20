@@ -70,6 +70,14 @@ void Psyz_GteCtrlWrite(unsigned reg, unsigned int value);
  * by tests that run two implementations of a routine from the same state.
  */
 unsigned int Psyz_GteStateSize(void);
+
+/**
+ * @brief Scale the projected screen X of RTPS/RTPT by num/den around OFX
+ *
+ * 1/1 (the default) is the exact hardware behavior. 3/4 shows a 16:9 wide
+ * field of view when the output is stretched from 4:3 to 16:9.
+ */
+void Psyz_GteSetXScale(int num, int den);
 void Psyz_GteSaveState(void* out);
 void Psyz_GteLoadState(const void* in);
 

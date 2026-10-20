@@ -1798,6 +1798,16 @@ static unsigned clz16(unsigned x) {
 #endif
 
 // Perspective transformation of one vertex into caller locals.
+// Horizontal squeeze of the projected X (the "widescreen hack"): the game
+// draws a wider field of view into the same pixels. 1/1 is exact hardware.
+static int gte_x_num = 1, gte_x_den = 1;
+void Psyz_GteSetXScale(int num, int den) {
+    if (num > 0 && den > 0) {
+        gte_x_num = num;
+        gte_x_den = den;
+    }
+}
+
 #define RTP_VERTEX(                                                            \
     sf, lm, x, y, z, f, div, mac1, mac2, mac3, ir1, ir2, ir3, sx, sy, sz)      \
     do {                                                                       \
@@ -1824,7 +1834,8 @@ static unsigned clz16(unsigned x) {
         } else {                                                               \
             GTE_DIVIDE(div, H, sz);                                            \
         }                                                                      \
-        (sx) = OFX + MUL_DIV_HI(div, ir1);                                     \
+        (sx) = OFX + (int)(((long long)MUL_DIV_HI(div, ir1) * gte_x_num) /     \
+                           gte_x_den);                                         \
         MAC0_OVF(sx, f);                                                       \
         SAT_FLAG(sx, sx, -0x400, 0x3FF, FLAG_SX2_SAT, f);                      \
         (sy) = OFY + MUL_DIV_HI(div, ir2);                                     \

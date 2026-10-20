@@ -107,6 +107,19 @@ void Psyz_AdjustPathCB(int (*callback)(char* dst, const char* src, int maxlen));
 int Psyz_QuitRequested(void);
 
 /**
+ * @brief Make the Escape key a request for the game's own menu.
+ *
+ * By default Escape terminates the application. With this enabled it only
+ * latches a flag for Psyz_EscapePressed, and the game decides what to do.
+ */
+void Psyz_EscapeIsMenu(int enable);
+
+/**
+ * @brief Return non-zero once per Escape press when Psyz_EscapeIsMenu is on.
+ */
+int Psyz_EscapePressed(void);
+
+/**
  * @brief Join two path components with the platform's path separator
  *
  * Automatically handles path separators to avoid double separators.
