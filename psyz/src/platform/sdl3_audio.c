@@ -39,6 +39,12 @@ int Psyz_AudioInit(void) {
         return 0;
     }
     Psyz_SpuInit();
+    // The host pulls the samples itself (Psyz_SpuPullSamples), e.g. to write
+    // them to a file at game speed.
+    if (SDL_getenv("PSYZ_AUDIO_NO_DEVICE")) {
+        is_audio_init = true;
+        return 0;
+    }
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
             ERRORF("failed to init SDL audio: %s", SDL_GetError());
