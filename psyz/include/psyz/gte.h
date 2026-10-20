@@ -62,6 +62,18 @@ unsigned int Psyz_GteCtrlRead(unsigned reg);
 void Psyz_GteCtrlWrite(unsigned reg, unsigned int value);
 
 /**
+ * @brief Size in bytes of a GTE state snapshot
+ *
+ * Psyz_GteSaveState copies every data and control register into a buffer of
+ * this size and Psyz_GteLoadState restores it exactly, without the side
+ * effects of register writes (FIFO pushes, IRGB and LZCS conversions). Used
+ * by tests that run two implementations of a routine from the same state.
+ */
+unsigned int Psyz_GteStateSize(void);
+void Psyz_GteSaveState(void* out);
+void Psyz_GteLoadState(const void* in);
+
+/**
  * @brief Execute a GTE command (COP2 instruction)
  *
  * Dispatches a 25-bit GTE command to the corresponding operation. Bits 0-5

@@ -3258,6 +3258,25 @@ static void AVSZ3_cmd(unsigned int cmd) { AVSZ3(); }
 static void AVSZ4_cmd(unsigned int cmd) { AVSZ4(); }
 static void NOOP(unsigned int cmd) { (void)cmd; }
 
+#define GTE_STATE_FIELD(type, name) type name;
+struct gte_state {
+    GTE_REGS(GTE_STATE_FIELD)
+};
+#define GTE_STATE_SAVE(type, name) state->name = GTE(name);
+#define GTE_STATE_LOAD(type, name) GTE(name) = state->name;
+
+unsigned int Psyz_GteStateSize(void) { return sizeof(struct gte_state); }
+
+void Psyz_GteSaveState(void* out) {
+    struct gte_state* state = out;
+    GTE_REGS(GTE_STATE_SAVE)
+}
+
+void Psyz_GteLoadState(const void* in) {
+    const struct gte_state* state = in;
+    GTE_REGS(GTE_STATE_LOAD)
+}
+
 // 0x00 mirrors 0x01, verified on hardware. Undocumented on psx-spx.
 // 0x1A mirrors 0x29, verified on hardware. Also undocumented on psx-spx.
 static void (*const gte_ops[64])(unsigned int cmd) = {
