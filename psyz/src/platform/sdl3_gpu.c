@@ -2662,7 +2662,8 @@ void Draw_FlushBuffer(void) {
             const u32 color_pass[4] = {
                 semi ? 2u : 0u, target_scale,
                 draw_grid_source_width == draw_grid_target_width,
-                target_index && model_filtering ? 1u : 0u};
+                (target_index && model_filtering ? 1u : 0u) |
+                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
             SDL_PushGPUFragmentUniformData(
                 cmd, 0, color_pass, sizeof(color_pass));
 
@@ -2677,7 +2678,8 @@ void Draw_FlushBuffer(void) {
                 const u32 mask_pass[4] = {
                     1, target_scale,
                     draw_grid_source_width == draw_grid_target_width,
-                    target_index && model_filtering ? 1u : 0u};
+                    (target_index && model_filtering ? 1u : 0u) |
+                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
                 SDL_PushGPUFragmentUniformData(
                     cmd, 0, mask_pass, sizeof(mask_pass));
                 SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);

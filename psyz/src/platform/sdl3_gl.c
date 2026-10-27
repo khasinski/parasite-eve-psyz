@@ -116,6 +116,7 @@ static const char fragment_shader_body[] = {
     "flat in ivec2 pageBase;\n"
     "flat in uvec4 texWindow;\n"
     "uniform sampler2D texVram;\n"
+    "uniform bool fullColor;\n"
     "\n"
     "uvec2 resolveTexel() {\n"
     "    vec2 uv = rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;\n"
@@ -136,6 +137,7 @@ static const char fragment_shader_body[] = {
     "    -3.0, +1.0, -4.0, +0.0,"
     "    +3.0, -1.0, +2.0, -2.0);\n"
     "vec3 applyDither(vec3 c) {\n"
+    "    if (fullColor) return clamp(c, 0.0, 1.0);\n"
     "    if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / "
     "31.0;\n"
     "    int dx = int(gl_FragCoord.x) & 3;\n"
@@ -186,6 +188,8 @@ static const char fragment_shader_body[] = {
     "        modColor = dither != 0u ? prod8 / 255.0\n"
     "                                : floor(prod8 / 8.0) / 31.0;\n"
     "    }\n"
+    "    if (fullColor && textureMode != 0u) modColor = texColor.rgb * "
+    "vertexColor.rgb;\n"
     "    modColor = applyDither(modColor);\n"
     // pre-multiplied alpha output for GL_ONE, GL_ONE_MINUS_SRC_ALPHA blending
     "    if (colorSemiTrans && isSemiTrans) {\n"
@@ -222,6 +226,7 @@ static GLuint shader_program = 0;
 static GLint uniform_resolution = 0;
 static GLint uniform_tex_vram = 0;
 static GLint uniform_draw_offset = 0;
+static GLint uniform_full_color = -1;
 static GLuint vram_texture;
 static GLuint rgb24_texture, rgb24_fbo;
 static bool display_rgb24;
@@ -404,6 +409,7 @@ bool InitPlatform() {
     uniform_resolution = glGetUniformLocation(shader_program, "resolution");
     uniform_tex_vram = glGetUniformLocation(shader_program, "texVram");
     uniform_draw_offset = glGetUniformLocation(shader_program, "drawOffset");
+    uniform_full_color = glGetUniformLocation(shader_program, "fullColor");
 
     glUniform1i(uniform_tex_vram, 0);
     glUniform2f(uniform_draw_offset, 0, 0);
@@ -1526,6 +1532,7 @@ void Draw_FlushBuffer(void) {
     }
 
     glUseProgram(shader_program);
+    glUniform1i(uniform_full_color, dither_mode == PSYZ_DITHER_OFF);
     glBindVertexArray(VAO);
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
     glBufferSubData(

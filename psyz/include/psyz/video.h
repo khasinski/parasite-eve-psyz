@@ -69,7 +69,7 @@ typedef enum {
 
 typedef enum {
     PSYZ_DITHER_AUTO, /**< let the game decide whether to dither (default) */
-    PSYZ_DITHER_OFF,  /**< force dithering always off */
+    PSYZ_DITHER_OFF,  /**< disable dithering and RGB555 shading quantization on desktop GPUs */
 } PsyzDitherMode;
 
 typedef enum {

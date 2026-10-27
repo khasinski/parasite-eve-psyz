@@ -48,7 +48,7 @@ static DBuf* cdb;
 
 static void gpu_setup(void) {
     RECT clearRect = {0, 0, 0x7FFF, 0x7FFF};
-    Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_AUTO);
     Psyz_VideoSetInternalResolution(1);
     SetDefDrawEnv(&db[0].draw, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
     SetDefDispEnv(&db[0].disp, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -130,6 +130,82 @@ static void SetPolyF4Img(POLY_FT4* poly, int x, int y, int w, int h, int u,
 
 ZTEST_SETUP(gpu) { gpu_setup(); }
 ZTEST_TEARDOWN(gpu) { gpu_teardown(); }
+
+/* Off keeps RGB888 shading; Auto remains the PS1 RGB555 reference even
+ * when DRAWENV.dtd is zero. Test actual captured GPU pixels, not shader text.
+ */
+ZTEST(gpu, dithering_off_preserves_color_precision) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        zskip("requires SDL GPU");
+    u16 white[256];
+    for (unsigned i = 0; i < 256; ++i)
+        white[i] = 0xFFFF;
+    RECT texture = {512, 0, 256, 1};
+    LoadImage(&texture, (u_long*)white);
+    DrawSync(0);
+    for (unsigned scale = 1; scale <= 2; ++scale) {
+        Psyz_VideoSetInternalResolution(scale);
+        for (unsigned enabled = 0; enabled < 2; ++enabled) {
+            DRAWENV draw = db[0].draw;
+            draw.dtd = enabled;
+            PutDrawEnv(&draw);
+            for (unsigned mode = 0; mode < 3; ++mode) {
+                /* Off -> Auto -> Off also exercises a live setting change. */
+                Psyz_VideoSetDitheringMode(
+                    mode == 1 ? PSYZ_DITHER_AUTO : PSYZ_DITHER_OFF);
+                POLY_G4 gradient = {0};
+                setPolyG4(&gradient);
+                setXYWH(&gradient, 0, 8, 256, 16);
+                setRGB0(&gradient, 0, 0, 0);
+                setRGB2(&gradient, 0, 0, 0);
+                setRGB1(&gradient, 255, 255, 255);
+                setRGB3(&gradient, 255, 255, 255);
+                DrawPrim(&gradient);
+                POLY_GT4 shaded = {0};
+                setPolyGT4(&shaded);
+                setXYWH(&shaded, 0, 32, 256, 16);
+                setUVWH(&shaded, 0, 0, 255, 0);
+                shaded.tpage = GetTPage(2, 0, 512, 0);
+                setRGB0(&shaded, 0, 0, 0);
+                setRGB2(&shaded, 0, 0, 0);
+                setRGB1(&shaded, 128, 128, 128);
+                setRGB3(&shaded, 128, 128, 128);
+                DrawPrim(&shaded);
+                RECT clear = {0, 56, 256, 24};
+                ClearImage(&clear, 0, 0, 0);
+                setXYWH(&shaded, 0, 60, 256, 16);
+                setSemiTrans(&shaded, 1);
+                DrawPrim(&shaded);
+                DrawSync(0);
+                int w, h;
+                unsigned char* rgb = Psyz_VideoAllocRenderedFrame(&w, &h);
+                zassert_ptr_ne(NULL, rgb);
+                for (unsigned row = 0; row < 3; ++row) {
+                    unsigned char seen[256] = {0};
+                    unsigned count = 0;
+                    int y = (row == 0 ? 12 : row == 1 ? 36 : 64) * scale;
+                    for (int x = 0; x < 256 * (int)scale; ++x) {
+                        unsigned value = rgb[(y * w + x) * 3];
+                        if (!seen[value]) {
+                            seen[value] = 1;
+                            ++count;
+                        }
+                    }
+                    if (mode == 1)
+                        zexpect_s32_eq(1, count <= 32);
+                    else
+                        zexpect_s32_eq(1, count > (row == 2 ? 90 : 180));
+                }
+                free(rgb);
+            }
+        }
+    }
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_AUTO);
+    Psyz_VideoSetInternalResolution(1);
+#endif
+}
 
 ZTEST(gpu, supersampling_at_max_resolution_preserves_requested_size) {
 #if defined(__psyz) && !defined(__PSP__)

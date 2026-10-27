@@ -56,6 +56,8 @@ const mat4 ditherMatrix = mat4(
     -3.0, +1.0, -4.0, +0.0,
     +3.0, -1.0, +2.0, -2.0);
 vec3 applyDither(vec3 c) {
+    // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
+    if ((passMode.w & 2u) != 0u) return clamp(c, 0.0, 1.0);
     if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;
     int dx = int(gl_FragCoord.x) & 3;
     int dy = int(gl_FragCoord.y) & 3;
@@ -80,7 +82,7 @@ vec4 fetchModelTexel(ivec2 position) {
 void main() {
     vec4 texColor=textureMode==0u ? vec4(1,1,1,2) :
         fetchModelTexel(ivec2(resolveTexel()));
-    if (passMode.w!=0u && model!=0u && textureMode!=0u) {
+    if ((passMode.w & 1u)!=0u && model!=0u && textureMode!=0u) {
         vec2 pos=rawUV-vec2(0.5);
         ivec2 lo=ivec2(uvBounds.xy),hi=ivec2(uvBounds.zw);
         ivec2 origin=ivec2(floor(pos));vec2 weight=fract(pos);
@@ -121,7 +123,21 @@ void main() {
         modColor = dither != 0u ? prod8 / 255.0
                                 : floor(prod8 / 8.0) / 31.0;
     }
+    if ((passMode.w & 2u) != 0u && textureMode != 0u)
+        modColor = texColor.rgb * vertexColor.rgb;
     modColor = applyDither(modColor);
+    if (passMode.x == 2u && (passMode.w & 2u) != 0u) {
+        if (colorSemiTrans && isSemiTrans) {
+            vec3 back = texelFetch(texBlend, ivec2(gl_FragCoord.xy), 0).rgb;
+            uint abr = (tpage & 0x60u) >> 5u;
+            if (abr == 0u) modColor = (back + modColor) * 0.5;
+            else if (abr == 1u) modColor = back + modColor;
+            else if (abr == 2u) modColor = back - modColor;
+            else modColor = back + modColor * 0.25;
+        }
+        FragColor = vec4(clamp(modColor, 0.0, 1.0), textureMode == 0u ? 0.0 : texColor.a);
+        return;
+    }
     if (passMode.x == 2u) {
         ivec3 color = ivec3(floor(modColor * 31.0 + 0.5));
         if (colorSemiTrans && isSemiTrans) {

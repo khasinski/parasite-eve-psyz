@@ -648,9 +648,9 @@ int Psyz_VideoSetDitheringMode(PsyzDitherMode mode) {
     if (dither_mode == mode) {
         return 0;
     }
-    if (GetCurrentDither() != (mode == PSYZ_DITHER_OFF ? 0 : s_dither)) {
-        Draw_FlushBuffer();
-    }
+    /* Off also changes color precision, even when the draw env disables dither.
+     */
+    Draw_FlushBuffer();
     dither_mode = mode;
     return 0;
 }
