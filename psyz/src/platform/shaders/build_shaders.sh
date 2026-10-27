@@ -42,7 +42,7 @@ for shader in "$@"; do
     glslangValidator -V --target-env vulkan1.0 -S "$stage" \
         "$shader.glsl" -o "$shader.spv"
     emit_header "$shader.spv" "$name" spv
-    spirv-cross --msl "$shader.spv" --output "$shader.metal"
+    spirv-cross --msl --msl-decoration-binding "$shader.spv" --output "$shader.metal"
     emit_header "$shader.metal" "$name" msl
     case "$stage" in
         vert) profile=vs_6_0; cross_stage=vertex ;;

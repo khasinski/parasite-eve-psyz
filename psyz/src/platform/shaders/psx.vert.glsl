@@ -8,6 +8,7 @@ layout(location = 4) in vec2 polygonUV;
 layout(location = 5) in vec3 polygonRGB;
 layout(location = 6) in vec3 pgxpPos;
 layout(location = 7) in vec4 atlasBounds;
+layout(location = 8) in vec3 hdCoordinates;
 
 layout(set = 1, binding = 0) uniform UBO { vec4 drawOffset; };
 
@@ -28,7 +29,10 @@ layout(location = 12) flat out uint polygon;
 layout(location = 13) flat out uint model;
 layout(location = 14) flat out vec4 uvBounds;
 
+layout(location = 15) out vec3 hdUV;
+
 void main() {
+    hdUV=hdCoordinates;
     model = (tex.w & 0x1000u) != 0u ? 1u : 0u;
     uvBounds = atlasBounds;
     polygon = (tex.w & 0x2000u) != 0u ? 1u : 0u;

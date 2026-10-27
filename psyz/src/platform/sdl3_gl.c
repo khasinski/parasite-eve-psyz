@@ -2,6 +2,10 @@
 #include <psyz/overlay.h>
 #include <psyz/overlay_sdl3_gl.h>
 #include <assert.h>
+/* The experimental atlas path currently targets SDL_GPU only. */
+int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *path) { (void)key; (void)path; return 0; }
+void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell) { (void)key; (void)cell; }
+void Psyz_GpuResetSpriteAtlases(void) {}
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>

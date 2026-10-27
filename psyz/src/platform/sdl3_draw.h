@@ -35,6 +35,7 @@ typedef struct {
     float polygon_rgb[3];
     float pgxp_pos[3];
     float uv_bounds[4];
+    float hd_uv[3];
 } Vertex;
 
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====

@@ -15,9 +15,11 @@ layout(location = 11) flat in uvec4 texWindow;
 layout(location = 12) flat in uint polygon;
 layout(location = 13) flat in uint model;
 layout(location = 14) flat in vec4 uvBounds;
+layout(location = 15) in vec3 hdUV;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 layout(set = 2, binding = 1) uniform sampler2D texBlend;
+layout(set = 2, binding = 2) uniform sampler2D texHD;
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
 
 float attributeRoundingBias() {
@@ -118,6 +120,32 @@ void main() {
                                 : floor(prod8 / 8.0) / 31.0;
     }
     modColor = applyDither(modColor);
+    bool enhancedPixel=false;
+    // Presentation only. The original texel still owns coverage, STP and
+    // palette changes. Unmatched reference colours fall back pixel by pixel.
+    if (passMode.y>1u && hdUV.z>0.5 && textureMode!=0u) {
+        ivec2 size=textureSize(texHD,0);
+        ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
+        vec3 basis=texelFetch(texHD,reference,0).rgb;
+        if (all(equal(floor(basis*31.0+0.5),floor(texColor.rgb*31.0+0.5)))) {
+            vec3 enhanced=texture(texHD,hdUV.xy).rgb;
+            vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+            modColor=clamp(enhanced*tint,0.0,1.0);
+            enhancedPixel=true;
+        }
+    }
+    if (passMode.x==2u && enhancedPixel) {
+        vec3 color=modColor;
+        if (colorSemiTrans && isSemiTrans) {
+            vec3 back=texelFetch(texBlend,ivec2(gl_FragCoord.xy),0).rgb;
+            uint abr=(tpage&0x60u)>>5u;
+            if (abr==0u) color=(back+color)*0.5;
+            else if (abr==1u) color=back+color;
+            else if (abr==2u) color=back-color;
+            else color=back+color*0.25;
+        }
+        FragColor=vec4(clamp(color,0.0,1.0),texColor.a);return;
+    }
     if (passMode.x == 2u) {
         ivec3 color = ivec3(floor(modColor * 31.0 + 0.5));
         if (colorSemiTrans && isSemiTrans) {

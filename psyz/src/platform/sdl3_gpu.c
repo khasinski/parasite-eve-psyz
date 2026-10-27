@@ -95,6 +95,25 @@ static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
 static SDL_GPUGraphicsPipeline* pipe_clear = NULL;
 static SDL_GPUCommandBuffer* pending_cmd = NULL;
 
+/* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
+typedef struct SpriteAtlas {
+    uint64_t key;
+    unsigned columns, rows, first_cell;
+} SpriteAtlas;
+static SpriteAtlas sprite_atlases[512];
+static unsigned sprite_atlas_count;
+static size_t sprite_atlas_bytes;
+static SpriteAtlas *next_sprite_atlas;
+static SDL_GPUTexture *sprite_atlas_texture;
+static unsigned sprite_atlas_cells;
+#define HD_ATLAS_COLUMNS 240u
+#define HD_ATLAS_ROWS 60u
+#define HD_ATLAS_WIDTH (HD_ATLAS_COLUMNS*68u)
+#define HD_ATLAS_HEIGHT (HD_ATLAS_ROWS*136u)
+static unsigned next_sprite_cell;
+static SDL_GPUSampler *sprite_atlas_sampler;
+
+
 static Posi display_area = {0, 0};
 static Posi display_size = {256, 240};
 static Posi cur_display_size = {-1, -1};
@@ -138,6 +157,95 @@ static void SubmitCmd(void) {
         pending_cmd = NULL;
     }
 }
+
+void Psyz_GpuResetSpriteAtlases(void) {
+    if (!device || UseSoftwareBackend()) return;
+    /* A room transition may still have queued draws reading the old cells.
+     * Retire those reads before another room uploads into the same storage. */
+    Draw_FlushBuffer();
+    SubmitCmd();
+    SDL_WaitForGPUIdle(device);
+    sprite_atlas_count=0;
+    sprite_atlas_cells=0;
+    sprite_atlas_bytes=0;
+    next_sprite_atlas=NULL;
+    next_sprite_cell=0;
+}
+
+int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
+    if (!key || !filename || !device || UseSoftwareBackend()) return 0;
+    for (unsigned i=0;i<sprite_atlas_count;++i)
+        if (sprite_atlases[i].key==key) return 1;
+    SDL_Surface *source=SDL_LoadBMP(filename);
+    if (!source) return 0;
+    int w=source->w,h=source->h;
+    size_t bytes=(size_t)w*(size_t)h*4;
+    if (w<=0 || h<=0 || w%68 || h%136 || w>16*68 || h>16384 ||
+        sprite_atlas_count>=512 || (unsigned)(w/68)*(unsigned)(h/136)>HD_ATLAS_COLUMNS*HD_ATLAS_ROWS-sprite_atlas_cells) {
+        SDL_DestroySurface(source); WARNF("Invalid or over-budget HD sprite atlas: %s",filename); return -1;
+    }
+    SDL_Surface *rgba=SDL_ConvertSurface(source,SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(source); if (!rgba) return -1;
+    SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=HD_ATLAS_WIDTH,.height=HD_ATLAS_HEIGHT,.layer_count_or_depth=1,.num_levels=1};
+    if (!sprite_atlas_texture) sprite_atlas_texture=SDL_CreateGPUTexture(device,&info);
+    SDL_GPUTexture *texture=sprite_atlas_texture;
+    SDL_GPUTransferBufferCreateInfo upload_info={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=(Uint32)bytes};
+    SDL_GPUTransferBuffer *upload=SDL_CreateGPUTransferBuffer(device,&upload_info);
+    void *mapped=upload ? SDL_MapGPUTransferBuffer(device,upload,false) : NULL;
+    if (!texture || !mapped) {
+        if (mapped) SDL_UnmapGPUTransferBuffer(device,upload);
+        if (upload) SDL_ReleaseGPUTransferBuffer(device,upload);
+        SDL_DestroySurface(rgba); return -1;
+    }
+    unsigned columns=(unsigned)w/68,rows=(unsigned)h/136,cells=columns*rows;
+    /* This SDL revision's Metal uploader uses destination width for row
+     * pitch. Pack every cell contiguously instead of relying on row strides. */
+    for (unsigned cell=0;cell<cells;++cell) for (unsigned reference=0;reference<2;++reference) {
+        unsigned sx=(cell%columns)*68,sy=(cell/columns)*68+reference*(unsigned)h/2;
+        u8 *target=(u8 *)mapped+(size_t)(cell*2+reference)*68*68*4;
+        for (unsigned row=0;row<68;++row)
+            memcpy(target+(size_t)row*68*4,(u8 *)rgba->pixels+(size_t)(sy+row)*rgba->pitch+sx*4,68*4);
+    }
+    SDL_UnmapGPUTransferBuffer(device,upload);SDL_DestroySurface(rgba);
+    SDL_GPUCommandBuffer *cmd=AcquireCmd();
+    if (!cmd) { SDL_ReleaseGPUTransferBuffer(device,upload);return -1; }
+    SDL_GPUCopyPass *copy=SDL_BeginGPUCopyPass(cmd);
+    for (unsigned cell=0;cell<cells;++cell) for (unsigned reference=0;reference<2;++reference) {
+        unsigned target_cell=sprite_atlas_cells+cell;
+        SDL_GPUTextureTransferInfo from={.transfer_buffer=upload,
+            .offset=(cell*2+reference)*68*68*4,.pixels_per_row=68,.rows_per_layer=68};
+        SDL_GPUTextureRegion to={.texture=texture,.x=(target_cell%HD_ATLAS_COLUMNS)*68,
+            .y=(target_cell/HD_ATLAS_COLUMNS)*68+reference*HD_ATLAS_HEIGHT/2,.w=68,.h=68,.d=1};
+        SDL_UploadToGPUTexture(copy,&from,&to,false);
+    }
+    SDL_EndGPUCopyPass(copy);
+    SDL_ReleaseGPUTransferBuffer(device,upload);
+    if (!sprite_atlas_sampler) {
+        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
+        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
+    }
+    if (!sprite_atlas_sampler) return -1;
+    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells};
+    sprite_atlas_cells+=cells;
+    sprite_atlas_bytes+=bytes;
+    INFOF("HD sprite atlas %016llx: %dx%d (%zu MiB cached)",(unsigned long long)key,w,h,sprite_atlas_bytes/(1024*1024));
+    return 1;
+}
+
+void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned cell) {
+    next_sprite_atlas=NULL;
+    if (UseSoftwareBackend()) return;
+    for (unsigned i=0;i<sprite_atlas_count;++i) {
+        SpriteAtlas *atlas=&sprite_atlases[i];
+        if (atlas->key==key && cell<atlas->columns*atlas->rows) {
+            next_sprite_atlas=atlas;next_sprite_cell=cell;return;
+        }
+    }
+}
+
 
 // FIX: the fence mechanic solves a out-of-memory on Windows when running a
 // game with SDL_VIDEODRIVER=offscreen and PSYZ_VSYNC_LIMITLESS when the CPU
@@ -248,6 +356,7 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
         {.location = 7, .buffer_slot = 0,
          .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
          .offset = offsetof(Vertex, uv_bounds)},
+        {.location=8,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,.offset=offsetof(Vertex,hd_uv)},
     };
     // the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
     static const SDL_GPUColorTargetBlendState blend[BLEND_COUNT] = {
@@ -448,7 +557,7 @@ static bool CreateGpuResources(void) {
     SDL_GPUShader* psx_vs =
         CreateShader(psx_vert, psx_vert_len, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
     SDL_GPUShader* psx_fs = CreateShader(
-        psx_frag, psx_frag_len, SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
+        psx_frag, psx_frag_len, SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1);
     SDL_GPUShader* clear_vs = CreateShader(
         clear_vert, clear_vert_len, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
     SDL_GPUShader* clear_fs = CreateShader(
@@ -921,6 +1030,11 @@ static void QuitPlatform(void) {
     if (device) {
         SDL_WaitForGPUIdle(device);
         ReleaseFrameFences();
+        if (sprite_atlas_texture) SDL_ReleaseGPUTexture(device,sprite_atlas_texture);
+        sprite_atlas_texture=NULL;sprite_atlas_cells=0;
+        sprite_atlas_count=0;sprite_atlas_bytes=0;next_sprite_atlas=NULL;
+        if (sprite_atlas_sampler) SDL_ReleaseGPUSampler(device,sprite_atlas_sampler);
+        sprite_atlas_sampler=NULL;
         for (int i = 0; i < BLEND_COUNT; i++) {
             if (pipe_tri[i]) {
                 SDL_ReleaseGPUGraphicsPipeline(device, pipe_tri[i]);
@@ -1376,6 +1490,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool isTile = (code & 0x40) && (code & 0x20);
     bool isTextured = (code & TEXTURED) != 0;
     bool isGouraud = (code & GOURAUD) != 0;
+    SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C) ? next_sprite_atlas : NULL;
+    unsigned atlas_cell=next_sprite_cell;
+    next_sprite_atlas=NULL;
+    /* One shared atlas: selecting a replacement must not split PS1 batches. */
+
     bool isShadeTex = !((code & 1) && isTextured && !isLine);
     u16 tpage = -1, clut = -1, pad2, pad3;
     Vertex* v;
@@ -1384,6 +1503,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     // This also covers Gouraud's fifth-slot colour read-ahead.
     Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
+    for (int i=0;i<6;++i) v[i].hd_uv[0]=v[i].hd_uv[1]=v[i].hd_uv[2]=0;
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
         v->g = (unsigned char)(*packets >> 8);
@@ -1587,6 +1707,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     lt |= TPAGE_DITHER;
                 }
                 for (int k = 0; k < 4; k++) {
+                    q[k].hd_uv[2]=0;
                     SET_TC(&q[k], lt, -1);
                 }
                 index_cur[0] = base + 0;
@@ -1668,6 +1789,16 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         index_cur[3] = n_vertices + 1;
         index_cur[4] = n_vertices + 3;
         index_cur[5] = n_vertices + 2;
+        if (atlas) {
+            float width=(float)HD_ATLAS_WIDTH,height=(float)HD_ATLAS_HEIGHT;
+            atlas_cell+=atlas->first_cell;
+            float left=(float)((atlas_cell%HD_ATLAS_COLUMNS)*68+2),top=(float)((atlas_cell/HD_ATLAS_COLUMNS)*68+2);
+            for (int i=0;i<4;++i) {
+                vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
+                vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
+                vertex_cur[i].hd_uv[2]=1;
+            }
+        }
         SET_TC_ALL(vertex_cur, tpage, clut);
         Draw_EnqueueBuffer(4, 6);
     }
@@ -2024,10 +2155,12 @@ void Draw_FlushBuffer(void) {
             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
             const SDL_GPUBufferBinding ib = {.buffer = ibuf};
             SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
-            const SDL_GPUTextureSamplerBinding sampler_binding[2] = {
+            const SDL_GPUTextureSamplerBinding sampler_binding[3] = {
                 {.texture=vram_sample,.sampler=vram_sampler},
-                {.texture=destination_sample,.sampler=vram_sampler}};
-            SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,2);
+                {.texture=destination_sample,.sampler=vram_sampler},
+                {.texture=sprite_atlas_texture ? sprite_atlas_texture : vram_sample,
+                 .sampler=sprite_atlas_texture ? sprite_atlas_sampler : vram_sampler}};
+            SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,3);
             const float offset_ubo[4] = {
                 (float)draw_offset.x, (float)draw_offset.y,
                 (target_index != 0 && geometry_correction) ? 1.0f : 0.0f,
