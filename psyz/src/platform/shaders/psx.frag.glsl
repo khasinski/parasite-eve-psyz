@@ -32,7 +32,11 @@ uvec2 resolveTexel() {
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
     vec2 uv = polygon != 0u ? rawUV + attributeRoundingBias() :
         rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
-    uvec2 texel = uvec2(ivec2(floor(uv))) & uvec2(255u);
+    ivec2 position = ivec2(floor(uv));
+    // A sprite reads only its own texels: a squeezed sprite's edge can cut
+    // a pixel whose left side lies outside it.
+    if (polygon == 0u) position = clamp(position, ivec2(uvBounds.xy), ivec2(uvBounds.zw));
+    uvec2 texel = uvec2(position) & uvec2(255u);
     return (texel & texWindow.xy) | texWindow.zw;
 }
 

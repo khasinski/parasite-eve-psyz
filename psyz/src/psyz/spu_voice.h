@@ -88,10 +88,10 @@ typedef struct {
     short gwin[4];  // GAUSS interpolation window
     u8 gpos;        // index to next decoded sample in gwin
     u8 active;
-    u8 key_on_pending;    // latch a retrigger after the current output sample
+    u8 key_on_pending; // latch a retrigger after the current output sample
     short volume_current[2]; // VOLL/VOLR latch for the current sample
     u8 needs_decode;
-    u8 noise_mode;       // NON bypasses the ADPCM end-triggered envelope stop
+    u8 noise_mode;        // NON bypasses the ADPCM end-triggered envelope stop
     int env_vol;          // mirrors SPU_VOICE_REG::volumex
     unsigned env_counter; // fractional 15-bit envelope rate divider
     AdsrState env_state;  // voice phase, works like a state machine
@@ -262,7 +262,8 @@ static inline int spu_voice_envelope_rate(const VoiceState* vs) {
 // The divider advances by a rate-dependent fraction and resets on a
 // firing. A free-running tick modulo would carry attack ticks into decay
 // and shift the modulator envelope, accumulating FM phase error.
-static inline unsigned spu_voice_envelope_increment(const VoiceState* vs, int rate) {
+static inline unsigned spu_voice_envelope_increment(
+    const VoiceState* vs, int rate) {
     if ((vs->env_state == ADSR_ATTACK && ((vs->adsr_lo >> 8) & 127) == 127) ||
         (vs->env_state == ADSR_SUSTAIN && ((vs->adsr_hi >> 6) & 127) == 127) ||
         (vs->env_state == ADSR_RELEASE && (vs->adsr_hi & 31) == 31) ||
@@ -273,7 +274,8 @@ static inline unsigned spu_voice_envelope_increment(const VoiceState* vs, int ra
 
 static inline int spu_voice_envelope_clock(VoiceState* vs, int rate) {
     vs->env_counter += spu_voice_envelope_increment(vs, rate);
-    if (vs->env_counter < 0x8000) return 0;
+    if (vs->env_counter < 0x8000)
+        return 0;
     vs->env_counter = 0;
     return 1;
 }
@@ -502,17 +504,20 @@ static inline void spu_voice_envelope_advance(VoiceState* vs, unsigned ticks) {
         }
         int rate = spu_voice_envelope_rate(vs);
         unsigned increment = spu_voice_envelope_increment(vs, rate);
-        if (!increment) return;
-        int held = vs->env_state == ADSR_SUSTAIN &&
-                   ((vs->adsr_hi & 0x4000) ? vs->env_vol == 0
-                                          : vs->env_vol == 0x7FFF);
+        if (!increment)
+            return;
+        int held =
+            vs->env_state == ADSR_SUSTAIN &&
+            ((vs->adsr_hi & 0x4000) ? vs->env_vol == 0 : vs->env_vol == 0x7FFF);
         if (held) {
-            vs->env_counter = (unsigned)(vs->env_counter +
-                (uint64_t)ticks * increment) & 0x7FFF;
+            vs->env_counter =
+                (unsigned)(vs->env_counter + (uint64_t)ticks * increment) &
+                0x7FFF;
             return;
         }
         unsigned den = 0x8000u / increment;
-        unsigned first = (0x8000u - vs->env_counter + increment - 1) / increment;
+        unsigned first =
+            (0x8000u - vs->env_counter + increment - 1) / increment;
         if (first > ticks) {
             vs->env_counter += ticks * increment;
             return;

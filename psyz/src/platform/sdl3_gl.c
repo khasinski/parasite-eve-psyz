@@ -136,7 +136,8 @@ static const char fragment_shader_body[] = {
     "    -3.0, +1.0, -4.0, +0.0,"
     "    +3.0, -1.0, +2.0, -2.0);\n"
     "vec3 applyDither(vec3 c) {\n"
-    "    if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;\n"
+    "    if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / "
+    "31.0;\n"
     "    int dx = int(gl_FragCoord.x) & 3;\n"
     "    int dy = int(gl_FragCoord.y) & 3;\n"
     "    float off = ditherMatrix[dy][dx];\n"
@@ -608,20 +609,27 @@ static void PlatformBackend_Present(void) {
     GLuint source_fbo = GetDrawFbo();
     bool rgb24 = disp_on && display_rgb24 && !debug_show_vram;
     if (rgb24) {
-        u8* pixels = Sdl3Common_ReadRgb24(display_area.x, display_area.y, display_size.x, display_size.y);
+        u8* pixels = Sdl3Common_ReadRgb24(
+            display_area.x, display_area.y, display_size.x, display_size.y);
         if (pixels) {
-            if (!rgb24_texture) glGenTextures(1, &rgb24_texture);
-            if (!rgb24_fbo) glGenFramebuffers(1, &rgb24_fbo);
+            if (!rgb24_texture)
+                glGenTextures(1, &rgb24_texture);
+            if (!rgb24_fbo)
+                glGenFramebuffers(1, &rgb24_fbo);
             glBindTexture(GL_TEXTURE_2D, rgb24_texture);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, display_size.x, display_size.y, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, display_size.x,
+                         display_size.y, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
             free(pixels);
             glBindFramebuffer(GL_FRAMEBUFFER, rgb24_fbo);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rgb24_texture, 0);
-            source_fbo = rgb24_fbo; n = 1;
-        } else rgb24 = false;
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, rgb24_texture, 0);
+            source_fbo = rgb24_fbo;
+            n = 1;
+        } else
+            rgb24 = false;
     }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, source_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -629,7 +637,8 @@ static void PlatformBackend_Present(void) {
 
     SDL_Rect src = {display_area.x, display_area.y, display_size.x,
                     display_size.y};
-    if (rgb24) src.x = src.y = 0;
+    if (rgb24)
+        src.x = src.y = 0;
     float game_aspect =
         GetCurrentGameAspectRatio(display_size.x, display_size.y);
     if (debug_show_vram) {
@@ -664,8 +673,14 @@ static void PlatformBackend_Present(void) {
 }
 
 static void QuitPlatform(void) {
-    if (rgb24_texture) { glDeleteTextures(1, &rgb24_texture); rgb24_texture=0; }
-    if (rgb24_fbo) { glDeleteFramebuffers(1, &rgb24_fbo); rgb24_fbo=0; }
+    if (rgb24_texture) {
+        glDeleteTextures(1, &rgb24_texture);
+        rgb24_texture = 0;
+    }
+    if (rgb24_fbo) {
+        glDeleteFramebuffers(1, &rgb24_fbo);
+        rgb24_fbo = 0;
+    }
     Sdl3Common_Shutdown();
     if (overlay_destroy_cb) {
         overlay_destroy_cb();
@@ -721,7 +736,8 @@ void ResetPlatform(void) {
     QuitPlatform();
 }
 
-static unsigned char* AllocRgb888FboRegion(GLuint fbo,int x, int y, int w, int h) {
+static unsigned char* AllocRgb888FboRegion(
+    GLuint fbo, int x, int y, int w, int h) {
     if (fbo == 0) {
         ERRORF("FBO not initialized");
         return NULL;
@@ -764,41 +780,56 @@ static unsigned char* AllocRgb888FboRegion(GLuint fbo,int x, int y, int w, int h
 unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
     *w = display_size.x;
     *h = display_size.y;
-    if (display_rgb24) return Sdl3Common_ReadRgb24(display_area.x, display_area.y, *w, *h);
-    return AllocRgb888FboRegion(vram_fbo,display_area.x, display_area.y, *w, *h);
+    if (display_rgb24)
+        return Sdl3Common_ReadRgb24(display_area.x, display_area.y, *w, *h);
+    return AllocRgb888FboRegion(
+        vram_fbo, display_area.x, display_area.y, *w, *h);
 }
 
 unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
     *w = VRAM_W;
     *h = VRAM_H;
-    return AllocRgb888FboRegion(vram_fbo,0, 0, VRAM_W, VRAM_H);
+    return AllocRgb888FboRegion(vram_fbo, 0, 0, VRAM_W, VRAM_H);
 }
 
-unsigned char* Psyz_VideoAllocRenderedFrame(int* w,int* h) {
-    if (w) *w=0;
-    if (h) *h=0;
-    if (!w || !h) return NULL;
-    if (!InitPlatform()) return NULL;
-    Draw_FlushBuffer();ApplyPendingInternalRes();
-    if (!display_rgb24 && (display_area.x<0 || display_area.y<0 ||
-        display_size.x<=0 || display_size.y<=0 ||
-        display_area.x>VRAM_W-display_size.x || display_area.y>VRAM_H-display_size.y))
+unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
+    if (w)
+        *w = 0;
+    if (h)
+        *h = 0;
+    if (!w || !h)
         return NULL;
-    if (display_rgb24 || internal_res==1) {
-        unsigned char* pixels=Psyz_VideoAllocCapturedFrame(w,h);
-        if (!pixels) *w=*h=0;
+    if (!InitPlatform())
+        return NULL;
+    Draw_FlushBuffer();
+    ApplyPendingInternalRes();
+    if (!display_rgb24 &&
+        (display_area.x < 0 || display_area.y < 0 || display_size.x <= 0 ||
+         display_size.y <= 0 || display_area.x > VRAM_W - display_size.x ||
+         display_area.y > VRAM_H - display_size.y))
+        return NULL;
+    if (display_rgb24 || internal_res == 1) {
+        unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
+        if (!pixels)
+            *w = *h = 0;
         return pixels;
     }
-    if (!scaled_vram_fbo || display_area.x<0 || display_area.y<0 ||
-        display_size.x<=0 || display_size.y<=0 ||
-        display_area.x>VRAM_W-display_size.x || display_area.y>VRAM_H-display_size.y)
+    if (!scaled_vram_fbo || display_area.x < 0 || display_area.y < 0 ||
+        display_size.x <= 0 || display_size.y <= 0 ||
+        display_area.x > VRAM_W - display_size.x ||
+        display_area.y > VRAM_H - display_size.y)
         return NULL;
-    GLint read_fbo;glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read_fbo);
-    unsigned char* pixels=AllocRgb888FboRegion(scaled_vram_fbo,
-        display_area.x*internal_res,display_area.y*internal_res,
-        display_size.x*internal_res,display_size.y*internal_res);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)read_fbo);
-    if (pixels) {*w=display_size.x*internal_res;*h=display_size.y*internal_res;}
+    GLint read_fbo;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+    unsigned char* pixels = AllocRgb888FboRegion(
+        scaled_vram_fbo, display_area.x * internal_res,
+        display_area.y * internal_res, display_size.x * internal_res,
+        display_size.y * internal_res);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_fbo);
+    if (pixels) {
+        *w = display_size.x * internal_res;
+        *h = display_size.y * internal_res;
+    }
     return pixels;
 }
 
@@ -808,6 +839,24 @@ int Psyz_VideoSetAntialiasing(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetAntialiasing(void) { return 0; }
 int Psyz_VideoSetModelFiltering(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetModelFiltering(void) { return 0; }
+int Psyz_VideoSetWidescreen(int enabled) { return enabled ? -1 : 0; }
+int Psyz_VideoGetWidescreen(void) { return 0; }
+void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
+    (void)buffer_y;
+    (void)left;
+    (void)right;
+}
+void Psyz_VideoSetWidescreenPictureShifted(
+    int buffer_y, int left, int right, float dx, float dy, int camera_x) {
+    (void)buffer_y;
+    (void)left;
+    (void)right;
+    (void)dx;
+    (void)dy;
+    (void)camera_x;
+}
+void Psyz_VideoSetWidescreenCentred(int enabled) { (void)enabled; }
+void Psyz_VideoSetWidescreenField(int enabled) { (void)enabled; }
 
 int Psyz_VideoGetGeometryCorrection(void) { return 0; }
 

@@ -56,6 +56,30 @@ int Psyz_GpuSetHorizontalGrid(
     unsigned int source_width, unsigned int target_width);
 
 /**
+ * @brief Keep a CPU copy of the VRAM (off by default)
+ *
+ * When on, image uploads (LoadImage), fills (ClearImage) and copies
+ * (MoveImage) are also applied to a 1024x512 RGB5551 copy in memory, so the
+ * application can read texels without downloading from the GPU. Primitives
+ * are not rasterized into it: drawing marks the current drawing area unknown
+ * instead. Only writes made while it is on are in the copy.
+ *
+ * @param enabled non-zero to allocate and keep the copy, zero to free it
+ * @return 0 on success, negative when out of memory
+ */
+int Psyz_GpuSetVramCopy(int enabled);
+
+/**
+ * @brief Read the CPU copy of the VRAM (see Psyz_GpuSetVramCopy)
+ *
+ * @param known If not NULL, receives a 1024x512 byte map: non-zero where the
+ * copy holds what the VRAM holds, zero where it was never written while the
+ * copy was on, or was drawn over since
+ * @return 1024x512 RGB5551 pixels, row by row, or NULL when the copy is off
+ */
+const unsigned short* Psyz_GpuGetVramCopy(const unsigned char** known);
+
+/**
  * @brief Write a GP0 word to the internal GPU queue
  *
  * GP0 (1F801810h) is the PS1 rendering port responsible for drawing primitives

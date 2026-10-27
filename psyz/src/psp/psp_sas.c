@@ -826,7 +826,7 @@ static void spu_consume(short* out, const short* sas, int frames) {
 
 void Psyz_SpuFlushCdSamples(void) {
     Psyz_AudioLock();
-    spu.cd_ring_read=spu.cd_ring_count=0;
+    spu.cd_ring_read = spu.cd_ring_count = 0;
     Psyz_AudioUnlock();
 }
 

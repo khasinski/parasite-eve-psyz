@@ -8,10 +8,10 @@
 static uint64_t clock_us;
 uint64_t Psyz_OsNowUs(void) { return clock_us; }
 uintptr_t Psyz_OsThreadSelf(void) { return 1; }
-void* Psyz_OsLockCreate(void) { return (void *)1; }
+void* Psyz_OsLockCreate(void) { return (void*)1; }
 void Psyz_OsLock(void* p) { (void)p; }
 void Psyz_OsUnlock(void* p) { (void)p; }
-void* Psyz_OsBellCreate(void) { return (void *)1; }
+void* Psyz_OsBellCreate(void) { return (void*)1; }
 void Psyz_OsBellRing(void* p) { (void)p; }
 void Psyz_OsBellWait(void* p, uint32_t timeout) {
     (void)p;
@@ -22,8 +22,8 @@ int Psyz_OsThreadStart(void (*fn)(void), const char* name) {
     (void)name;
     return -1;
 }
-void psyz_log(unsigned level, const char* file, unsigned line,
-              const char* func, const char* fmt, ...) {
+void psyz_log(unsigned level, const char* file, unsigned line, const char* func,
+              const char* fmt, ...) {
     (void)level;
     (void)file;
     (void)line;
@@ -41,44 +41,52 @@ static long tick(void) {
  * writes: build test_events.c with -DPSYZ_TEST_CLOCK and the PsyZ include path.
  * The normal ztest build below still tests actual interrupt-thread delivery. */
 int main(void) {
-    static const uint64_t starts[] = {1000, UINT64_C(0x7ffff000),
-        UINT64_C(0xfffff000), UINT64_C(0x100000000),
-        UINT64_C(86400)*1000000};
-    static const uint64_t stalls[] = {UINT64_C(40)*60*1000000,
-        UINT64_C(72)*60*1000000, UINT64_C(6)*60*60*1000000,
-        UINT64_C(30)*86400*1000000};
+    static const uint64_t starts[] = {
+        1000, UINT64_C(0x7ffff000), UINT64_C(0xfffff000), UINT64_C(0x100000000),
+        UINT64_C(86400) * 1000000};
+    static const uint64_t stalls[] = {
+        UINT64_C(40) * 60 * 1000000, UINT64_C(72) * 60 * 1000000,
+        UINT64_C(6) * 60 * 60 * 1000000, UINT64_C(30) * 86400 * 1000000};
     unsigned tested = 0;
     for (unsigned i = 0; i < sizeof(starts) / sizeof(starts[0]); ++i) {
         for (unsigned j = 0; j < sizeof(stalls) / sizeof(stalls[0]); ++j) {
             clock_us = starts[i];
             calls = 0;
             long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, tick);
-            if (event < 0 || !EnableEvent(event)) return 1;
+            if (event < 0 || !EnableEvent(event))
+                return 1;
             SetRCnt(RCntCNT2, 17640, RCntMdINTR);
             StartRCnt(RCntCNT2);
             clock_us += 4165;
             Psyz_KernelPoll();
-            if (calls != 0) return 2;
+            if (calls != 0)
+                return 2;
             clock_us += 2;
             Psyz_KernelPoll();
-            if (calls != 1) return 3;
+            if (calls != 1)
+                return 3;
             clock_us += stalls[j];
             Psyz_KernelPoll();
             /* Long pauses discard catch-up debt, preserving the existing
              * MAX_CATCHUP_US policy instead of emitting millions of ticks. */
-            if (calls != 1) return 4;
+            if (calls != 1)
+                return 4;
             clock_us += 4165;
             Psyz_KernelPoll();
-            if (calls != 1) return 5;
+            if (calls != 1)
+                return 5;
             clock_us += 2;
             Psyz_KernelPoll();
-            if (calls != 2) return 6;
+            if (calls != 2)
+                return 6;
             StopRCnt(RCntCNT2);
             CloseEvent(event);
             ++tested;
         }
     }
-    printf("host-clock cases=%u passed; ordinary periods, long-pause restart, no catch-up storm\n",tested);
+    printf("host-clock cases=%u passed; ordinary periods, long-pause restart, "
+           "no catch-up storm\n",
+           tested);
     return 0;
 }
 
@@ -187,7 +195,9 @@ ZTEST_SETUP(events) {
     // Initialize first: headless startup installs its default timing mode.
     // Apply the required real-time limiter after that, without a blank.
     ResetGraph(0);
-    DISPENV display;SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);
+    DISPENV display;
+    SetDefDispEnv(&display, 0, 0, 320, 240);
+    PutDispEnv(&display);
     // All RCNT tests need a frame limiter to pass
     saved_vsync_mode = Psyz_VideoGetVsyncMode();
     Psyz_VideoSetVsyncMode(PSYZ_VSYNC_OFF);
@@ -962,6 +972,11 @@ ZTEST(events, akao_deinit_sequence_leaves_nothing_pending) {
 }
 
 ZTEST(events, rcnt3_event_fires_once_per_vblank) {
+#if defined(__psyz) && !defined(__PSP__)
+    /* Count emulated blanks, not thirty presentations which can each miss
+     * several wall-clock blanks on a loaded or software-rendered runner. */
+    Psyz_VideoSetVsyncMode(PSYZ_VSYNC_LIMITLESS);
+#endif
     long counted =
         ev_open(RCntCNT3, EvSpINT, EvMdINTR, cb_increase_handler_calls);
     EnableEvent(counted);
@@ -981,6 +996,11 @@ ZTEST(events, rcnt3_nointr_event_becomes_pending_every_vblank) {
 }
 
 ZTEST(events, hw_vblank_trap_event_fires_once_per_vblank) {
+#if defined(__psyz) && !defined(__PSP__)
+    /* Count emulated blanks, not thirty presentations which can each miss
+     * several wall-clock blanks on a loaded or software-rendered runner. */
+    Psyz_VideoSetVsyncMode(PSYZ_VSYNC_LIMITLESS);
+#endif
     long counted =
         ev_open(HwVBLANK, EvSpTRAP, EvMdINTR, cb_increase_handler_calls);
     EnableEvent(counted);

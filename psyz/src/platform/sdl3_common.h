@@ -27,13 +27,19 @@
 /* Display mode 24 reads three consecutive VRAM bytes per output pixel;
  * those bytes are not RGB555 pixels. Keep their 16-bit storage lossless. */
 static unsigned char* Sdl3Common_ReadRgb24(int x, int y, int w, int h) {
-    if (w <= 0 || w > VRAM_W * 2 / 3 || h <= 0 || x < 0 || x >= VRAM_W || y < 0 || y >= VRAM_H)
+    if (w <= 0 || w > VRAM_W * 2 / 3 || h <= 0 || x < 0 || x >= VRAM_W ||
+        y < 0 || y >= VRAM_H)
         return NULL;
     int words = (w * 3 + 1) / 2;
-    if (words > VRAM_W - x || h > VRAM_H - y) return NULL;
+    if (words > VRAM_W - x || h > VRAM_H - y)
+        return NULL;
     u16* raw = calloc((size_t)words * h, sizeof(*raw));
     unsigned char* rgb = malloc((size_t)w * h * 3);
-    if (!raw || !rgb) { free(raw); free(rgb); return NULL; }
+    if (!raw || !rgb) {
+        free(raw);
+        free(rgb);
+        return NULL;
+    }
     PS1_RECT region = {x, y, words, h};
     Draw_StoreImage(&region, (u_long*)raw);
     for (int row = 0; row < h; ++row)
@@ -228,14 +234,16 @@ static Uint64 last_present_time = 0;
 static bool present_skip = false; // this frame is not shown
 
 static Uint32 WallVblankCount(void) {
-    return (Uint32)((double)SDL_GetTicksNS() * target_frame_rate * game_speed / 1e9);
+    return (Uint32)((double)SDL_GetTicksNS() * target_frame_rate * game_speed /
+                    1e9);
 }
 
 static void PollEvents(void);
 
 // overlay callbacks shared across backends
 static PsyzOverlayEventFilter_SDL3 overlay_event_filter;
-PsyzOverlayEventFilter_SDL3 Psyz_SetOverlayEventFilter_SDL3(PsyzOverlayEventFilter_SDL3 filter) {
+PsyzOverlayEventFilter_SDL3 Psyz_SetOverlayEventFilter_SDL3(
+    PsyzOverlayEventFilter_SDL3 filter) {
     PsyzOverlayEventFilter_SDL3 previous = overlay_event_filter;
     overlay_event_filter = filter;
     return previous;
@@ -501,7 +509,8 @@ static void WaitForNextFrame(void) {
     last_frame_time = frame_end_time;
 }
 
-/* Implemented by the existing SDL audio backend; no device in video-clock mode. */
+/* Implemented by the existing SDL audio backend; no device in video-clock mode.
+ */
 void Sdl3Audio_VBlank(bool pal);
 void Sdl3Audio_SetSpeed(unsigned speed);
 
@@ -513,8 +522,8 @@ static bool SkipPresent(void) {
         return false;
     }
     Uint64 now = SDL_GetPerformanceCounter();
-    if (last_present_time &&
-        GetElapsedMicroseconds(last_present_time, now) < target_frame_time_us * 0.75) {
+    if (last_present_time && GetElapsedMicroseconds(last_present_time, now) <
+                                 target_frame_time_us * 0.75) {
         return true;
     }
     last_present_time = now;
@@ -526,11 +535,14 @@ int Psyz_VideoVSync(int mode) {
     unsigned short ret;
     Sdl3Common_ApplyPendingTimingReset();
     if (mode < 0) {
-        if(host_clock_pause_depth)return (int)host_clock_pause_count;
+        if (host_clock_pause_depth)
+            return (int)host_clock_pause_count;
         /* With pacing disabled, each explicit present advances one blank.
          * Wall time cannot drive this counter in an accelerated runner. */
         if (vsync_mode == PSYZ_VSYNC_LIMITLESS)
-            return (int)(limitless_vblank_base + (Uint32)(gpu_stats.total_frames - limitless_frame_base));
+            return (
+                int)(limitless_vblank_base +
+                     (Uint32)(gpu_stats.total_frames - limitless_frame_base));
         return (int)(WallVblankCount() + vblank_clock_offset);
     }
     // a line is approximated as 64 us
@@ -549,24 +561,24 @@ int Psyz_VideoVSync(int mode) {
 }
 
 void Psyz_PauseHostClock_SDL3(bool paused) {
-    if(paused){
-        if(!host_clock_pause_depth){
-            host_clock_pause_count=(Uint32)Psyz_VideoVSync(-1);
+    if (paused) {
+        if (!host_clock_pause_depth) {
+            host_clock_pause_count = (Uint32)Psyz_VideoVSync(-1);
             Psyz_KernelPauseHostClock(1);
         }
         ++host_clock_pause_depth;
-    }else if(host_clock_pause_depth && !--host_clock_pause_depth){
+    } else if (host_clock_pause_depth && !--host_clock_pause_depth) {
         Psyz_KernelPauseHostClock(0);
-        if(vsync_mode==PSYZ_VSYNC_LIMITLESS){
-            limitless_vblank_base=host_clock_pause_count;
-            limitless_frame_base=gpu_stats.total_frames;
-        }else{
-            vblank_clock_offset=host_clock_pause_count-WallVblankCount();
+        if (vsync_mode == PSYZ_VSYNC_LIMITLESS) {
+            limitless_vblank_base = host_clock_pause_count;
+            limitless_frame_base = gpu_stats.total_frames;
+        } else {
+            vblank_clock_offset = host_clock_pause_count - WallVblankCount();
         }
-        drift_compensation=0.0;
-        last_frame_time=SDL_GetPerformanceCounter();
-        finish_time=last_frame_time;
-        last_vsync_us=(Uint32)(SDL_GetTicksNS()/1000);
+        drift_compensation = 0.0;
+        last_frame_time = SDL_GetPerformanceCounter();
+        finish_time = last_frame_time;
+        last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
     }
 }
 
@@ -766,21 +778,21 @@ static unsigned int PadRead_Keyboard(u_long* config, int config_len) {
     return r;
 }
 static int gamepad_p1[16] = {
-    SDL_GAMEPAD_BUTTON_COUNT, SDL_GAMEPAD_BUTTON_COUNT + 1,
+    SDL_GAMEPAD_BUTTON_COUNT,         SDL_GAMEPAD_BUTTON_COUNT + 1,
     SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
-    SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_EAST,
-    SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_WEST,
-    SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_LEFT_STICK,
-    SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_START,
-    SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
-    SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT
-};
+    SDL_GAMEPAD_BUTTON_NORTH,         SDL_GAMEPAD_BUTTON_EAST,
+    SDL_GAMEPAD_BUTTON_SOUTH,         SDL_GAMEPAD_BUTTON_WEST,
+    SDL_GAMEPAD_BUTTON_BACK,          SDL_GAMEPAD_BUTTON_LEFT_STICK,
+    SDL_GAMEPAD_BUTTON_RIGHT_STICK,   SDL_GAMEPAD_BUTTON_START,
+    SDL_GAMEPAD_BUTTON_DPAD_UP,       SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
+    SDL_GAMEPAD_BUTTON_DPAD_DOWN,     SDL_GAMEPAD_BUTTON_DPAD_LEFT};
 int Psyz_GetKeyboardBinding_SDL3(unsigned button) {
     return button < 16 ? (int)keyb_p1[button] : -1;
 }
 int Psyz_SetKeyboardBinding_SDL3(unsigned button, SDL_Scancode key) {
-    if (button >= 16 || key <= SDL_SCANCODE_UNKNOWN || key >= SDL_SCANCODE_COUNT ||
-        key == SDL_SCANCODE_ESCAPE) return -1;
+    if (button >= 16 || key <= SDL_SCANCODE_UNKNOWN ||
+        key >= SDL_SCANCODE_COUNT || key == SDL_SCANCODE_ESCAPE)
+        return -1;
     keyb_p1[button] = key;
     return 0;
 }
@@ -788,20 +800,26 @@ int Psyz_GetGamepadBinding_SDL3(unsigned button) {
     return button < 16 ? gamepad_p1[button] : -1;
 }
 int Psyz_SetGamepadBinding_SDL3(unsigned button, int binding) {
-    if (button >= 16 || binding < 0 || binding > SDL_GAMEPAD_BUTTON_COUNT + 1) return -1;
+    if (button >= 16 || binding < 0 || binding > SDL_GAMEPAD_BUTTON_COUNT + 1)
+        return -1;
     gamepad_p1[button] = binding;
     return 0;
 }
 static unsigned int PadRead_Gamepad(struct Gamepad* g) {
-    if (!g || !g->dev) return 0;
+    if (!g || !g->dev)
+        return 0;
     unsigned int result = 0;
     for (unsigned i = 0; i < 16; ++i) {
         int binding = gamepad_p1[i];
-        bool pressed = binding < SDL_GAMEPAD_BUTTON_COUNT
-            ? SDL_GetGamepadButton(g->dev, (SDL_GamepadButton)binding)
-            : SDL_GetGamepadAxis(g->dev, binding == SDL_GAMEPAD_BUTTON_COUNT
-                ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000;
-        if (pressed) result |= 1u << i;
+        bool pressed =
+            binding < SDL_GAMEPAD_BUTTON_COUNT
+                ? SDL_GetGamepadButton(g->dev, (SDL_GamepadButton)binding)
+                : SDL_GetGamepadAxis(
+                      g->dev, binding == SDL_GAMEPAD_BUTTON_COUNT
+                                  ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                  : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000;
+        if (pressed)
+            result |= 1u << i;
     }
     return result;
 }
@@ -959,13 +977,15 @@ static void SetFullScreen(bool isFullscreen) {
 }
 #endif
 
-SDL_Window *Psyz_GetWindow_SDL3(void) { return sdl3_window; }
+SDL_Window* Psyz_GetWindow_SDL3(void) { return sdl3_window; }
 
 bool Psyz_SetFullscreen_SDL3(bool enabled) {
 #ifndef PLATFORM_IOS
-    if (!sdl3_window) return !enabled;
+    if (!sdl3_window)
+        return !enabled;
     /* Also account for window-manager changes, not just our F4 shortcut. */
-    is_fullscreen = (SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN) != 0;
+    is_fullscreen =
+        (SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN) != 0;
     SetFullScreen(enabled);
     return is_fullscreen == enabled;
 #else
@@ -977,7 +997,8 @@ bool Psyz_SetFullscreen_SDL3(bool enabled) {
 static void PollEvents(void) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        if (overlay_event_filter && overlay_event_filter(&event)) continue;
+        if (overlay_event_filter && overlay_event_filter(&event))
+            continue;
         if (overlay_event_cb) {
             overlay_event_cb(&event);
         }

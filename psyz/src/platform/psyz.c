@@ -45,7 +45,8 @@ static void default_adjust_path(char* dst, const char* src, int maxlen) {
 
 static void truncate_filename(char* path) {
     // find the last path separator, then truncate it
-    // memcard names have 20 data bytes; host paths additionally need a terminator
+    // memcard names have 20 data bytes; host paths additionally need a
+    // terminator
     const int max_filename_len = 20;
     char* filename = path;
     char* p = path;

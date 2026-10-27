@@ -9,7 +9,9 @@ layout(location = 5) in vec3 polygonRGB;
 layout(location = 6) in vec3 pgxpPos;
 layout(location = 7) in vec4 atlasBounds;
 
-layout(set = 1, binding = 0) uniform UBO { vec4 drawOffset; };
+// widescreen: {x squeeze, centre x before the draw-grid viewport,
+//              sub-pixel shift x, y (game pixels)}
+layout(set = 1, binding = 0) uniform UBO { vec4 drawOffset; vec4 widescreen; };
 
 layout(location = 0) out vec4 vertexColor;
 layout(location = 1) out vec2 rawUV;
@@ -38,8 +40,14 @@ void main() {
     float vx = usePgxp ? pgxpPos.x : (float(pos.x) + bias);
     float vy = usePgxp ? pgxpPos.y : (float(pos.y) + bias);
     float w = usePgxp ? pgxpPos.z : 1.0;
-    float x = ((vx + drawOffset.x) / (1024.0 / 2.0)) - 1.0;
-    float y = ((vy + drawOffset.y) / (512.0 / 2.0)) - 1.0;
+    float ax = vx + widescreen.z + drawOffset.x;
+    // Squeezed before clipping, so drawing left of a buffer at VRAM x 0
+    // still lands inside VRAM.
+    if (widescreen.x != 1.0) {
+        ax = widescreen.y + (ax - widescreen.y) * widescreen.x;
+    }
+    float x = (ax / (1024.0 / 2.0)) - 1.0;
+    float y = ((vy + widescreen.w + drawOffset.y) / (512.0 / 2.0)) - 1.0;
     // SDL_GPU NDC y=-1 is the bottom while texture row 0 is the top; negate Y
     // so VRAM row 0 lands on texture row 0, like the GL FBO convention.
     gl_Position = vec4(x * w, -y * w, 0.0, w);

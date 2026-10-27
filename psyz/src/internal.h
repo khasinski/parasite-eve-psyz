@@ -57,9 +57,9 @@ void Psyz_KernelPoll(void);
 void Psyz_PgxpSetActive(int active);
 void Psyz_PgxpNextFrame(void);
 void Psyz_PgxpSetCulling(int enabled);
-void Psyz_GteCopyQueuedPgxpSxy(const void* src, const void* dst, unsigned int sxy);
-int Psyz_PgxpLookupVertex(
-    const void* packet_sxy_addr, unsigned int sxy, float* x, float* y,
-    float* w);
+void Psyz_GteCopyQueuedPgxpSxy(
+    const void* src, const void* dst, unsigned int sxy);
+int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
+                          float* x, float* y, float* w);
 
 #endif
