@@ -17,13 +17,39 @@
 #include <direct.h>
 #include <stdlib.h>
 #include <share.h>
+#include <SDL3/SDL.h>
+#include <wchar.h>
 #include <romio.h>
+
+/* SDL paths are UTF-8; CRT file APIs need UTF-16. Absolute paths use the
+ * extended form so user-data directories also work beyond MAX_PATH. */
+static wchar_t* file_path_utf16(const char* path) {
+    char* extended = NULL;
+    if (!strncmp(path, "\\\\?\\", 4))
+        extended = SDL_strdup(path);
+    else if (strlen(path) >= 3 && path[1] == ':' &&
+             (path[2] == '/' || path[2] == '\\'))
+        SDL_asprintf(&extended, "\\\\?\\%s", path);
+    else if (path[0] == '\\' && path[1] == '\\')
+        SDL_asprintf(&extended, "\\\\?\\UNC\\%s", path + 2);
+    else
+        extended = SDL_strdup(path);
+    if (!extended)
+        return NULL;
+    wchar_t* wide = (wchar_t*)SDL_iconv_string(
+        "UTF-16LE", "UTF-8", extended, strlen(extended) + 1);
+    SDL_free(extended);
+    for (wchar_t* p = wide; p && *p; ++p)
+        if (*p == L'/')
+            *p = L'\\';
+    return wide;
+}
 
 typedef struct {
     char** filenames;
     int file_count;
     int current_index;
-    char base_dir[1024];
+    char base_dir[4096];
 } WIN_DIRENTRY_RESERVED;
 
 static WIN_DIRENTRY_RESERVED singleton_dir = {0};
@@ -52,19 +78,24 @@ static int open_filesearch_handle(const char* basePath) {
               _TRUNCATE);
 
     // Build search pattern
-    char search_pattern[1024];
+    char search_pattern[4098];
     strncpy_s(search_pattern, sizeof(search_pattern), basePath,
               sizeof(search_pattern) - 3);
 
     // Ensure path ends with backslash
     size_t len = strlen(search_pattern);
-    if (len > 0 && search_pattern[len - 1] != '\\') {
+    if (len > 0 && search_pattern[len - 1] != '\\' &&
+        search_pattern[len - 1] != '/') {
         strcat_s(search_pattern, sizeof(search_pattern), "\\");
     }
     strcat_s(search_pattern, sizeof(search_pattern), "*");
 
-    struct _finddata_t file_info;
-    intptr_t handle = _findfirst(search_pattern, &file_info);
+    struct _wfinddata_t file_info;
+    wchar_t* wide = file_path_utf16(search_pattern);
+    if (!wide)
+        return 0;
+    intptr_t handle = _wfindfirst(wide, &file_info);
+    SDL_free(wide);
 
     if (handle == -1) {
         return 0;
@@ -74,11 +105,15 @@ static int open_filesearch_handle(const char* basePath) {
     int capacity = 16;
     singleton_dir.filenames = (char**)malloc(capacity * sizeof(char*));
     singleton_dir.file_count = 0;
+    if (!singleton_dir.filenames) {
+        _findclose(handle);
+        return 0;
+    }
 
     do {
         // skip directories: ps1 memcards are flat
         // skip hidden files starting with `.`
-        if (!(file_info.attrib & _A_SUBDIR) && file_info.name[0] != '.') {
+        if (!(file_info.attrib & _A_SUBDIR) && file_info.name[0] != L'.') {
             if (singleton_dir.file_count >= capacity) {
                 capacity *= 2;
                 char** new_filenames = (char**)realloc(
@@ -90,11 +125,19 @@ static int open_filesearch_handle(const char* basePath) {
                 }
                 singleton_dir.filenames = new_filenames;
             }
-            singleton_dir.filenames[singleton_dir.file_count] =
-                _strdup(file_info.name);
-            singleton_dir.file_count++;
+            char* utf8 = SDL_iconv_string(
+                "UTF-8", "UTF-16LE", (const char*)file_info.name,
+                (wcslen(file_info.name) + 1) * sizeof(wchar_t));
+            char* name = utf8 ? _strdup(utf8) : NULL;
+            SDL_free(utf8);
+            if (!name) {
+                close_filesearch_handle();
+                _findclose(handle);
+                return 0;
+            }
+            singleton_dir.filenames[singleton_dir.file_count++] = name;
         }
-    } while (!_findnext(handle, &file_info));
+    } while (!_wfindnext(handle, &file_info));
 
     _findclose(handle);
 
@@ -114,8 +157,8 @@ static int open_filesearch_handle(const char* basePath) {
 
 static void populate_entry(
     const char* baseDir, struct DIRENTRY* dst, const char* filename) {
-    char buf[512];
-    struct _stat fileStat = {0};
+    char buf[8192];
+    SDL_PathInfo fileStat = {0};
 
     strncpy_s(buf, sizeof(buf), baseDir, _TRUNCATE);
     if (!Psyz_JoinPath(buf, filename, sizeof(buf))) {
@@ -124,7 +167,7 @@ static void populate_entry(
         return;
     }
 
-    if (_stat(buf, &fileStat) != 0) {
+    if (!SDL_GetPathInfo(buf, &fileStat)) {
         ERRORF("failed to stat '%s'", buf);
         return;
     }
@@ -135,13 +178,13 @@ static void populate_entry(
     }
     strncpy(dst->name, filename, sizeof(dst->name));
     dst->attr = 0x10 | 0x40; // Same as Unix version
-    dst->size = (long)fileStat.st_size;
+    dst->size = (long)fileStat.size;
     dst->next = NULL;
     dst->system[0] = 0;
 }
 
 struct DIRENTRY* my_firstfile(char* dirPath, struct DIRENTRY* firstEntry) {
-    char basePath[0x100];
+    char basePath[4096];
     Psyz_AdjustPath(basePath, dirPath, sizeof(basePath));
     DEBUGF("opendir('%s')", basePath);
 
@@ -170,11 +213,11 @@ struct DIRENTRY* my_nextfile(struct DIRENTRY* outEntry) {
 }
 
 long my_erase(char* path) {
-    char adjPath[0x100];
+    char adjPath[4096];
     Psyz_AdjustPath(adjPath, path, sizeof(adjPath));
 
     DEBUGF("remove('%s')", adjPath);
-    return remove(adjPath) == 0;
+    return SDL_RemovePath(adjPath);
 }
 
 long my_format(char* fs) {
@@ -229,37 +272,23 @@ int psyz_open(const char* devname, int flag, ...) {
         DEBUGF("0x10000 ignored for %s", devname);
     }
 
-    char path[0x100];
+    char path[4096];
     Psyz_AdjustPath(path, devname, sizeof(path));
-    int fd = -1;
-    if (oflag & _O_CREAT) {
-        // Use _sopen_s for creation with default sharing mode
-        errno_t err = _sopen_s(
-            &fd, path, oflag | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-        if (err != 0) {
+    if (!(oflag & _O_CREAT)) {
+        SDL_PathInfo info;
+        if (!SDL_GetPathInfo(path, &info) || info.type != SDL_PATHTYPE_FILE) {
+            WARNF("path '%s' mapped from '%s' is not a file", path, devname);
             return -1;
         }
-        return fd;
-    } else {
-        struct _stat st;
-        if (_stat(path, &st) != 0) {
-            WARNF("path '%s' mapped from '%s' not found", path, devname);
-            return -1;
-        }
-        if (!(st.st_mode & _S_IFREG)) {
-            if (st.st_mode & _S_IFDIR) {
-                WARNF("path '%s' mapped as '%s' is a directory", path, devname);
-            } else {
-                WARNF("path '%s' mapped as '%s' is not a file", path, devname);
-            }
-            return -1;
-        }
-        errno_t err = _sopen_s(&fd, path, oflag | _O_BINARY, _SH_DENYNO, 0);
-        if (err != 0) {
-            return -1;
-        }
-        return fd;
     }
+    wchar_t* wide = file_path_utf16(path);
+    if (!wide)
+        return -1;
+    int fd = -1;
+    errno_t err = _wsopen_s(&fd, wide, oflag | _O_BINARY, _SH_DENYNO,
+                            oflag & _O_CREAT ? _S_IREAD | _S_IWRITE : 0);
+    SDL_free(wide);
+    return err ? -1 : fd;
 }
 
 int psyz_close(int fd) { return _close(fd); }
