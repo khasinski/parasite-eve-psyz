@@ -95,7 +95,7 @@ static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
 static SDL_GPUGraphicsPipeline* pipe_clear = NULL;
 static SDL_GPUCommandBuffer* pending_cmd = NULL;
 
-/* Immutable optional atlas cache. PoC bound: 512 MiB, no native VRAM changes. */
+/* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
 typedef struct SpriteAtlas {
     uint64_t key;
     unsigned columns, rows, first_cell;
@@ -156,6 +156,20 @@ static void SubmitCmd(void) {
         SDL_SubmitGPUCommandBuffer(pending_cmd);
         pending_cmd = NULL;
     }
+}
+
+void Psyz_GpuResetSpriteAtlases(void) {
+    if (!device || UseSoftwareBackend()) return;
+    /* A room transition may still have queued draws reading the old cells.
+     * Retire those reads before another room uploads into the same storage. */
+    Draw_FlushBuffer();
+    SubmitCmd();
+    SDL_WaitForGPUIdle(device);
+    sprite_atlas_count=0;
+    sprite_atlas_cells=0;
+    sprite_atlas_bytes=0;
+    next_sprite_atlas=NULL;
+    next_sprite_cell=0;
 }
 
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {

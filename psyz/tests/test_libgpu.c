@@ -211,6 +211,17 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
             zassert_s32_eq(0,memcmp(a,b,3));
     }
     zassert_s32_eq(1,changed>500);
+    /* A different room must be able to reuse the bounded cache. Resetting it
+     * must drop a cached identity even when its original BMP is now absent,
+     * while leaving the native VRAM untouched. */
+    Psyz_GpuResetSpriteAtlases();
+    zassert_s32_eq(0,Psyz_GpuLoadSpriteAtlas(key,path));
+    {
+        RECT clear={0,0,64,64};
+        u16 after_reset[64*64];
+        StoreImage(&clear,(u_long *)after_reset);DrawSync(0);
+        zassert_s32_eq(0,memcmp(native[3],after_reset,sizeof(after_reset)));
+    }
     for(int i=0;i<4;++i)free(images[i]);
     Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);Psyz_GpuSelectSpriteAtlas(0,0);Psyz_VideoSetInternalResolution(1);
 #endif

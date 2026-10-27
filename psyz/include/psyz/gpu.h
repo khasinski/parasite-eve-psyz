@@ -61,6 +61,8 @@ int Psyz_GpuSetHorizontalGrid(
  * Returns 1 when loaded, 0 when unavailable, -1 for malformed/over-budget data.
  * Keys identify immutable assets, not VRAM addresses. */
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *bmp_path);
+/* Retire queued reads and reuse the bounded atlas storage for a new room. */
+void Psyz_GpuResetSpriteAtlases(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command
  * when selecting inside an OT. Missing keys select ordinary rendering. */
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell);
