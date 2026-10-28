@@ -96,6 +96,10 @@ static SDL_GPUTransferBuffer* tex_download_transfer = NULL;
 static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
 static SDL_GPUGraphicsPipeline* pipe_clear = NULL;
 static SDL_GPUCommandBuffer* pending_cmd = NULL;
+/* SDL D3D12 has 2048 sampler descriptors per command buffer. Keep half
+ * available for presentation/overlays and never roll its heaps mid-draw. */
+static unsigned command_descriptor_limit, command_descriptors;
+static bool descriptor_rollover_reported;
 
 static Posi display_area = {0, 0};
 static Posi display_size = {256, 240};
@@ -248,6 +252,7 @@ PsyzOverlayRenderCB_SDL3GPU Psyz_OverlayRender_SDL3GPU(
 
 static SDL_GPUCommandBuffer* AcquireCmd(void) {
     if (!pending_cmd) {
+        command_descriptors = 0;
         pending_cmd = SDL_AcquireGPUCommandBuffer(device);
         if (!pending_cmd) {
             ERRORF("SDL_AcquireGPUCommandBuffer: %s", SDL_GetError());
@@ -261,6 +266,25 @@ static void SubmitCmd(void) {
         SDL_SubmitGPUCommandBuffer(pending_cmd);
         pending_cmd = NULL;
     }
+}
+
+/* Call only between passes: submitted uploads remain ordered before subsequent
+ * draws, and SDL tracks their resources until the submitted buffer completes.
+ */
+static SDL_GPUCommandBuffer* ReserveDrawDescriptors(unsigned count) {
+    if (command_descriptor_limit &&
+        command_descriptors > command_descriptor_limit - count) {
+        SubmitCmd();
+        if (!descriptor_rollover_reported) {
+            INFOF("GPU descriptor batch rollover (budget %u)",
+                  command_descriptor_limit);
+            descriptor_rollover_reported = true;
+        }
+    }
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (cmd)
+        command_descriptors += count;
+    return cmd;
 }
 
 // FIX: the fence mechanic solves a out-of-memory on Windows when running a
@@ -645,6 +669,17 @@ bool InitPlatform() {
         return false;
     }
     INFOF("SDL_GPU with driver %s", SDL_GetGPUDeviceDriver(device));
+    command_descriptor_limit =
+        !strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") ? 1024u : 0u;
+    /* Exercise the same command boundaries with other backends in headless
+     * tests. */
+    const char* descriptor_limit =
+        SDL_getenv("PSYZ_GPU_COMMAND_DESCRIPTOR_LIMIT");
+    if (descriptor_limit) {
+        int value = SDL_atoi(descriptor_limit);
+        if (value >= 4 && value <= 1024)
+            command_descriptor_limit = (unsigned)value;
+    }
 
 #ifdef PLATFORM_IOS
     const SDL_WindowFlags window_flags =
@@ -746,7 +781,7 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     if (!scaled_vram_render || w <= 0 || h <= 0) {
         return;
     }
-    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    SDL_GPUCommandBuffer* cmd = ReserveDrawDescriptors(1);
     if (!cmd) {
         return;
     }
@@ -843,7 +878,7 @@ static void ApplyPendingInternalRes(void) {
         } else {
             // upscale the whole native VRAM into the freshly created scaled
             // target
-            SDL_GPUCommandBuffer* cmd = AcquireCmd();
+            SDL_GPUCommandBuffer* cmd = ReserveDrawDescriptors(1);
             if (cmd) {
                 const SDL_GPUBlitInfo blit = {
                     .source = {.texture = vram_render,
@@ -1097,7 +1132,7 @@ static void PlatformBackend_Present(void) {
             sc_w = ws_capture_width;
             sc_h = ws_capture_height;
         } else if (!SDL_WaitAndAcquireGPUSwapchainTexture(
-                cmd, sdl3_window, &swapchain, &sc_w, &sc_h)) {
+                       cmd, sdl3_window, &swapchain, &sc_w, &sc_h)) {
             WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
         }
         if (swapchain) {
@@ -1274,7 +1309,8 @@ static void QuitPlatform(void) {
     if (device) {
         SDL_WaitForGPUIdle(device);
         ReleaseFrameFences();
-        if (ws_capture) SDL_ReleaseGPUTexture(device, ws_capture);
+        if (ws_capture)
+            SDL_ReleaseGPUTexture(device, ws_capture);
         ws_capture = NULL;
         ws_capture_width = ws_capture_height = 0;
         ws_capture_active = false;
@@ -1484,14 +1520,15 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     Draw_FlushBuffer();
     if (!UseSoftwareBackend())
         ApplyPendingInternalRes();
-    if (UseSoftwareBackend() || display_rgb24 || (!scaled_vram_render && !widescreen)) {
+    if (UseSoftwareBackend() || display_rgb24 ||
+        (!scaled_vram_render && !widescreen)) {
         unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
         if (!pixels)
             *w = *h = 0;
         return pixels;
     }
-    if ((!scaled_vram_render && !widescreen) || display_area.x < 0 || display_area.y < 0 ||
-        display_size.x <= 0 || display_size.y <= 0 ||
+    if ((!scaled_vram_render && !widescreen) || display_area.x < 0 ||
+        display_area.y < 0 || display_size.x <= 0 || display_size.y <= 0 ||
         display_area.x > VRAM_W - display_size.x ||
         display_area.y > VRAM_H - display_size.y)
         return NULL;
@@ -1501,20 +1538,25 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     bool capture_widescreen = widescreen && !debug_show_vram;
     if (capture_widescreen) {
         width = (height * 16u + 4u) / 9u;
-        if (!ws_capture || ws_capture_width != width || ws_capture_height != height) {
-            if (ws_capture) SDL_ReleaseGPUTexture(device, ws_capture);
+        if (!ws_capture || ws_capture_width != width ||
+            ws_capture_height != height) {
+            if (ws_capture)
+                SDL_ReleaseGPUTexture(device, ws_capture);
             ws_capture_width = width;
             ws_capture_height = height;
             const SDL_GPUTextureCreateInfo capture_info = {
                 .type = SDL_GPU_TEXTURETYPE_2D,
                 .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-                .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
-                .width = width, .height = height,
-                .layer_count_or_depth = 1, .num_levels = 1
-            };
+                .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER |
+                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+                .width = width,
+                .height = height,
+                .layer_count_or_depth = 1,
+                .num_levels = 1};
             ws_capture = SDL_CreateGPUTexture(device, &capture_info);
         }
-        if (!ws_capture) return NULL;
+        if (!ws_capture)
+            return NULL;
         ws_capture_active = true;
         PlatformBackend_Present();
         ws_capture_active = false;
@@ -1545,7 +1587,8 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         .w = (Uint32)display_size.x * internal_res,
         .h = (Uint32)display_size.y * internal_res};
     if (capture_widescreen)
-        visible = (SDL_GPUBlitRegion){.texture = ws_capture, .w = width, .h = height};
+        visible =
+            (SDL_GPUBlitRegion){.texture = ws_capture, .w = width, .h = height};
     else if (antialiasing)
         visible = PrepareDisplayTexture(cmd, visible);
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
@@ -2330,6 +2373,9 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     memcpy(map, quad, sizeof(quad));
     SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
 
+    cmd = ReserveDrawDescriptors(1);
+    if (!cmd)
+        return;
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     const SDL_GPUTransferBufferLocation src = {.transfer_buffer = vtx_transfer};
     const SDL_GPUBufferRegion dst = {
@@ -2599,6 +2645,12 @@ void Draw_FlushBuffer(void) {
             if (!semi)
                 while (end < n_indices && vertex_buf[index_buf[end]].a != 0x80)
                     end += 3;
+            /* Two sampled textures, up to two draws (color and mask). Reserve
+             * both heaps' worst-case sampler use before any destination copy.
+             */
+            cmd = ReserveDrawDescriptors(4);
+            if (!cmd)
+                return;
             if (semi) {
                 int x0 = (clip.x + clip.w) * (int)target_scale;
                 int y0 = (clip.y + clip.h) * (int)target_scale;
