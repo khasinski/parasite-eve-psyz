@@ -1303,6 +1303,12 @@ static void PlatformBackend_Present(void) {
 
 static void QuitPlatform(void) {
     Sdl3Common_Shutdown();
+    if (device) {
+        /* Retire acquired command buffers before destroying their device,
+         * including work not submitted by a frame presentation yet. */
+        SubmitCmdAndWait();
+        Draw_ResetBuffer();
+    }
     if (overlay_destroy_cb) {
         overlay_destroy_cb();
     }
@@ -1395,6 +1401,8 @@ static void QuitPlatform(void) {
         }
         SDL_DestroyGPUDevice(device);
         device = NULL;
+        command_descriptors = 0;
+        descriptor_rollover_reported = false;
     }
     if (sdl3_window) {
         SDL_DestroyWindow(sdl3_window);
@@ -1449,7 +1457,8 @@ static bool DownloadVramRegionAsRGBA8888(int x, int y, int w, int h, u8* out) {
     };
     SDL_DownloadFromGPUTexture(copy, &region, &transfer);
     SDL_EndGPUCopyPass(copy);
-    SubmitCmdAndWait();
+    if (!SubmitCmdAndWait())
+        return false;
 
     const u8* map =
         SDL_MapGPUTransferBuffer(device, tex_download_transfer, false);
@@ -2569,12 +2578,14 @@ void Draw_FlushBuffer(void) {
     }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
+        Draw_ResetBuffer();
         return;
     }
 
     u8* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, true);
     if (!map) {
         ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
+        Draw_ResetBuffer();
         return;
     }
     const Uint32 vtx_size = (Uint32)(sizeof(Vertex) * n_vertices);
@@ -2649,8 +2660,10 @@ void Draw_FlushBuffer(void) {
              * both heaps' worst-case sampler use before any destination copy.
              */
             cmd = ReserveDrawDescriptors(4);
-            if (!cmd)
+            if (!cmd) {
+                Draw_ResetBuffer();
                 return;
+            }
             if (semi) {
                 int x0 = (clip.x + clip.w) * (int)target_scale;
                 int y0 = (clip.y + clip.h) * (int)target_scale;
