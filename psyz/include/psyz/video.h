@@ -366,6 +366,8 @@ unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h);
  *
  * Includes internal-resolution detail for RGB555 GPU output. RGB24 movies
  * and platforms without internal scaling retain their native dimensions.
+ * Widescreen GPU output includes the final 16:9 crop, scaling and black bars,
+ * using the same presenter as the game window, including hidden windows.
  * Does not change the dimensions or behavior of AllocCapturedFrame.
  *
  * @param w Required output width (zero on failure)

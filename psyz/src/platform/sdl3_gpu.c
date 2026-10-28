@@ -112,6 +112,11 @@ static SDL_Rect scissor_rect = {0, 0, VRAM_W, VRAM_H};
  * pixels) of the 16:9 view from the screen's centre chosen for it. */
 #define WS_SQUEEZE 0.75f
 static bool widescreen;
+/* Rendered-frame capture uses the same final widescreen crop and scaling as
+ * presentation, into an offscreen texture even when the window is hidden. */
+static SDL_GPUTexture* ws_capture;
+static Uint32 ws_capture_width, ws_capture_height;
+static bool ws_capture_active;
 static struct {
     int y;
     int left, right;
@@ -1068,7 +1073,7 @@ static void PlatformBackend_Present(void) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
-    if (Sdl3Common_IsInBackground()) {
+    if (!ws_capture_active && Sdl3Common_IsInBackground()) {
         finish_time = SDL_GetPerformanceCounter();
         return;
     }
@@ -1084,10 +1089,14 @@ static void PlatformBackend_Present(void) {
         return;
     }
     // a skipped frame still submits its drawing, without a swapchain image
-    if (swapchain_ok && !present_skip) {
+    if (ws_capture_active || (swapchain_ok && !present_skip)) {
         SDL_GPUTexture* swapchain = NULL;
         Uint32 sc_w = 0, sc_h = 0;
-        if (!SDL_WaitAndAcquireGPUSwapchainTexture(
+        if (ws_capture_active) {
+            swapchain = ws_capture;
+            sc_w = ws_capture_width;
+            sc_h = ws_capture_height;
+        } else if (!SDL_WaitAndAcquireGPUSwapchainTexture(
                 cmd, sdl3_window, &swapchain, &sc_w, &sc_h)) {
             WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
         }
@@ -1235,10 +1244,10 @@ static void PlatformBackend_Present(void) {
                 };
                 SDL_BlitGPUTexture(cmd, &blit);
             }
-            if (overlay_frame_cb) {
+            if (!ws_capture_active && overlay_frame_cb) {
                 overlay_frame_cb();
             }
-            if (overlay_render_cb) {
+            if (!ws_capture_active && overlay_render_cb) {
                 SDL_GPUColorTargetInfo target = {
                     .texture = swapchain,
                     .load_op = SDL_GPU_LOADOP_LOAD,
@@ -1265,6 +1274,10 @@ static void QuitPlatform(void) {
     if (device) {
         SDL_WaitForGPUIdle(device);
         ReleaseFrameFences();
+        if (ws_capture) SDL_ReleaseGPUTexture(device, ws_capture);
+        ws_capture = NULL;
+        ws_capture_width = ws_capture_height = 0;
+        ws_capture_active = false;
         for (int i = 0; i < BLEND_COUNT; i++) {
             if (pipe_tri[i]) {
                 SDL_ReleaseGPUGraphicsPipeline(device, pipe_tri[i]);
@@ -1471,13 +1484,13 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     Draw_FlushBuffer();
     if (!UseSoftwareBackend())
         ApplyPendingInternalRes();
-    if (UseSoftwareBackend() || display_rgb24 || !scaled_vram_render) {
+    if (UseSoftwareBackend() || display_rgb24 || (!scaled_vram_render && !widescreen)) {
         unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
         if (!pixels)
             *w = *h = 0;
         return pixels;
     }
-    if (!scaled_vram_render || display_area.x < 0 || display_area.y < 0 ||
+    if ((!scaled_vram_render && !widescreen) || display_area.x < 0 || display_area.y < 0 ||
         display_size.x <= 0 || display_size.y <= 0 ||
         display_area.x > VRAM_W - display_size.x ||
         display_area.y > VRAM_H - display_size.y)
@@ -1485,6 +1498,27 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     unsigned output_scale = Psyz_VideoGetInternalResolution();
     unsigned width = (unsigned)display_size.x * output_scale;
     unsigned height = (unsigned)display_size.y * output_scale;
+    bool capture_widescreen = widescreen && !debug_show_vram;
+    if (capture_widescreen) {
+        width = (height * 16u + 4u) / 9u;
+        if (!ws_capture || ws_capture_width != width || ws_capture_height != height) {
+            if (ws_capture) SDL_ReleaseGPUTexture(device, ws_capture);
+            ws_capture_width = width;
+            ws_capture_height = height;
+            const SDL_GPUTextureCreateInfo capture_info = {
+                .type = SDL_GPU_TEXTURETYPE_2D,
+                .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+                .width = width, .height = height,
+                .layer_count_or_depth = 1, .num_levels = 1
+            };
+            ws_capture = SDL_CreateGPUTexture(device, &capture_info);
+        }
+        if (!ws_capture) return NULL;
+        ws_capture_active = true;
+        PlatformBackend_Present();
+        ws_capture_active = false;
+    }
     size_t count = (size_t)width * height;
     unsigned char* pixels = malloc(count * 3);
     SDL_GPUTransferBufferCreateInfo info = {
@@ -1505,12 +1539,14 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         return NULL;
     }
     SDL_GPUBlitRegion visible = {
-        .texture = scaled_vram_render,
+        .texture = GetRenderTarget(),
         .x = (Uint32)display_area.x * internal_res,
         .y = (Uint32)display_area.y * internal_res,
         .w = (Uint32)display_size.x * internal_res,
         .h = (Uint32)display_size.y * internal_res};
-    if (antialiasing)
+    if (capture_widescreen)
+        visible = (SDL_GPUBlitRegion){.texture = ws_capture, .w = width, .h = height};
+    else if (antialiasing)
         visible = PrepareDisplayTexture(cmd, visible);
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     if (!copy) {
