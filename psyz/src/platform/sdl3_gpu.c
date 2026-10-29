@@ -8,6 +8,7 @@
 #include <string.h>
 #include "../internal.h"
 #include <SDL3/SDL.h>
+#include <webp/decode.h>
 #include "sdl3_common.h"
 #include "rasterizer.h"
 static bool headless_renderer;
@@ -302,13 +303,46 @@ void Psyz_GpuResetSpriteAtlases(void) {
     next_sprite_cell=0;
 }
 
+/* The lossy material and lossless native-reference plane are deliberately
+ * separate: changing reference colors would break palette fallback. */
+static SDL_Surface *LoadHdImage(const char *filename) {
+    const char *extension=SDL_strrchr(filename,'.');
+    if (!extension || SDL_strcasecmp(extension,".webp"))
+        return extension && !SDL_strcasecmp(extension,".png") ? SDL_LoadPNG(filename) : SDL_LoadBMP(filename);
+    size_t bytes=0;void *data=SDL_LoadFile(filename,&bytes);
+    if(!data)return NULL;
+    int width,height;
+    if(!WebPGetInfo(data,bytes,&width,&height) || width<=0 || height<=0 || width>4096 || height>16384 ||
+       (uint64_t)width*height>32u*1024u*1024u){SDL_free(data);return NULL;}
+    SDL_Surface *surface=SDL_CreateSurface(width,height,SDL_PIXELFORMAT_RGBA32);
+    if(surface && !WebPDecodeRGBAInto(data,bytes,surface->pixels,(size_t)surface->pitch*height,surface->pitch)) {
+        SDL_DestroySurface(surface);surface=NULL;
+    }
+    SDL_free(data);return surface;
+}
+
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     if (!key || !filename || !device || UseSoftwareBackend()) return 0;
     for (unsigned i=0;i<sprite_atlas_count;++i)
         if (sprite_atlases[i].key==key) return 1;
     const char *extension=SDL_strrchr(filename,'.');
-    SDL_Surface *source=extension && SDL_strcasecmp(extension,".png")==0
-        ? SDL_LoadPNG(filename) : SDL_LoadBMP(filename);
+    SDL_Surface *source=LoadHdImage(filename);
+    if(source && extension && !SDL_strcasecmp(extension,".webp")) {
+        char reference_path[4096];size_t prefix=(size_t)(extension-filename);
+        if(prefix+sizeof(".ref.png")>sizeof(reference_path)){SDL_DestroySurface(source);return -1;}
+        memcpy(reference_path,filename,prefix);memcpy(reference_path+prefix,".ref.png",sizeof(".ref.png"));
+        SDL_Surface *reference=SDL_LoadPNG(reference_path);
+        if(!reference || source->w!=reference->w || source->h!=reference->h || source->w%68 || source->h%68 || source->h>8192) {
+            if(reference)SDL_DestroySurface(reference);SDL_DestroySurface(source);return -1;
+        }
+        SDL_SetSurfaceBlendMode(source,SDL_BLENDMODE_NONE);SDL_SetSurfaceBlendMode(reference,SDL_BLENDMODE_NONE);
+        SDL_Surface *combined=SDL_CreateSurface(source->w,source->h*2,SDL_PIXELFORMAT_RGBA32);
+        SDL_Rect bottom={0,source->h,source->w,source->h};
+        if(combined && (!SDL_BlitSurface(source,NULL,combined,NULL) || !SDL_BlitSurface(reference,NULL,combined,&bottom))) {
+            SDL_DestroySurface(combined);combined=NULL;
+        }
+        SDL_DestroySurface(reference);SDL_DestroySurface(source);source=combined;
+    }
     if (!source) return 0;
     int w=source->w,h=source->h;
     size_t bytes=(size_t)w*(size_t)h*4;
@@ -1055,7 +1089,7 @@ int Psyz_VideoSetRgb24Backdrop(const char *filename, const unsigned char *refere
     if (!filename || !reference || UseSoftwareBackend()) return 0;
     if (width<=0 || width>1024 || height<=0 || top<0 || bottom<0 ||
         height>512 || top>512-height || bottom>512-height-top || strlen(filename)>=sizeof(title_path)) return -1;
-    SDL_Surface *source=SDL_LoadPNG(filename);
+    SDL_Surface *source=LoadHdImage(filename);
     if (!source) return 0;
     if (source->w<=0 || source->w>4096 || source->h<=0 || source->h>4096) {SDL_DestroySurface(source);return -1;}
     title_image=SDL_ConvertSurface(source,SDL_PIXELFORMAT_RGBA32);SDL_DestroySurface(source);

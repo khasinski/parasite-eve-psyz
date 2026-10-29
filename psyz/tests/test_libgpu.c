@@ -588,28 +588,39 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
     char path[512];snprintf(path,sizeof(path),"%spsyz-hd-%llu.bmp",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
     zassert_s32_eq(1,SDL_SaveBMP(bmp,path));
     char png_path[512];snprintf(png_path,sizeof(png_path),"%spsyz-hd-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
-    zassert_s32_eq(1,SDL_SavePNG(bmp,png_path));SDL_DestroySurface(bmp);
+    zassert_s32_eq(1,SDL_SavePNG(bmp,png_path));
+    char webp_path[512],ref_path[512];
+    snprintf(webp_path,sizeof(webp_path),"%spsyz-hd-%llu.webp",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    snprintf(ref_path,sizeof(ref_path),"%.*s.ref.png",(int)strlen(webp_path)-5,webp_path);
+    static const u8 webp_bytes[]={82,73,70,70,224,0,0,0,87,69,66,80,86,80,56,32,212,0,0,0,176,8,0,157,1,42,68,0,68,0,62,25,12,132,66,33,4,40,4,0,97,44,96,177,251,189,255,7,58,63,227,183,225,47,75,127,23,112,1,152,37,224,31,0,61,255,243,255,178,114,0,196,94,207,249,30,38,74,19,241,182,193,95,127,103,213,211,249,152,192,57,86,68,213,60,158,26,192,0,254,246,80,99,29,236,227,255,243,191,241,136,47,59,255,45,2,127,255,89,255,253,78,223,245,159,255,234,213,195,178,243,230,88,212,117,23,21,69,50,113,254,30,230,108,3,236,47,126,64,195,90,94,91,195,154,161,118,104,95,78,1,180,42,115,168,219,70,125,115,240,75,151,24,222,164,63,8,65,160,220,201,43,194,109,93,38,81,35,92,219,74,253,243,99,191,152,194,152,68,149,230,13,11,81,255,124,249,251,235,10,213,160,17,12,53,212,27,36,240,113,193,186,53,202,135,0,217,39,136,200,0,0};
+    zassert_s32_eq(1,SDL_SaveFile(webp_path,webp_bytes,sizeof(webp_bytes)));
+    SDL_Surface *reference=SDL_CreateSurface(68,68,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,reference);
+    SDL_Rect reference_rect={0,136,68,68};SDL_SetSurfaceBlendMode(bmp,SDL_BLENDMODE_NONE);
+    zassert_s32_eq(1,SDL_BlitSurface(bmp,&reference_rect,reference,NULL));
+    zassert_s32_eq(1,SDL_SavePNG(reference,ref_path));SDL_DestroySurface(reference);SDL_DestroySurface(bmp);
     const uint64_t key=UINT64_C(0x0123456789abcdef);
     zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,png_path));SDL_RemovePath(png_path);
     zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+1,path));SDL_RemovePath(path);
     zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,path)); // cached identity survives missing file
     zassert_s32_eq(0,Psyz_GpuLoadSpriteAtlas(key+2,path));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+2,webp_path));SDL_RemovePath(ref_path);
+    zassert_s32_eq(-1,Psyz_GpuLoadSpriteAtlas(key+3,webp_path));SDL_RemovePath(webp_path);
     zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
     DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
     DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
     Psyz_VideoSetInternalResolution(2);
-    u8 *images[5]={0};u16 native[5][64*64];int w,h;
-    for(int mode=0;mode<5;++mode){
-        u16 pixels[16*16];for(unsigned i=0;i<256;++i)pixels[i]=(mode==2||mode==3)?0x7c00:((((i%16)+(i/16))&1)?0x03e0:0x01e0);
+    u8 *images[7]={0};u16 native[7][64*64];int w,h;
+    for(int mode=0;mode<7;++mode){
+        u16 pixels[16*16];for(unsigned i=0;i<256;++i)pixels[i]=(mode==2||mode==3||mode==6)?0x7c00:((((i%16)+(i/16))&1)?0x03e0:0x01e0);
         pixels[8*16+8]=0; // the original coverage must survive a bright HD texel
         RECT texture={512,0,16,16};LoadImage(&texture,(u_long *)pixels);
         RECT clear={0,0,64,64};ClearImage(&clear,16,24,32);
         DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
         struct {u_long address,length;u32 words[7];} packet={0};
-        uint64_t selected_key=mode==4?key+1:key;
-        packet.length=7;packet.words[0]=(mode==1||mode==2||mode==4)?0xF7000003:0;
-        packet.words[1]=(mode==1||mode==2||mode==4)?(u32)selected_key:0;
-        packet.words[2]=(mode==1||mode==2||mode==4)?(u32)(selected_key>>32):0;
+        uint64_t selected_key=mode>=5?key+2:mode==4?key+1:key;
+        packet.length=7;packet.words[0]=(mode==1||mode==2||mode>=4)?(mode>=5?0xF7000000:0xF7000003):0;
+        packet.words[1]=(mode==1||mode==2||mode>=4)?(u32)selected_key:0;
+        packet.words[2]=(mode==1||mode==2||mode>=4)?(u32)(selected_key>>32):0;
         packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;
         packet.words[5]=16u|(16u<<16);packet.words[6]=0;
         termPrim(&packet);DrawOTag((OT_TYPE *)&packet);
@@ -625,6 +636,10 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
     zassert_s32_eq(0,memcmp(images[2],images[3],(size_t)w*h*3)); // changed palette falls back exactly
     zassert_s32_eq(0,memcmp(images[1],images[4],(size_t)w*h*3)); // PNG and BMP render identically
     zassert_s32_eq(0,memcmp(native[1],native[4],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(native[1],native[5],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(native[3],native[6],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[3],images[6],(size_t)w*h*3));
+    zassert_s32_eq(1,memcmp(images[0],images[5],(size_t)w*h*3)!=0);
     unsigned changed=0;
     for(int y=0;y<128;++y)for(int x=0;x<128;++x){
         const u8 *a=images[0]+(y*w+x)*3,*b=images[1]+(y*w+x)*3;
@@ -642,9 +657,9 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
         RECT clear={0,0,64,64};
         u16 after_reset[64*64];
         StoreImage(&clear,(u_long *)after_reset);DrawSync(0);
-        zassert_s32_eq(0,memcmp(native[4],after_reset,sizeof(after_reset)));
+        zassert_s32_eq(0,memcmp(native[6],after_reset,sizeof(after_reset)));
     }
-    for(int i=0;i<5;++i)free(images[i]);
+    for(int i=0;i<7;++i)free(images[i]);
     Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);Psyz_GpuSelectSpriteAtlas(0,0);Psyz_VideoSetInternalResolution(1);
 #endif
 }

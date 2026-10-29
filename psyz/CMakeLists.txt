@@ -328,8 +328,26 @@ if(NOT PSP AND NOT EMSCRIPTEN AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
     list(APPEND PSYZ_SOURCES src/platform/sdl3_software.c)
 endif()
 
+if(NOT PSP AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
+    include(FetchContent)
+    foreach(tool CWEBP DWEBP GIF2WEBP IMG2WEBP VWEBP WEBPINFO WEBPMUX EXTRAS ANIM_UTILS)
+        set(WEBP_BUILD_${tool} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    set(WEBP_BUILD_LIBWEBPMUX OFF CACHE BOOL "" FORCE)
+    set(WEBP_BUILD_WEBP_JS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(psyz_webp
+        URL https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz
+        URL_HASH SHA256=93a852c2b3efafee3723efd4636de855b46f9fe1efddd607e1f42f60fc8f2136
+        EXCLUDE_FROM_ALL)
+    FetchContent_MakeAvailable(psyz_webp)
+endif()
+
 add_library(psyz STATIC ${PSYZ_SOURCES})
 target_compile_definitions(psyz PUBLIC __psyz)
+if(TARGET webpdecoder)
+    target_link_libraries(psyz PRIVATE webpdecoder)
+    target_include_directories(psyz PUBLIC $<BUILD_INTERFACE:${psyz_webp_SOURCE_DIR}/src>)
+endif()
 target_compile_definitions(psyz PRIVATE _FILE_OFFSET_BITS=64)
 if(EMSCRIPTEN)
     target_compile_definitions(psyz PUBLIC PLATFORM_WEB=1)
