@@ -386,7 +386,8 @@ void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned cell) {
  */
 static SDL_GPUCommandBuffer* ReserveDrawDescriptors(unsigned count) {
     if (command_descriptor_limit &&
-        command_descriptors > command_descriptor_limit - count) {
+        (count > command_descriptor_limit ||
+         command_descriptors > command_descriptor_limit - count)) {
         SubmitCmd();
         if (!descriptor_rollover_reported) {
             INFOF("GPU descriptor batch rollover (budget %u)",
@@ -2916,10 +2917,10 @@ void Draw_FlushBuffer(void) {
             if (!semi)
                 while (end < n_indices && vertex_buf[index_buf[end]].a != 0x80)
                     end += 3;
-            /* Two sampled textures, up to two draws (color and mask). Reserve
+            /* Three sampled textures, up to two draws (color and mask). Reserve
              * both heaps' worst-case sampler use before any destination copy.
              */
-            cmd = ReserveDrawDescriptors(5);
+            cmd = ReserveDrawDescriptors(6);
             if (!cmd) {
                 Draw_ResetBuffer();
                 return;
