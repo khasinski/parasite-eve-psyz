@@ -55,12 +55,12 @@ int Psyz_GpuRegisterCommandHandler(
 int Psyz_GpuSetHorizontalGrid(
     unsigned int source_width, unsigned int target_width);
 
-/** Optional display-only 4x sprite atlas. BMP RGB: 68px cells (64px image,
+/** Optional display-only 4x sprite atlas. PNG or BMP: 68px cells (64px image,
  * 2px gutters), at most 16 columns; lower half holds original RGB references.
  * Native VRAM/readback, transparency and STP always use the original texture.
  * Returns 1 when loaded, 0 when unavailable, -1 for malformed/over-budget data.
  * Keys identify immutable assets, not VRAM addresses. */
-int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *bmp_path);
+int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
 /* Retire queued reads and reuse the bounded atlas storage for a new room. */
 void Psyz_GpuResetSpriteAtlases(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command

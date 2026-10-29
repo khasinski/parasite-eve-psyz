@@ -176,7 +176,9 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     if (!key || !filename || !device || UseSoftwareBackend()) return 0;
     for (unsigned i=0;i<sprite_atlas_count;++i)
         if (sprite_atlases[i].key==key) return 1;
-    SDL_Surface *source=SDL_LoadBMP(filename);
+    const char *extension=SDL_strrchr(filename,'.');
+    SDL_Surface *source=extension && SDL_strcasecmp(extension,".png")==0
+        ? SDL_LoadPNG(filename) : SDL_LoadBMP(filename);
     if (!source) return 0;
     int w=source->w,h=source->h;
     size_t bytes=(size_t)w*(size_t)h*4;
