@@ -12,7 +12,7 @@
 
 static void populate_entry(
     const char* baseDir, struct DIRENTRY* dst, struct dirent* src) {
-    char buf[512];
+    char buf[8192];
     struct stat fileStat = {0};
     strncpy(buf, baseDir, sizeof(buf));
     if (!Psyz_JoinPath(buf, src->d_name, sizeof(buf))) {
@@ -39,7 +39,7 @@ static void populate_entry(
 }
 
 typedef struct {
-    char base_dir[1024];
+    char base_dir[4096];
     struct dirent** entries;
     int entry_count;
     int current_index;
@@ -109,7 +109,7 @@ static struct dirent* read_filesearch_handle() {
     return singleton_dir.entries[singleton_dir.current_index++];
 }
 struct DIRENTRY* my_firstfile(char* dirPath, struct DIRENTRY* firstEntry) {
-    char basePath[0x100];
+    char basePath[4096];
     Psyz_AdjustPath(basePath, dirPath, sizeof(basePath));
     DEBUGF("opendir('%s')", basePath);
     DIRENTRY_RESERVED* handle = open_filesearch_handle(basePath);
@@ -139,7 +139,7 @@ struct DIRENTRY* my_nextfile(struct DIRENTRY* outEntry) {
 
 long my_format(char* fs) {
     size_t path_end;
-    char path[0x200];
+    char path[8192];
     Psyz_AdjustPath(path, fs, sizeof(path));
     path_end = strlen(path);
     DEBUGF("format('%s')", fs);
@@ -165,7 +165,7 @@ long my_format(char* fs) {
 }
 
 long my_erase(char* path) {
-    char adjPath[0x100];
+    char adjPath[4096];
     Psyz_AdjustPath(adjPath, path, sizeof(adjPath));
 
     DEBUGF("remove('%s')", adjPath);
@@ -224,7 +224,7 @@ int psyz_open(const char* devname, int flag) {
         DEBUGF("0x10000 ignored for %s", devname);
     }
 
-    char path[0x100];
+    char path[4096];
     Psyz_AdjustPath(path, devname, sizeof(path));
     if (oflag & O_CREAT) {
         return creat(path, 0644);

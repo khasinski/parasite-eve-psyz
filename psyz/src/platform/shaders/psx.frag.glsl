@@ -34,7 +34,11 @@ uvec2 resolveTexel() {
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
     vec2 uv = polygon != 0u ? rawUV + attributeRoundingBias() :
         rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
-    uvec2 texel = uvec2(ivec2(floor(uv))) & uvec2(255u);
+    ivec2 position = ivec2(floor(uv));
+    // A sprite reads only its own texels: a squeezed sprite's edge can cut
+    // a pixel whose left side lies outside it.
+    if (polygon == 0u) position = clamp(position, ivec2(uvBounds.xy), ivec2(uvBounds.zw));
+    uvec2 texel = uvec2(position) & uvec2(255u);
     return (texel & texWindow.xy) | texWindow.zw;
 }
 
@@ -54,6 +58,8 @@ const mat4 ditherMatrix = mat4(
     -3.0, +1.0, -4.0, +0.0,
     +3.0, -1.0, +2.0, -2.0);
 vec3 applyDither(vec3 c) {
+    // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
+    if ((passMode.w & 2u) != 0u) return clamp(c, 0.0, 1.0);
     if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;
     int dx = int(gl_FragCoord.x) & 3;
     int dy = int(gl_FragCoord.y) & 3;
@@ -76,9 +82,19 @@ vec4 fetchModelTexel(ivec2 position) {
 }
 
 void main() {
+    // Outpainted room margins are presentation-only. They must never reach
+    // the native target, even if camera motion moves a margin into its bounds.
+    if (hdUV.z>1.5) {
+        if (hdUV.z>2.5 || passMode.y<=1u) discard;
+        vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+        vec4 material=texture(texHD,hdUV.xy);
+        if (material.a<0.5) discard;
+        FragColor=vec4(clamp(material.rgb*tint,0.0,1.0),0.0);
+        return;
+    }
     vec4 texColor=textureMode==0u ? vec4(1,1,1,2) :
         fetchModelTexel(ivec2(resolveTexel()));
-    if (passMode.w!=0u && model!=0u && textureMode!=0u) {
+    if ((passMode.w & 1u)!=0u && model!=0u && textureMode!=0u) {
         vec2 pos=rawUV-vec2(0.5);
         ivec2 lo=ivec2(uvBounds.xy),hi=ivec2(uvBounds.zw);
         ivec2 origin=ivec2(floor(pos));vec2 weight=fract(pos);
@@ -119,6 +135,8 @@ void main() {
         modColor = dither != 0u ? prod8 / 255.0
                                 : floor(prod8 / 8.0) / 31.0;
     }
+    if ((passMode.w & 2u) != 0u && textureMode != 0u)
+        modColor = texColor.rgb * vertexColor.rgb;
     modColor = applyDither(modColor);
     bool enhancedPixel=false;
     // Presentation only. The original texel still owns coverage, STP and
@@ -134,17 +152,17 @@ void main() {
             enhancedPixel=true;
         }
     }
-    if (passMode.x==2u && enhancedPixel) {
-        vec3 color=modColor;
+    if (passMode.x == 2u && (enhancedPixel || (passMode.w & 2u) != 0u)) {
         if (colorSemiTrans && isSemiTrans) {
-            vec3 back=texelFetch(texBlend,ivec2(gl_FragCoord.xy),0).rgb;
-            uint abr=(tpage&0x60u)>>5u;
-            if (abr==0u) color=(back+color)*0.5;
-            else if (abr==1u) color=back+color;
-            else if (abr==2u) color=back-color;
-            else color=back+color*0.25;
+            vec3 back = texelFetch(texBlend, ivec2(gl_FragCoord.xy), 0).rgb;
+            uint abr = (tpage & 0x60u) >> 5u;
+            if (abr == 0u) modColor = (back + modColor) * 0.5;
+            else if (abr == 1u) modColor = back + modColor;
+            else if (abr == 2u) modColor = back - modColor;
+            else modColor = back + modColor * 0.25;
         }
-        FragColor=vec4(clamp(color,0.0,1.0),texColor.a);return;
+        FragColor = vec4(clamp(modColor, 0.0, 1.0), textureMode == 0u ? 0.0 : texColor.a);
+        return;
     }
     if (passMode.x == 2u) {
         ivec3 color = ivec3(floor(modColor * 31.0 + 0.5));

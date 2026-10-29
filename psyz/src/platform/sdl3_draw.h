@@ -11,7 +11,8 @@ static float GetDrawGridXScale(void) {
 int Draw_SetHorizontalGrid(
     unsigned int source_width, unsigned int target_width) {
 #ifdef PSYZ_SOFTWARE_ROUTING
-    if (UseSoftwareBackend()) return software_rasterizer.horizontal_grid(source_width, target_width);
+    if (UseSoftwareBackend())
+        return software_rasterizer.horizontal_grid(source_width, target_width);
 #endif
     if (source_width == 0 || target_width == 0) {
         return -1;
@@ -41,7 +42,7 @@ typedef struct {
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====
 #define TPAGE_NOTEXTURE 0x8000 // flag untextured poly
 #define TPAGE_DITHER 0x4000    // flag a dithered primitive
-#define TPAGE_MODEL 0x1000   // projection provenance: model geometry only
+#define TPAGE_MODEL 0x1000     // projection provenance: model geometry only
 #define TPAGE_POLYGON 0x2000   // PS1 integer polygon sampling
 
 #define VRGBA(p) (*(unsigned int*)(&((p).r)))
@@ -175,7 +176,10 @@ static int SubtractGroupEnd(int start, int run_end) {
 
 void Draw_SetTexpageMode(ParamDrawTexpageMode* p) {
 #ifdef PSYZ_SOFTWARE_ROUTING
-    if (UseSoftwareBackend()) { software_rasterizer.texpage_mode(p); return; }
+    if (UseSoftwareBackend()) {
+        software_rasterizer.texpage_mode(p);
+        return;
+    }
 #endif
     // implements SetDrawMode, SetDrawEnv
     unsigned short mode = *(u_short*)p;
@@ -194,7 +198,10 @@ void Draw_SetTexpageMode(ParamDrawTexpageMode* p) {
 void Draw_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
                            unsigned int off_x, unsigned int off_y) {
 #ifdef PSYZ_SOFTWARE_ROUTING
-    if (UseSoftwareBackend()) { software_rasterizer.texture_window(mask_x, mask_y, off_x, off_y); return; }
+    if (UseSoftwareBackend()) {
+        software_rasterizer.texture_window(mask_x, mask_y, off_x, off_y);
+        return;
+    }
 #endif
     mask_x &= 0x1F;
     mask_y &= 0x1F;
@@ -205,7 +212,10 @@ void Draw_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
 }
 void Draw_SetMask(int bit0, int bit1) {
 #ifdef PSYZ_SOFTWARE_ROUTING
-    if (UseSoftwareBackend()) { software_rasterizer.mask(bit0, bit1); return; }
+    if (UseSoftwareBackend()) {
+        software_rasterizer.mask(bit0, bit1);
+        return;
+    }
 #endif
     if (bit0 || bit1) {
         NOT_IMPLEMENTED;

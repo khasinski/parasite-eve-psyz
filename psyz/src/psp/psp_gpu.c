@@ -1059,12 +1059,16 @@ unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
     return out;
 }
 
-unsigned char* Psyz_VideoAllocRenderedFrame(int* w,int* h) {
-    if (w) *w=0;
-    if (h) *h=0;
-    if (!w || !h) return NULL;
-    unsigned char* pixels=Psyz_VideoAllocCapturedFrame(w,h);
-    if (!pixels) *w=*h=0;
+unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
+    if (w)
+        *w = 0;
+    if (h)
+        *h = 0;
+    if (!w || !h)
+        return NULL;
+    unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
+    if (!pixels)
+        *w = *h = 0;
     return pixels;
 }
 

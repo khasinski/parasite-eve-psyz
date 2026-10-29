@@ -526,7 +526,8 @@ static void xa_decode_28(const unsigned char* blk, int sub, int nibble,
     for (int j = 0; j < 28; j++) {
         const unsigned char byte = blk[16 + sub + j * 4];
         const int t = s4((byte >> (nibble * 4)) & 0x0F);
-        const int s = t * (1 << shift) + (((*prev) * f0 + (*prev2) * f1 + 32) / 64);
+        const int s =
+            t * (1 << shift) + (((*prev) * f0 + (*prev2) * f1 + 32) / 64);
         dst[j * stride] = clamp16(s);
         *prev2 = *prev;
         *prev = s;
@@ -582,20 +583,24 @@ static int xa_read_and_decode_sector(void) {
      * (4 at 1x). Do not decode unrelated clips after the filter gap. */
     int silent_sectors = (CD_mode & CdlModeSpeed) ? 8 : 4;
     if (xa.silent_sectors_pending) {
-        xa.silent_sectors_pending = xa.silent_sectors_pending > silent_sectors
-            ? xa.silent_sectors_pending - silent_sectors : 0;
+        xa.silent_sectors_pending =
+            xa.silent_sectors_pending > silent_sectors
+                ? xa.silent_sectors_pending - silent_sectors
+                : 0;
         goto silence;
     }
     while (!xa.stream_ended || silent_sectors-- > 0) {
-        const size_t n = disk_read_cb
-            ? (size_t)disk_read_cb(&(struct PsyzCdRead){
-                (unsigned int)(xa.cur_abs_sector + 1), SECTOR_SIZE, sector})
-            : fread(sector, 1, SECTOR_SIZE, track_file);
+        const size_t n =
+            disk_read_cb ? (size_t)disk_read_cb(&(struct PsyzCdRead){
+                               (unsigned int)(xa.cur_abs_sector + 1),
+                               SECTOR_SIZE, sector})
+                         : fread(sector, 1, SECTOR_SIZE, track_file);
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
         }
         xa.cur_abs_sector++;
-        if (xa.stream_ended) continue;
+        if (xa.stream_ended)
+            continue;
         const unsigned char file = sector[0x10];
         const unsigned char channel = sector[0x11];
         const unsigned char submode = sector[0x12];
@@ -718,7 +723,8 @@ end:
     if (hit_eof) {
         is_playing = 0;
         xa.active = 0;
-        if (xa.cur_abs_sector >= 0) CdIntToPos(xa.cur_abs_sector, &CD_pos);
+        if (xa.cur_abs_sector >= 0)
+            CdIntToPos(xa.cur_abs_sector, &CD_pos);
     }
     Psyz_AudioUnlock();
     if (hit_eof) {

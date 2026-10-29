@@ -12,9 +12,11 @@ volatile u16 _spu_RQ[10] = {0};
 void SpuNGetVoiceAttr(int vNum, SpuVoiceAttr* arg) { NOT_IMPLEMENTED; }
 
 void SpuGetVoiceEnvelope(int voiceNum, short* envx) {
-    if (!envx) return;
+    if (!envx)
+        return;
     *envx = voiceNum >= 0 && voiceNum < NUM_VOICES
-                ? (short)SPURV(voiceNum, volumex) : 0;
+                ? (short)SPURV(voiceNum, volumex)
+                : 0;
 }
 
 void SpuSetReverbModeDepth(short depthL, short depthR) {

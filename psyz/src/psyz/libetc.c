@@ -71,7 +71,8 @@ static unsigned dma_pending;
 static int dma_dispatching;
 
 void* DMACallback(int dma, void (*func)()) {
-    if (dma < 0 || dma >= 7) return NULL;
+    if (dma < 0 || dma >= 7)
+        return NULL;
     void (*previous)(void) = dma_callbacks[dma];
     dma_callbacks[dma] = func;
     return (void*)previous;
@@ -80,16 +81,20 @@ void* DMACallback(int dma, void (*func)()) {
 /* Transfers finish synchronously on PC. A callback may start another one;
  * dispatch its completion after the current callback returns, as DMA would. */
 void Psyz_DmaComplete(unsigned channel) {
-    if (channel >= 7) return;
+    if (channel >= 7)
+        return;
     dma_pending |= 1u << channel;
-    if (dma_dispatching) return;
+    if (dma_dispatching)
+        return;
     dma_dispatching = 1;
     while (dma_pending) {
         unsigned next = 0;
-        while (!(dma_pending & (1u << next))) ++next;
+        while (!(dma_pending & (1u << next)))
+            ++next;
         dma_pending &= ~(1u << next);
         void (*callback)(void) = dma_callbacks[next];
-        if (callback) callback();
+        if (callback)
+            callback();
     }
     dma_dispatching = 0;
 }

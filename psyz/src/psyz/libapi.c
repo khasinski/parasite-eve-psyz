@@ -55,13 +55,17 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
 static unsigned int last_vsync_count;
 int VSync(int mode) {
     Psyz_KernelPoll();
-    if (mode < 0) return Psyz_VideoVSync(-1);
-    if (mode == 1) return Psyz_VideoVSync(1);
+    if (mode < 0)
+        return Psyz_VideoVSync(-1);
+    if (mode == 1)
+        return Psyz_VideoVSync(1);
 
     int elapsed = Psyz_VideoVSync(1);
     unsigned int now = (unsigned int)Psyz_VideoVSync(-1);
-    unsigned int target = mode > 1 ? last_vsync_count + (unsigned int)mode : now + 1;
-    if ((int32_t)(target - now) < 1) target = now + 1;
+    unsigned int target =
+        mode > 1 ? last_vsync_count + (unsigned int)mode : now + 1;
+    if ((int32_t)(target - now) < 1)
+        target = now + 1;
     do {
         unsigned int before = now;
         Psyz_VideoVSync(0);
@@ -69,7 +73,8 @@ int VSync(int mode) {
         unsigned int advanced = now - before;
         while (advanced--) {
             ReadPadsOnVsync();
-            if (g_PsyzVsyncCb) g_PsyzVsyncCb();
+            if (g_PsyzVsyncCb)
+                g_PsyzVsyncCb();
             Psyz_KernelVBlank();
         }
     } while ((int32_t)(now - target) < 0);
@@ -77,8 +82,8 @@ int VSync(int mode) {
      * return just after it; using that late return as the next origin adds a
      * blank repeatedly and lets FMV pictures drift behind device audio.
      * A whole missed interval resynchronizes rather than replaying a stall. */
-    last_vsync_count = mode > 1 && now - target < (unsigned int)mode
-        ? target : now;
+    last_vsync_count =
+        mode > 1 && now - target < (unsigned int)mode ? target : now;
     return elapsed;
 }
 

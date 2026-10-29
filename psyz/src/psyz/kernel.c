@@ -1,5 +1,8 @@
 // PS1 kernel events, critical sections, root counters and the interrupt
 // controller behind libetc's callbacks.
+#ifdef __PSP__
+#include <pspkernel.h>
+#endif
 #include <psyz.h>
 #include <psyz/log.h>
 #include <kernel.h>
@@ -18,7 +21,15 @@ static inline uint64_t AtomicTimeLoad(AtomicTime* p) {
     return (uint64_t)_InterlockedCompareExchange64(p, 0, 0);
 }
 static inline void AtomicTimeStore(AtomicTime* p, uint64_t v) {
-    _InterlockedExchange64(p, (__int64)v);
+    /* Exchange64 is not available on 32-bit MSVC; cmpxchg8b is. */
+    uint64_t previous = AtomicTimeLoad(p);
+    for (;;) {
+        uint64_t observed = (uint64_t)_InterlockedCompareExchange64(
+            p, (__int64)v, (__int64)previous);
+        if (observed == previous)
+            break;
+        previous = observed;
+    }
 }
 static inline long AtomicLoad(AtomicWord* p) { return _InterlockedOr(p, 0); }
 static inline void AtomicStore(AtomicWord* p, long v) {
@@ -34,10 +45,25 @@ static inline void AtomicAdd(AtomicWord* p, long v) {
 typedef long AtomicWord;
 typedef uint64_t AtomicTime;
 static inline uint64_t AtomicTimeLoad(AtomicTime* p) {
+#ifdef __PSP__
+    /* Single-core Allegrex cannot emit 64-bit atomics. Keep the short
+     * two-word access indivisible against interrupt/thread switches. */
+    unsigned state = sceKernelCpuSuspendIntr();
+    uint64_t value = *(volatile uint64_t*)p;
+    sceKernelCpuResumeIntr(state);
+    return value;
+#else
     return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+#endif
 }
 static inline void AtomicTimeStore(AtomicTime* p, uint64_t v) {
+#ifdef __PSP__
+    unsigned state = sceKernelCpuSuspendIntr();
+    *(volatile uint64_t*)p = v;
+    sceKernelCpuResumeIntr(state);
+#else
     __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+#endif
 }
 static inline long AtomicLoad(AtomicWord* p) {
     return __atomic_load_n(p, __ATOMIC_SEQ_CST);
@@ -139,27 +165,31 @@ static void (*irq_callbacks[IRQ_COUNT])(void) = {VSyncDispatch};
 
 /* Offline playback owns emulated time. Host scheduling must not change AKAO
  * timer counts or positions within the mixed PCM stream. Fixed at startup. */
-static AtomicWord audio_clock=-1;
+static AtomicWord audio_clock = -1;
 static AtomicTime audio_time_us;
 static unsigned audio_time_fraction;
 static AtomicWord host_clock_paused;
+static AtomicWord host_clock_speed = 1;
+/* Kernel time = wall time * speed - offset (modulo 2^64). */
 static AtomicTime host_clock_frozen_us, host_clock_offset_us;
-static uint64_t host_clock_pause_started_us;
 
 static int UsesAudioClock(void) {
-    long mode=AtomicLoad(&audio_clock);
-    if(mode<0){
-        const char* clock=getenv("PSYZ_AUDIO_CLOCK");
-        AtomicCas(&audio_clock,-1,clock && !strcmp(clock,"video"));
-        mode=AtomicLoad(&audio_clock);
+    long mode = AtomicLoad(&audio_clock);
+    if (mode < 0) {
+        const char* clock = getenv("PSYZ_AUDIO_CLOCK");
+        AtomicCas(&audio_clock, -1, clock && !strcmp(clock, "video"));
+        mode = AtomicLoad(&audio_clock);
     }
     return (int)mode;
 }
 
 static uint64_t KernelNowUs(void) {
-    if(UsesAudioClock())return AtomicTimeLoad(&audio_time_us);
-    if(AtomicLoad(&host_clock_paused))return AtomicTimeLoad(&host_clock_frozen_us);
-    return Psyz_OsNowUs()-AtomicTimeLoad(&host_clock_offset_us);
+    if (UsesAudioClock())
+        return AtomicTimeLoad(&audio_time_us);
+    if (AtomicLoad(&host_clock_paused))
+        return AtomicTimeLoad(&host_clock_frozen_us);
+    return Psyz_OsNowUs() * (uint64_t)AtomicLoad(&host_clock_speed) -
+           AtomicTimeLoad(&host_clock_offset_us);
 }
 
 static void KernelInit(void) {
@@ -548,8 +578,8 @@ static void IrqThread(void) {
         uint64_t now = KernelNowUs();
         if (deadline > now) {
             uint64_t left = deadline - now;
-            Psyz_OsBellWait(bell_irq,
-                (uint32_t)(left < INT32_MAX ? left : INT32_MAX));
+            Psyz_OsBellWait(
+                bell_irq, (uint32_t)(left < INT32_MAX ? left : INT32_MAX));
         }
     }
 }
@@ -559,24 +589,46 @@ static void StartIrqThread(void) {
         return;
     }
     KernelInit();
-    if(UsesAudioClock()){irq_thread_state=-1;return;}
+    if (UsesAudioClock()) {
+        irq_thread_state = -1;
+        return;
+    }
     irq_thread_state = Psyz_OsThreadStart(IrqThread, "psyz_irq") ? -1 : 1;
 }
 
 /* Desktop modal/focus pauses exclude wall time from root counters too.
  * Freezing only video/audio leaves AKAO sequencing ahead on return. */
 void Psyz_KernelPauseHostClock(int paused) {
-    if(UsesAudioClock())return;
+    if (UsesAudioClock())
+        return;
     KernelLock();
-    if(paused && !AtomicLoad(&host_clock_paused)){
-        host_clock_pause_started_us=Psyz_OsNowUs();
-        AtomicTimeStore(&host_clock_frozen_us,host_clock_pause_started_us-
-                         AtomicTimeLoad(&host_clock_offset_us));
-        AtomicStore(&host_clock_paused,1);
-    }else if(!paused && AtomicLoad(&host_clock_paused)){
-        AtomicTimeStore(&host_clock_offset_us,AtomicTimeLoad(&host_clock_offset_us)+
-                         Psyz_OsNowUs()-host_clock_pause_started_us);
-        AtomicStore(&host_clock_paused,0);
+    if (paused && !AtomicLoad(&host_clock_paused)) {
+        AtomicTimeStore(&host_clock_frozen_us, KernelNowUs());
+        AtomicStore(&host_clock_paused, 1);
+    } else if (!paused && AtomicLoad(&host_clock_paused)) {
+        AtomicTimeStore(
+            &host_clock_offset_us,
+            Psyz_OsNowUs() * (uint64_t)AtomicLoad(&host_clock_speed) -
+                AtomicTimeLoad(&host_clock_frozen_us));
+        AtomicStore(&host_clock_paused, 0);
+    }
+    KernelUnlock();
+    Psyz_OsBellRing(bell_irq);
+}
+
+/* Root counters run `speed` times faster from now on, without a jump.
+ * Offline playback takes its time from the mixed audio instead. */
+void Psyz_KernelSetHostClockSpeed(unsigned speed) {
+    if (UsesAudioClock())
+        return;
+    KernelLock();
+    if (AtomicLoad(&host_clock_paused)) {
+        AtomicStore(&host_clock_speed, (long)speed);
+    } else {
+        uint64_t now = KernelNowUs();
+        AtomicStore(&host_clock_speed, (long)speed);
+        AtomicTimeStore(
+            &host_clock_offset_us, Psyz_OsNowUs() * (uint64_t)speed - now);
     }
     KernelUnlock();
     Psyz_OsBellRing(bell_irq);
@@ -585,7 +637,8 @@ void Psyz_KernelPauseHostClock(int paused) {
 void Psyz_KernelPoll(void) {
     uint64_t deadline;
     if (!irq_thread_state || OwnsKernel() ||
-        (!UsesAudioClock() && !IsDue(AtomicTimeLoad(&poll_deadline_us), KernelNowUs()))) {
+        (!UsesAudioClock() &&
+         !IsDue(AtomicTimeLoad(&poll_deadline_us), KernelNowUs()))) {
         return;
     }
     ServiceTimers(&deadline);
@@ -594,22 +647,28 @@ void Psyz_KernelPoll(void) {
 /* Keep a timer edge between sample batches, rather than moving every AKAO
  * update to the video-frame boundary. These endpoints are private to SDL. */
 unsigned Psyz_KernelAudioBatch(unsigned maximum) {
-    if(!UsesAudioClock())return maximum;
+    if (!UsesAudioClock())
+        return maximum;
     Psyz_KernelPoll();
-    if(!irq_thread_state)return maximum;
-    uint64_t deadline=AtomicTimeLoad(&poll_deadline_us);
-    uint64_t now=AtomicTimeLoad(&audio_time_us);
-    if(deadline<=now)return 1;
-    uint64_t until=(deadline-now)*PSYZ_SPU_SAMPLE_RATE-audio_time_fraction;
-    uint64_t frames=(until+999999)/1000000;
-    return frames<maximum?(unsigned)(frames?frames:1):maximum;
+    if (!irq_thread_state)
+        return maximum;
+    uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
+    uint64_t now = AtomicTimeLoad(&audio_time_us);
+    if (deadline <= now)
+        return 1;
+    uint64_t until =
+        (deadline - now) * PSYZ_SPU_SAMPLE_RATE - audio_time_fraction;
+    uint64_t frames = (until + 999999) / 1000000;
+    return frames < maximum ? (unsigned)(frames ? frames : 1) : maximum;
 }
 
 void Psyz_KernelAdvanceAudio(unsigned frames) {
-    if(!UsesAudioClock())return;
-    uint64_t fraction=audio_time_fraction+(uint64_t)frames*1000000;
-    AtomicTimeStore(&audio_time_us,AtomicTimeLoad(&audio_time_us)+fraction/PSYZ_SPU_SAMPLE_RATE);
-    audio_time_fraction=(unsigned)(fraction%PSYZ_SPU_SAMPLE_RATE);
+    if (!UsesAudioClock())
+        return;
+    uint64_t fraction = audio_time_fraction + (uint64_t)frames * 1000000;
+    AtomicTimeStore(&audio_time_us, AtomicTimeLoad(&audio_time_us) +
+                                        fraction / PSYZ_SPU_SAMPLE_RATE);
+    audio_time_fraction = (unsigned)(fraction % PSYZ_SPU_SAMPLE_RATE);
     Psyz_KernelPoll();
 }
 

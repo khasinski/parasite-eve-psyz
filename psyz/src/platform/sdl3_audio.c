@@ -11,12 +11,24 @@
 static SDL_AudioStream* sdl_stream;
 static unsigned output_volume = 100;
 int Psyz_AudioSetOutputVolume(unsigned percent) {
-    if (percent > 100) return -1;
-    if (sdl_stream && !SDL_SetAudioStreamGain(sdl_stream, (float)percent / 100.0f)) return -1;
+    if (percent > 100)
+        return -1;
+    if (sdl_stream &&
+        !SDL_SetAudioStreamGain(sdl_stream, (float)percent / 100.0f))
+        return -1;
     output_volume = percent;
     return 0;
 }
 unsigned Psyz_AudioGetOutputVolume(void) { return output_volume; }
+
+/* Game speed: the device pulls SPU samples that much faster, keeping every
+ * voice, CD stream and sequence in step with the game (higher pitch). */
+static unsigned audio_speed = 1;
+void Sdl3Audio_SetSpeed(unsigned speed) {
+    audio_speed = speed;
+    if (sdl_stream)
+        SDL_SetAudioStreamFrequencyRatio(sdl_stream, (float)speed);
+}
 
 static SDL_Mutex* mutex;
 static bool video_clock, video_paused;
@@ -26,11 +38,11 @@ static bool video_pal;
 static PsyzAudioCaptureCallback capture_callback;
 static void* capture_userdata;
 
-void Psyz_AudioSetCaptureCallback(PsyzAudioCaptureCallback callback,
-                                  void* userdata) {
+void Psyz_AudioSetCaptureCallback(
+    PsyzAudioCaptureCallback callback, void* userdata) {
     Psyz_AudioLock();
-    capture_callback=callback;
-    capture_userdata=userdata;
+    capture_callback = callback;
+    capture_userdata = userdata;
     Psyz_AudioUnlock();
 }
 
@@ -51,7 +63,8 @@ static void SDLCALL audio_callback(void* userdata, SDL_AudioStream* stream,
         if (batch > 2048)
             batch = 2048;
         Psyz_SpuPullSamples(buf, batch);
-        if (capture_callback) capture_callback(buf,batch,capture_userdata);
+        if (capture_callback)
+            capture_callback(buf, batch, capture_userdata);
         SDL_PutAudioStreamData(stream, buf, batch * N_CHANNELS * SAMPLE_SIZE);
         num_frames -= batch;
     }
@@ -68,7 +81,8 @@ int Psyz_AudioInit(void) {
     video_clock = clock && SDL_strcmp(clock, "video") == 0;
     if (video_clock) {
         mutex = SDL_CreateMutex();
-        if (!mutex) return -1;
+        if (!mutex)
+            return -1;
         video_paused = false;
         video_remainder = 0;
         video_pal = false;
@@ -103,6 +117,7 @@ int Psyz_AudioInit(void) {
     }
 
     SDL_SetAudioStreamGain(sdl_stream, (float)output_volume / 100.0f);
+    SDL_SetAudioStreamFrequencyRatio(sdl_stream, (float)audio_speed);
     if (!SDL_ResumeAudioStreamDevice(sdl_stream)) {
         WARNF("failed to resume audio device: %s", SDL_GetError());
     }
@@ -121,7 +136,8 @@ void Psyz_AudioDestroy(void) {
         SDL_DestroyMutex(mutex);
         mutex = NULL;
     }
-    capture_callback=NULL;capture_userdata=NULL;
+    capture_callback = NULL;
+    capture_userdata = NULL;
     is_audio_init = false;
     video_clock = false;
 }
@@ -153,24 +169,27 @@ void Psyz_AudioUnpause(void) {
 }
 
 int Psyz_AudioIsPaused(void) {
-    if (video_clock) return !is_audio_init || video_paused;
+    if (video_clock)
+        return !is_audio_init || video_paused;
     return !sdl_stream || SDL_AudioStreamDevicePaused(sdl_stream);
 }
 
 static void MixOfflineFrames(unsigned frames) {
-    short samples[2*883];
-    unsigned offset=0;
-    while(offset<frames){
-        unsigned batch=Psyz_KernelAudioBatch(frames-offset);
-        Psyz_SpuPullSamples(samples+offset*2,(int)batch);
+    short samples[2 * 883];
+    unsigned offset = 0;
+    while (offset < frames) {
+        unsigned batch = Psyz_KernelAudioBatch(frames - offset);
+        Psyz_SpuPullSamples(samples + offset * 2, (int)batch);
         Psyz_KernelAdvanceAudio(batch);
-        offset+=batch;
+        offset += batch;
     }
-    if(capture_callback)capture_callback(samples,(int)frames,capture_userdata);
+    if (capture_callback)
+        capture_callback(samples, (int)frames, capture_userdata);
 }
 
 int Psyz_AudioWaitForTimer(void) {
-    if(!is_audio_init || !video_clock || video_paused)return 0;
+    if (!is_audio_init || !video_clock || video_paused)
+        return 0;
     SDL_LockMutex(mutex);
     MixOfflineFrames(Psyz_KernelAudioBatch(883));
     SDL_UnlockMutex(mutex);
@@ -180,8 +199,10 @@ int Psyz_AudioWaitForTimer(void) {
 /* SDL backend clock for offline runs. Queries and wall time never consume
  * samples. Carry the NTSC fraction so 60000 blanks yield 44100*1001 frames. */
 void Sdl3Audio_VBlank(bool pal) {
-    if (!is_audio_init || !video_clock || video_paused) return;
-    if (pal != video_pal) video_remainder = 0;
+    if (!is_audio_init || !video_clock || video_paused)
+        return;
+    if (pal != video_pal)
+        video_remainder = 0;
     video_pal = pal;
     unsigned divisor = pal ? 50 : 60000;
     video_remainder += PSYZ_SPU_SAMPLE_RATE * (pal ? 1u : 1001u);

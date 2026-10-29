@@ -16,6 +16,8 @@ jobs:
     env:
       CI: 1
       OS: linux
+      SDL_AUDIO_DRIVER: dummy
+      PSYZ_HEADLESS: gpu
     steps:
       - name: Install requirements
         run: |
@@ -48,6 +50,8 @@ jobs:
     env:
       CI: 1
       OS: linux
+      SDL_AUDIO_DRIVER: dummy
+      PSYZ_HEADLESS: gpu
     steps:
       - name: Clone repo
         uses: actions/checkout@v4
@@ -62,6 +66,8 @@ jobs:
     env:
       CI: 1
       OS: windows
+      SDL_AUDIO_DRIVER: dummy
+      PSYZ_HEADLESS: gpu
       SDL_VIDEODRIVER: offscreen
     strategy:
       fail-fast: false
@@ -89,6 +95,25 @@ jobs:
       - name: Test PsyZ on Windows (${{ matrix.arch }}, ${{ matrix.compiler.name }})
         working-directory: psyz/
         run: ./${{ matrix.compiler.script }} -A ${{ matrix.arch }}
+      - name: Compare polygon fixture with base shaders
+        if: failure() && github.event_name == 'pull_request' && matrix.arch == 'x64'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TEST_COMPILER: ${{ matrix.compiler.name }}
+        shell: pwsh
+        run: |
+          git fetch origin $env:BASE_SHA --depth=1
+          foreach ($shader in @('psx_vert_dxil.h', 'psx_frag_dxil.h')) {
+            $path = "psyz/src/platform/shaders/$shader"
+            git show "$($env:BASE_SHA):$path" | Set-Content -Encoding utf8 $path
+          }
+          $build = if ($env:TEST_COMPILER -eq 'MSVC') { 'msvc' } else { 'clang' }
+          cmake --build "psyz/tests/build/$build" --config Debug
+          Push-Location psyz/tests
+          & "./build/$build/Debug/psyz_tests.exe" '--filter=gpu::ps1_polygon_attribute_gradients'
+          $result = $LASTEXITCODE
+          Pop-Location
+          exit $result
       - name: Build and run overlays sample (${{ matrix.compiler.name }}, ${{ matrix.arch }})
         run: |
           cmake -S samples/overlays -B samples/overlays/build -A ${{ matrix.arch }} ${{ matrix.compiler.toolset }}
@@ -107,6 +132,8 @@ jobs:
     env:
       CI: 1
       OS: darwin
+      SDL_AUDIO_DRIVER: dummy
+      PSYZ_HEADLESS: gpu
     steps:
       - name: Install requirements
         run: brew install cmake ninja sdl2

@@ -21,6 +21,11 @@ extern "C" {
  */
 void Psyz_SetTitle(const char* str);
 
+/* Optional display-only PNG backdrop for an RGB24 screen. Pixels differing
+ * from the supplied native RGB reference remain native UI. NULL disables it. */
+int Psyz_VideoSetRgb24Backdrop(const char *filename, const unsigned char *reference,
+                             int width, int height, int top, int bottom);
+
 typedef enum {
     /**
      * Auto-detect use of driver VSync (default)
@@ -69,7 +74,7 @@ typedef enum {
 
 typedef enum {
     PSYZ_DITHER_AUTO, /**< let the game decide whether to dither (default) */
-    PSYZ_DITHER_OFF,  /**< force dithering always off */
+    PSYZ_DITHER_OFF,  /**< disable dithering and RGB555 shading quantization on desktop GPUs */
 } PsyzDitherMode;
 
 typedef enum {
@@ -225,6 +230,94 @@ int Psyz_VideoSetModelFiltering(int enabled);
 int Psyz_VideoGetModelFiltering(void);
 
 /**
+ * @brief Widescreen: present a 4:3 game at 16:9 with more of its picture
+ *
+ * While on, everything drawn into the display buffers (drawing areas inside
+ * the display's VRAM columns and the first two display heights of VRAM rows,
+ * where double buffers are stacked) is squeezed to 3/4 of its width around
+ * the buffer's centre. What the game draws from -1/6 to 7/6 of its screen
+ * width then fills the buffer, and the buffer is presented 4/3 wider, so
+ * everything keeps its shape. Untextured fills that cover the whole screen
+ * width are widened by the margin on both sides. The game has to draw the
+ * extra picture itself (wider culling: a sixth of the screen width past each
+ * side, plus the view's shift, see Psyz_VideoSetWidescreenPicture).
+ * 24-bit (movie) display stays 4:3. A drawing area clip narrower than the
+ * screen is squeezed with what it clips. Native VRAM is squeezed too, so
+ * read-backs of the display buffers see the presented picture.
+ * Only the SDL GPU renderer supports it; elsewhere it stays off.
+ *
+ * @param enabled Non-zero to enable, 0 to disable
+ * @return 0 on success, -1 when not supported
+ */
+int Psyz_VideoSetWidescreen(int enabled);
+int Psyz_VideoGetWidescreen(void);
+
+/**
+ * @brief Tell the presenter where the game's picture is in one buffer
+ *
+ * left and right are game pixels relative to the screen's left edge. The
+ * 16:9 view is slid towards the side that has picture until its edge meets
+ * the picture's end, at most as far as keeps the game's own screen inside it
+ * (39 pixels at 320x224); a span narrower than the view shows only the 4:3
+ * screen, unshifted, with even bars. The
+ * buffer's squeeze follows the shift, so the view always fits in the buffer:
+ * the game should draw its picture up to 0.3 of the screen width past each
+ * side. Everything outside the span stays black. Call it before drawing the
+ * frame into that buffer. left >= right presents the whole buffer, unshifted.
+ *
+ * @param buffer_y VRAM row of the buffer's drawing area
+ */
+void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right);
+
+/**
+ * @brief Draw centred in the 16:9 view, ignoring the view's shift
+ *
+ * While on, drawing into a display buffer lands where it would with the view
+ * unshifted: the game screen's centre is the view's centre. For layers that
+ * belong to the screen rather than the room (menus over a room whose view is
+ * shifted at its end). Psyz_VideoSetWidescreenPicture turns it off. To switch
+ * it in ordering-table order, call it from a GP0 command handler (see
+ * Psyz_GpuRegisterCommandHandler).
+ *
+ * @param enabled Non-zero to draw centred, 0 to follow the view's shift
+ */
+void Psyz_VideoSetWidescreenCentred(int enabled);
+
+/**
+ * @brief Psyz_VideoSetWidescreenPicture for a room that belongs between pixels
+ *
+ * As Psyz_VideoSetWidescreenPicture, for a frame whose room (its background
+ * and models) belongs dx, dy game pixels right and down of where the game
+ * draws it, for a camera the game keeps in whole pixels. Widescreen only:
+ * the room is drawn moved by whole pixels of the shown picture, chosen so
+ * the squeezed room keeps its texels' shape, and the presenter shows the
+ * rest, so slow pans move evenly at any internal resolution. A view that
+ * follows the picture's end follows it to the fraction. Only layers drawn
+ * while Psyz_VideoSetWidescreenField is on move; the presenter's part moves
+ * the whole picture, up to half a pixel of the shown picture. The game must
+ * draw 3 game pixels more past each side. Native VRAM under a high
+ * resolution picture keeps the game's own picture.
+ *
+ * @param buffer_y VRAM row of the buffer's drawing area
+ * @param dx, dy Where the room belongs, -2 to 2 game pixels
+ * @param camera_x The camera's whole-pixel x the room is drawn for (screen
+ *                 x = world x - camera_x plus a constant)
+ */
+void Psyz_VideoSetWidescreenPictureShifted(int buffer_y, int left, int right, float dx, float dy,
+                                           int camera_x);
+
+/**
+ * @brief Mark drawing as the room (see Psyz_VideoSetWidescreenPictureShifted)
+ *
+ * Psyz_VideoSetWidescreenPicture* turns it off. To switch it in
+ * ordering-table order, call it from a GP0 command handler (see
+ * Psyz_GpuRegisterCommandHandler).
+ *
+ * @param enabled Non-zero while the room is drawn
+ */
+void Psyz_VideoSetWidescreenField(int enabled);
+
+/**
  * @brief Synchronize with vertical blank
  *
  * Synchronize with the refresh rate mode set in Psyz_VideoSetVsyncMode.
@@ -237,6 +330,22 @@ int Psyz_VideoGetModelFiltering(void);
  * @return Simulates the SDK VSync return values as closely as possible.
  */
 int Psyz_VideoVSync(int mode);
+
+/**
+ * @brief Run the game faster than real time (default: 1)
+ *
+ * Frame pacing, the vertical blank count, root counters and audio all run
+ * `speed` times faster, so the game behaves as at normal speed. The VSync
+ * mode and the swapchain are left as they are: with driver VSync only the
+ * newest frame of each refresh is shown, so presents never queue up.
+ * Audio plays at a higher pitch.
+ *
+ * @param speed 1 (normal) to PSYZ_SPEED_MAX
+ * @return 0 on success, -1 if invalid speed
+ */
+#define PSYZ_SPEED_MAX 4
+int Psyz_VideoSetSpeed(unsigned speed);
+unsigned Psyz_VideoGetSpeed(void);
 
 /**
  * @brief Get frame timing statistics
@@ -262,6 +371,8 @@ unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h);
  *
  * Includes internal-resolution detail for RGB555 GPU output. RGB24 movies
  * and platforms without internal scaling retain their native dimensions.
+ * Widescreen GPU output includes the final 16:9 crop, scaling and black bars,
+ * using the same presenter as the game window, including hidden windows.
  * Does not change the dimensions or behavior of AllocCapturedFrame.
  *
  * @param w Required output width (zero on failure)

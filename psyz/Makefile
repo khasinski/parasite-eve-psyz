@@ -45,7 +45,7 @@ endif
 test-linux32:
 	@mkdir -p tests/build/linux32
 	@docker build -t psyz-i686 - < Dockerfile.i686
-	@docker run --rm $$([ -t 0 ] && echo -t) -u $$(id -u):$$(id -g) -e HOME=/tmp -e LANG=C.UTF-8 -e CI -e OS -w /src/psyz -v $(abspath ..):/src \
+	@docker run --rm $$([ -t 0 ] && echo -t) -u $$(id -u):$$(id -g) -e HOME=/tmp -e LANG=C.UTF-8 -e CI -e OS -e SDL_AUDIO_DRIVER -e PSYZ_HEADLESS -w /src/psyz -v $(abspath ..):/src \
 		-v $(CURDIR)/tests/build/linux32:/src/psyz/tests/build psyz-i686 make test
 
 PSP_TEST_CMAKE = cmake -G$(CMAKE_GEN) --log-level=WARNING -DCMAKE_TOOLCHAIN_FILE=$(CURDIR)/src/psp/psp.cmake -DCMAKE_BUILD_TYPE=Debug -S tests/ -B tests/build/psp

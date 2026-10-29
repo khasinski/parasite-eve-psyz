@@ -82,22 +82,27 @@ void SetDrawLoad(DR_LOAD* p, RECT* rect) {
 int MargePrim(void* p0, void* p1) {
 #ifdef __psyz
     if (!p0 || !p1 || (uintptr_t)p1 <= (uintptr_t)p0 ||
-        ((uintptr_t)p1 - (uintptr_t)p0) % 4) return -1;
+        ((uintptr_t)p1 - (uintptr_t)p0) % 4)
+        return -1;
     void* packets[2] = {p0, p1};
     int physical[2] = {getlen(p0), getlen(p1)};
     for (int which = 0; which < 2; ++which) {
         int code = getcode(packets[which]);
         if (sizeof(u_long) == 8 && !(code >= 0x20 && code < 0x80)) {
-            const u32* words = (const u32*)((char*)packets[which] + sizeof(OT_TYPE));
+            const u32* words =
+                (const u32*)((char*)packets[which] + sizeof(OT_TYPE));
             int packed = 0;
             for (int i = 0; i < physical[which]; ++i)
-                if (words[i] == PSYZ_MERGED_PRIM_NOP) packed = 1;
-            if (!packed) physical[which] *= 2;
+                if (words[i] == PSYZ_MERGED_PRIM_NOP)
+                    packed = 1;
+            if (!packed)
+                physical[which] *= 2;
         }
     }
     size_t distance = ((uintptr_t)p1 - (uintptr_t)p0) / 4;
     if (distance < (size_t)physical[0] + sizeof(OT_TYPE) / 4 ||
-        distance + physical[1] > 255) return -1;
+        distance + physical[1] > 255)
+        return -1;
     size_t gap = distance - physical[0];
     setlen(p0, distance + physical[1]);
     memset((char*)p0 + sizeof(OT_TYPE) + physical[0] * 4, 0, gap * 4);

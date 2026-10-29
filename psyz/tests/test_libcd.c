@@ -11,6 +11,10 @@
 #include <psyz.h>
 #include <libcd.h>
 #include <libspu.h>
+#if defined(__psyz) && !defined(__PSP__)
+#include <SDL3/SDL.h>
+static char* playback_saved_clock;
+#endif
 
 #ifdef _WIN32
 #include <direct.h>
@@ -721,7 +725,8 @@ static unsigned int xa_callback_sectors, xa_callback_reads;
 static int xa_image_read(struct PsyzCdRead* read) {
     if (read->size != SECTOR_SIZE || read->sector >= xa_callback_sectors)
         return -1;
-    memcpy(read->buffer, xa_callback_data + read->sector * SECTOR_SIZE, SECTOR_SIZE);
+    memcpy(read->buffer, xa_callback_data + read->sector * SECTOR_SIZE,
+           SECTOR_SIZE);
     ++xa_callback_reads;
     return SECTOR_SIZE;
 }
@@ -736,6 +741,17 @@ static int make_dir(const char* path) {
 
 ZTEST_SETUP(libcd_playback) {
     int ret;
+#if defined(__psyz) && !defined(__PSP__)
+    /* These tests pull exact PCM themselves. Do not let an in-flight device
+     * callback consume the beginning of a stream on a loaded CI runner. */
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    playback_saved_clock = clock ? SDL_strdup(clock) : NULL;
+    Psyz_AudioDestroy();
+    SDL_SetEnvironmentVariable(
+        SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true);
+    zassert_s32_eq(0, Psyz_AudioInit());
+    Psyz_AudioPause();
+#endif
     reset_state("psyz_libcdplayback_test_");
     ret = make_dir(dir);
     if (ret == -1) {
@@ -750,6 +766,15 @@ ZTEST_TEARDOWN(libcd_playback) {
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
     Psyz_AudioDestroy();
+#if defined(__psyz) && !defined(__PSP__)
+    if (playback_saved_clock) {
+        SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK",
+                                   playback_saved_clock, true);
+        SDL_free(playback_saved_clock);
+        playback_saved_clock = NULL;
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+#endif
     cleanup_files();
 }
 
@@ -774,8 +799,14 @@ ZTEST(libcd_playback, cdda_playback) {
     // Set arbitrary CD volume that will get reset with CdReset(1) anyway
     CdMix(&fake_vol);
 
-    // Initialize CD and audio systems
+    // Start from a known mixer state before CD reset writes its gains.
+    // Otherwise the device thread can latch them before our first pull.
+    zassert_s32_eq(0, Psyz_AudioInit());
+    Psyz_AudioPause();
+    Psyz_AudioLock();
+    Psyz_SpuReset(0);
     CdReset(1);
+    Psyz_AudioUnlock();
 
     // Set CD-DA mode (required for CDDA playback)
     param[0] = CdlModeDA;
@@ -808,7 +839,8 @@ ZTEST(libcd_playback, cdda_playback) {
     Psyz_AudioUnlock();
 
     // The direct master gain latches after the first sample.
-    zassert_s16_eq(0,out[0]);zassert_s16_eq(0,out[1]);
+    zassert_s16_eq(0, out[0]);
+    zassert_s16_eq(0, out[1]);
     for (i = 1; i < frame_count / 2; i++) {
         if (out[i * 2 + 0] != 0x2FFE) {
             zprintf("frame %d left channel unexpected value\n", i);
@@ -859,7 +891,8 @@ ZTEST(libcd_playback, xa_callback_matches_cue_and_stops_at_extent) {
     CdControlB(CdlReadN, NULL, NULL);
     size_t short_count = Psyz_CdPullSamples(actual, frames);
     zexpect_s32_eq(1, short_count > 64 && short_count < count);
-    zexpect_s32_eq(0, memcmp(expected, actual, short_count * 2 * sizeof(short)));
+    zexpect_s32_eq(
+        0, memcmp(expected, actual, short_count * 2 * sizeof(short)));
     CdControlB(CdlStop, NULL, NULL);
     Psyz_CdSetReadCB(NULL);
 }
@@ -869,39 +902,52 @@ ZTEST(libcd_playback, xa_callback_silent_tail_reaches_extent) {
     unsigned char* raw = test_calloc(sectors, SECTOR_SIZE);
     short* out = test_calloc(frames * 2, sizeof(short));
     for (int i = 0; i < sectors; ++i)
-        build_xa_sector_file(raw+i*SECTOR_SIZE,i,i>=8 && i<136?2:1);
+        build_xa_sector_file(
+            raw + i * SECTOR_SIZE, i, i >= 8 && i < 136 ? 2 : 1);
     CdReset(1);
-    u_char mode=CdlModeSpeed|CdlModeRT|CdlModeSF, filter[2]={1,0};
-    CdControlB(CdlSetmode,&mode,NULL);CdControlB(CdlSetfilter,filter,NULL);
+    u_char mode = CdlModeSpeed | CdlModeRT | CdlModeSF, filter[2] = {1, 0};
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdControlB(CdlSetfilter, filter, NULL);
     Psyz_AudioPause();
-    xa_callback_data=raw;xa_callback_sectors=sectors;xa_callback_reads=0;
+    xa_callback_data = raw;
+    xa_callback_sectors = sectors;
+    xa_callback_reads = 0;
     Psyz_CdSetReadCB(xa_image_read);
-    CdlLOC loc;CdIntToPos(0,&loc);CdControlB(CdlSetloc,(u_char*)&loc,NULL);
-    CdControlB(CdlReadN,NULL,NULL);
-    size_t count=Psyz_CdPullSamples(out,frames);
-    zexpect_s32_eq(sectors,xa_callback_reads);
-    zexpect_s32_eq(1,count>8*2352 && count<frames);
-    zexpect_s32_eq(0x1000,out[128]);
-    for(size_t i=8*2352+64;i<count;++i){
-        zassert_s16_eq(0,out[i*2]);zassert_s16_eq(0,out[i*2+1]);
+    CdlLOC loc;
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    CdControlB(CdlReadN, NULL, NULL);
+    size_t count = Psyz_CdPullSamples(out, frames);
+    zexpect_s32_eq(sectors, xa_callback_reads);
+    zexpect_s32_eq(1, count > 8 * 2352 && count < frames);
+    zexpect_s32_eq(0x1000, out[128]);
+    for (size_t i = 8 * 2352 + 64; i < count; ++i) {
+        zassert_s16_eq(0, out[i * 2]);
+        zassert_s16_eq(0, out[i * 2 + 1]);
     }
-    zexpect_s32_eq(0,Psyz_CdPullSamples(out,128));
-    u_char result[8];CdControlB(CdlGetlocL,NULL,result);
-    memcpy(&loc,result,sizeof(loc));
-    zexpect_s32_eq(sectors-1,CdPosToInt(&loc));
+    zexpect_s32_eq(0, Psyz_CdPullSamples(out, 128));
+    u_char result[8];
+    CdControlB(CdlGetlocL, NULL, result);
+    memcpy(&loc, result, sizeof(loc));
+    zexpect_s32_eq(sectors - 1, CdPosToInt(&loc));
     /* Switching 1x -> 2x with pending silence must not underflow its debt
      * and leave the stream emitting silence forever. */
-    CdControlB(CdlStop,NULL,NULL);
-    mode=CdlModeRT|CdlModeSF;CdControlB(CdlSetmode,&mode,NULL);
-    CdIntToPos(0,&loc);CdControlB(CdlSetloc,(u_char*)&loc,NULL);
-    xa_callback_reads=0;CdControlB(CdlReadN,NULL,NULL);
-    zexpect_s32_eq(8*2352+100,Psyz_CdPullSamples(out,8*2352+100));
-    mode|=CdlModeSpeed;CdControlB(CdlSetmode,&mode,NULL);
-    count=Psyz_CdPullSamples(out,frames);
-    zexpect_s32_eq(1,count>0 && count<frames);
-    zexpect_s32_eq(sectors,xa_callback_reads);
-    zexpect_s32_eq(0,Psyz_CdPullSamples(out,128));
-    CdControlB(CdlStop,NULL,NULL);Psyz_CdSetReadCB(NULL);
+    CdControlB(CdlStop, NULL, NULL);
+    mode = CdlModeRT | CdlModeSF;
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    xa_callback_reads = 0;
+    CdControlB(CdlReadN, NULL, NULL);
+    zexpect_s32_eq(8 * 2352 + 100, Psyz_CdPullSamples(out, 8 * 2352 + 100));
+    mode |= CdlModeSpeed;
+    CdControlB(CdlSetmode, &mode, NULL);
+    count = Psyz_CdPullSamples(out, frames);
+    zexpect_s32_eq(1, count > 0 && count < frames);
+    zexpect_s32_eq(sectors, xa_callback_reads);
+    zexpect_s32_eq(0, Psyz_CdPullSamples(out, 128));
+    CdControlB(CdlStop, NULL, NULL);
+    Psyz_CdSetReadCB(NULL);
 }
 
 ZTEST(libcd_playback, xa_playback) {
@@ -969,15 +1015,16 @@ ZTEST(libcd_playback, xa_playback) {
     }
     /* A short pull leaves decoded CD frames prefetched inside the SPU.
      * Stopping the decoder must silence that buffer immediately as well. */
-    const int stop_commands[]={CdlStop,CdlPause};
-    for(unsigned command=0;command<2;++command){
-        CdControl(CdlSetloc,(u_char *)&loc,NULL);
-        CdControl(CdlReadN,NULL,NULL);
-        Psyz_SpuPullSamples(out,128);
-        zassert_s16_ne(0,out[100]);
-        CdControl(stop_commands[command],NULL,NULL);
-        Psyz_SpuPullSamples(out,256);
-        for(i=0;i<512;++i)zassert_s16_eq(0,out[i]);
+    const int stop_commands[] = {CdlStop, CdlPause};
+    for (unsigned command = 0; command < 2; ++command) {
+        CdControl(CdlSetloc, (u_char*)&loc, NULL);
+        CdControl(CdlReadN, NULL, NULL);
+        Psyz_SpuPullSamples(out, 128);
+        zassert_s16_ne(0, out[100]);
+        CdControl(stop_commands[command], NULL, NULL);
+        Psyz_SpuPullSamples(out, 256);
+        for (i = 0; i < 512; ++i)
+            zassert_s16_eq(0, out[i]);
     }
 }
 
@@ -1111,27 +1158,31 @@ ZTEST(libcd_playback, xa_filtered_stream_ends_in_silence) {
     }
 }
 
-
 ZTEST(libcd_playback, xa_resampler_rounding) {
     enum { sectors = 32, frames = sectors * 2352 };
-    unsigned char *raw = test_calloc(sectors, SECTOR_SIZE);
-    short *out = test_calloc(frames * 2, sizeof(short));
+    unsigned char* raw = test_calloc(sectors, SECTOR_SIZE);
+    short* out = test_calloc(frames * 2, sizeof(short));
     unsigned seed = 0x4e415843u;
     for (int i = 0; i < sectors; ++i) {
         build_xa_sector(raw + i * SECTOR_SIZE, i);
         for (int group = 0; group < 18; ++group) {
-            unsigned char *block = raw + i * SECTOR_SIZE + 24 + group * 128;
+            unsigned char* block = raw + i * SECTOR_SIZE + 24 + group * 128;
             for (int byte = 16; byte < 128; ++byte) {
                 seed = seed * 1664525u + 1013904223u;
                 block[byte] = (unsigned char)(seed >> 24);
             }
         }
     }
-    mount_bin_cue_pair((unsigned short *)raw, sectors * SECTOR_SIZE / 2, "MODE2/2352");
-    CdReset(1);Psyz_AudioPause();
+    mount_bin_cue_pair(
+        (unsigned short*)raw, sectors * SECTOR_SIZE / 2, "MODE2/2352");
+    CdReset(1);
+    Psyz_AudioPause();
     u_char mode = CdlModeSpeed | CdlModeRT | CdlModeSF, filter[2] = {1, 0};
-    CdControlB(CdlSetmode, &mode, NULL);CdControlB(CdlSetfilter, filter, NULL);
-    CdlLOC loc;CdIntToPos(0, &loc);CdControlB(CdlSetloc, (u_char *)&loc, NULL);
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdControlB(CdlSetfilter, filter, NULL);
+    CdlLOC loc;
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
     CdControlB(CdlReadN, NULL, NULL);
     size_t count = Psyz_CdPullSamples(out, frames);
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -1141,7 +1192,7 @@ ZTEST(libcd_playback, xa_resampler_rounding) {
         hash = (hash ^ (sample >> 8)) * UINT64_C(1099511628211);
     }
     zprintf("XA varying-wave PCM frames %zu hash %08x%08x\n", count,
-        (unsigned)(hash >> 32), (unsigned)hash);
+            (unsigned)(hash >> 32), (unsigned)hash);
     zexpect_s32_eq(frames, count);
     zexpect_u32_eq(0xc1a616c2u, (unsigned)(hash >> 32));
     zexpect_u32_eq(0xd17dd80au, (unsigned)hash);

@@ -264,14 +264,14 @@ static int reverb_product14(int sample, int coefficient) {
 }
 
 static int reverb_inverse_phase(u16 coefficient) {
-    int value=spu_s16(coefficient);
+    int value = spu_s16(coefficient);
     return value == -32768 ? 32767 : -value;
 }
 
 static int reverb_iir_previous(int sample, int alpha) {
     if (alpha == -32768)
-        return sample == -32768 ? 0 : reverb_product14(sample,-65536);
-    return reverb_product14(sample,32768-alpha);
+        return sample == -32768 ? 0 : reverb_product14(sample, -65536);
+    return reverb_product14(sample, 32768 - alpha);
 }
 
 static short reverb_process_channel(unsigned channel, int sample) {
@@ -288,19 +288,25 @@ static short reverb_process_channel(unsigned channel, int sample) {
     const u16 apf2[2] = {r->mLAPF2, r->mRAPF2};
     const u16 in_coef[2] = {r->vLIN, r->vRIN};
     {
-        int iir_input_a = clamp16((
-            reverb_product14(reverb_read(same_src[channel],0),spu_s16(r->vWALL)) +
-            reverb_product14(sample,spu_s16(in_coef[channel]))) >> 1);
-        int iir_input_b = clamp16((
-            reverb_product14(reverb_read(diff_src[channel],0),spu_s16(r->vWALL)) +
-            reverb_product14(sample,spu_s16(in_coef[channel]))) >> 1);
-        int previous_a = reverb_read(same_dst[channel],-2);
-        int previous_b = reverb_read(diff_dst[channel],-2);
-        int alpha=spu_s16(r->vIIR);
-        int iir_a=clamp16((reverb_product14(iir_input_a,alpha) +
-                          reverb_iir_previous(previous_a,alpha)) >> 1);
-        int iir_b=clamp16((reverb_product14(iir_input_b,alpha) +
-                          reverb_iir_previous(previous_b,alpha)) >> 1);
+        int iir_input_a = clamp16(
+            (reverb_product14(
+                 reverb_read(same_src[channel], 0), spu_s16(r->vWALL)) +
+             reverb_product14(sample, spu_s16(in_coef[channel]))) >>
+            1);
+        int iir_input_b = clamp16(
+            (reverb_product14(
+                 reverb_read(diff_src[channel], 0), spu_s16(r->vWALL)) +
+             reverb_product14(sample, spu_s16(in_coef[channel]))) >>
+            1);
+        int previous_a = reverb_read(same_dst[channel], -2);
+        int previous_b = reverb_read(diff_dst[channel], -2);
+        int alpha = spu_s16(r->vIIR);
+        int iir_a = clamp16((reverb_product14(iir_input_a, alpha) +
+                             reverb_iir_previous(previous_a, alpha)) >>
+                            1);
+        int iir_b = clamp16((reverb_product14(iir_input_b, alpha) +
+                             reverb_iir_previous(previous_b, alpha)) >>
+                            1);
         int accumulator;
         int feedback_a;
         int feedback_b;
@@ -309,18 +315,27 @@ static short reverb_process_channel(unsigned channel, int sample) {
 
         reverb_write(same_dst[channel], iir_a);
         reverb_write(diff_dst[channel], iir_b);
-        accumulator = reverb_product14(reverb_read(comb1[channel],0),spu_s16(r->vCOMB1)) +
-                      reverb_product14(reverb_read(comb2[channel],0),spu_s16(r->vCOMB2)) +
-                      reverb_product14(reverb_read(comb3[channel],0),spu_s16(r->vCOMB3)) +
-                      reverb_product14(reverb_read(comb4[channel],0),spu_s16(r->vCOMB4));
-        feedback_a = reverb_read((u16)(apf1[channel] - r->dAPF1),0);
-        feedback_b = reverb_read((u16)(apf2[channel] - r->dAPF2),0);
-        mix_a = clamp16((accumulator +
-            reverb_product14(feedback_a,reverb_inverse_phase(r->vAPF1))) >> 1);
-        mix_b = clamp16(feedback_a + ((
-            reverb_product14(mix_a,spu_s16(r->vAPF1)) +
-            reverb_product14(feedback_b,reverb_inverse_phase(r->vAPF2))) >> 1));
-        sample = clamp16(feedback_b + reverb_mul(mix_b,r->vAPF2));
+        accumulator =
+            reverb_product14(
+                reverb_read(comb1[channel], 0), spu_s16(r->vCOMB1)) +
+            reverb_product14(
+                reverb_read(comb2[channel], 0), spu_s16(r->vCOMB2)) +
+            reverb_product14(
+                reverb_read(comb3[channel], 0), spu_s16(r->vCOMB3)) +
+            reverb_product14(
+                reverb_read(comb4[channel], 0), spu_s16(r->vCOMB4));
+        feedback_a = reverb_read((u16)(apf1[channel] - r->dAPF1), 0);
+        feedback_b = reverb_read((u16)(apf2[channel] - r->dAPF2), 0);
+        mix_a = clamp16(
+            (accumulator +
+             reverb_product14(feedback_a, reverb_inverse_phase(r->vAPF1))) >>
+            1);
+        mix_b = clamp16(
+            feedback_a +
+            ((reverb_product14(mix_a, spu_s16(r->vAPF1)) +
+              reverb_product14(feedback_b, reverb_inverse_phase(r->vAPF2))) >>
+             1));
+        sample = clamp16(feedback_b + reverb_mul(mix_b, r->vAPF2));
         reverb_write(apf1[channel], mix_a);
         reverb_write(apf2[channel], mix_b);
     }
@@ -338,30 +353,30 @@ static short reverb_process_channel(unsigned channel, int sample) {
 // Hardware half-band filter, documented in the SPU reverb specification.
 // Input is decimated by two; output inserts zeroes and doubles filter gain.
 static const short reverb_fir[39] = {
-    -1,0,2,0,-10,0,35,0,-103,0,266,0,-616,0,1332,0,-2960,0,
-    10246,16384,10246,0,-2960,0,1332,0,-616,0,266,0,-103,0,
-    35,0,-10,0,2,0,-1
-};
+    -1,   0, 2,     0, -10,   0,     35,    0, -103,  0, 266,  0, -616, 0,
+    1332, 0, -2960, 0, 10246, 16384, 10246, 0, -2960, 0, 1332, 0, -616, 0,
+    266,  0, -103,  0, 35,    0,     -10,   0, 2,     0, -1};
 
 static int reverb_filter(const short history[64], unsigned cursor, int shift) {
     int sum = 0;
-    for (unsigned tap=0;tap<39;++tap)
-        sum += reverb_fir[tap] * history[(cursor-tap)&63];
+    for (unsigned tap = 0; tap < 39; ++tap)
+        sum += reverb_fir[tap] * history[(cursor - tap) & 63];
     return clamp16(sum >> shift);
 }
 
 static void reverb_tick(int input_left, int input_right, int output[2]) {
-    unsigned cursor=spu.reverb_phase;
-    spu.reverb_input[0][cursor]=clamp16(input_left);
-    spu.reverb_input[1][cursor]=clamp16(input_right);
-    spu.reverb_output[0][cursor]=0;
-    spu.reverb_output[1][cursor]=0;
-    unsigned channel=(cursor&1)?0:1;
-    int downsampled=reverb_filter(spu.reverb_input[channel],cursor,15);
-    spu.reverb_output[channel][cursor]=reverb_process_channel(channel,downsampled);
-    output[0]=reverb_filter(spu.reverb_output[0],cursor,14);
-    output[1]=reverb_filter(spu.reverb_output[1],cursor,14);
-    spu.reverb_phase=(cursor+1)&63;
+    unsigned cursor = spu.reverb_phase;
+    spu.reverb_input[0][cursor] = clamp16(input_left);
+    spu.reverb_input[1][cursor] = clamp16(input_right);
+    spu.reverb_output[0][cursor] = 0;
+    spu.reverb_output[1][cursor] = 0;
+    unsigned channel = (cursor & 1) ? 0 : 1;
+    int downsampled = reverb_filter(spu.reverb_input[channel], cursor, 15);
+    spu.reverb_output[channel][cursor] =
+        reverb_process_channel(channel, downsampled);
+    output[0] = reverb_filter(spu.reverb_output[0], cursor, 14);
+    output[1] = reverb_filter(spu.reverb_output[1], cursor, 14);
+    spu.reverb_phase = (cursor + 1) & 63;
 }
 
 // generate one frame at 44100hz with voices mix, cd playback and volume control
@@ -401,8 +416,9 @@ static void spu_tick(short* out) {
     spu.noise_timer -= 4 + ((spucnt >> 8) & 3);
     if (spu.noise_timer < 0) {
         unsigned level = spu.noise_level;
-        unsigned feedback = ((level >> 15) ^ (level >> 12) ^
-                             (level >> 11) ^ (level >> 10) ^ 1) & 1;
+        unsigned feedback = ((level >> 15) ^ (level >> 12) ^ (level >> 11) ^
+                             (level >> 10) ^ 1) &
+                            1;
         spu.noise_level = (u16)((level << 1) | feedback);
         int period = 0x20000 >> ((spucnt >> 10) & 15);
         spu.noise_timer += period;
@@ -411,20 +427,23 @@ static void spu_tick(short* out) {
     }
 
     // decode+resample, scale volume by ADSR envelope, then mix voices
-    int main_left=spu.main_volume[0], main_right=spu.main_volume[1];
-    spu.main_volume[0]=(short)voice_vol(rxx->main_vol.left);
-    spu.main_volume[1]=(short)voice_vol(rxx->main_vol.right);
+    int main_left = spu.main_volume[0], main_right = spu.main_volume[1];
+    spu.main_volume[0] = (short)voice_vol(rxx->main_vol.left);
+    spu.main_volume[1] = (short)voice_vol(rxx->main_vol.right);
     short v1_sample = 0, v3_sample = 0, previous_sample = 0;
     for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
         // Volume controls latch after the current sample, independently of
         // key-on or envelope activity. Retain their old gain for this mix.
-        int left_gain=spu.voice[v].volume_current[0];
-        int right_gain=spu.voice[v].volume_current[1];
-        spu.voice[v].volume_current[0]=(short)voice_vol(rxx->voice[v].volume.left);
-        spu.voice[v].volume_current[1]=(short)voice_vol(rxx->voice[v].volume.right);
+        int left_gain = spu.voice[v].volume_current[0];
+        int right_gain = spu.voice[v].volume_current[1];
+        spu.voice[v].volume_current[0] =
+            (short)voice_vol(rxx->voice[v].volume.left);
+        spu.voice[v].volume_current[1] =
+            (short)voice_vol(rxx->voice[v].volume.right);
         if (!spu.voice[v].active) {
             previous_sample = 0;
-            if (spu.voice[v].key_on_pending) spu_key_on_voice(v);
+            if (spu.voice[v].key_on_pending)
+                spu_key_on_voice(v);
             continue;
         }
         // AKAO changes attack/release on voices that are already playing.
@@ -445,7 +464,8 @@ static void spu_tick(short* out) {
             spu.voice[v].delay_ticks--;
             rxx->voice[v].volumex = 0;
             previous_sample = 0;
-            if (spu.voice[v].key_on_pending) spu_key_on_voice(v);
+            if (spu.voice[v].key_on_pending)
+                spu_key_on_voice(v);
             continue;
         }
         spu.voice[v].noise_mode = (rxx->noise_mode[word] & bit) != 0;
@@ -479,7 +499,8 @@ static void spu_tick(short* out) {
         }
         // KON resets the decoder/envelope after this sample has fed the
         // mixer and the next voice's FM input, as on the SPU pipeline.
-        if (spu.voice[v].key_on_pending) spu_key_on_voice(v);
+        if (spu.voice[v].key_on_pending)
+            spu_key_on_voice(v);
     }
 
     // Mute all voices. CD audio is mixed after, and not affected by mute.
@@ -520,7 +541,7 @@ static void spu_tick(short* out) {
 
 void Psyz_SpuFlushCdSamples(void) {
     Psyz_AudioLock();
-    spu.cd_ring_read=spu.cd_ring_count=0;
+    spu.cd_ring_read = spu.cd_ring_count = 0;
     Psyz_AudioUnlock();
 }
 

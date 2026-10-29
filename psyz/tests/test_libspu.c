@@ -35,10 +35,11 @@ ZTEST(spu, GaussianHardwareImpulse) {
     // from both the SNES ROM and the previously normalized approximation.
     static const unsigned phases[] = {0, 64, 128, 192, 255};
     static const int taps[5][4] = {
-        {4807, 22963, 4871, -1}, {1756, 20944, 9901, 39},
-        {412, 15855, 15948, 424}, {37, 9811, 21004, 1789},
-        {-1, 4871, 22963, 4807}
-    };
+        {4807, 22963, 4871, -1},
+        {1756, 20944, 9901, 39},
+        {412, 15855, 15948, 424},
+        {37, 9811, 21004, 1789},
+        {-1, 4871, 22963, 4807}};
     for (unsigned phase = 0; phase < 5; ++phase) {
         for (unsigned tap = 0; tap < 4; ++tap) {
             for (unsigned negative = 0; negative < 2; ++negative) {
@@ -48,7 +49,7 @@ ZTEST(spu, GaussianHardwareImpulse) {
                 voice.spos = phases[phase] << 8;
                 voice.gwin[tap] = (short)amplitude;
                 zexpect_s32_eq((taps[phase][tap] * amplitude) >> 15,
-                              spu_voice_step(&voice, 0, NULL));
+                               spu_voice_step(&voice, 0, NULL));
             }
         }
         VoiceState voice = {0};
@@ -68,40 +69,49 @@ ZTEST(spu, GaussianHardwareImpulse) {
 ZTEST(spu, VoiceGainLatchReference) {
     // Synthetic ramp rendered by independent Beetle PSX SPU 9164674, with
     // frontend attenuation removed. Gain writes take effect after this tick.
-    static const unsigned char ramp[16]={0,7,0x10,0x32,0x54,0x76,0x77,0x65,
-        0x43,0x21,0xef,0xcd,0xab,0x89,0x88,0x9a};
-    static const short expected[128]={
-        -11464,-11464,-8059,-4030,-10377,-5189,-12696,-6348,
-        -15006,-7503,-16290,-8145,-16192,-8096,-13524,-6762,
-        -12333,-6167,-1402,-701,2424,1211,4742,2370,
-        7061,3530,9387,4693,11705,5852,13831,6915,
-        14275,7137,13308,6653,11045,5522,9510,4754,
-        7171,3585,4180,2089,3090,1544,-1347,-674,
-        -4314,-2157,-6641,-3321,-8959,-4480,-11278,-5639,
-        -13596,-6798,-15779,-7890,-16317,-8159,-15535,-7768,
-        -13055,-6528,-4357,-1090,422,105,1663,415,
-        2821,705,3985,996,5144,1286,6303,1575,
-        7098,1774,7118,1779,5983,1495,5646,1411,
-        3831,957,3464,866,1518,379,988,247,
-        -1404,-351,-2612,-653,-3771,-943,-4930,-1233,
-        -6089,-1523,-7252,-1813,-8103,-2026,-8148,-2037,
-        -7118,-1780,-6520,-1630,-1848,-462,953,238,
-        2112,528,3276,819,4435,1108,5594,1398,
+    static const unsigned char ramp[16] = {
+        0,    7,    0x10, 0x32, 0x54, 0x76, 0x77, 0x65,
+        0x43, 0x21, 0xef, 0xcd, 0xab, 0x89, 0x88, 0x9a};
+    static const short expected[128] = {
+        -11464, -11464, -8059,  -4030,  -10377, -5189,  -12696, -6348,  -15006,
+        -7503,  -16290, -8145,  -16192, -8096,  -13524, -6762,  -12333, -6167,
+        -1402,  -701,   2424,   1211,   4742,   2370,   7061,   3530,   9387,
+        4693,   11705,  5852,   13831,  6915,   14275,  7137,   13308,  6653,
+        11045,  5522,   9510,   4754,   7171,   3585,   4180,   2089,   3090,
+        1544,   -1347,  -674,   -4314,  -2157,  -6641,  -3321,  -8959,  -4480,
+        -11278, -5639,  -13596, -6798,  -15779, -7890,  -16317, -8159,  -15535,
+        -7768,  -13055, -6528,  -4357,  -1090,  422,    105,    1663,   415,
+        2821,   705,    3985,   996,    5144,   1286,   6303,   1575,   7098,
+        1774,   7118,   1779,   5983,   1495,   5646,   1411,   3831,   957,
+        3464,   866,    1518,   379,    988,    247,    -1404,  -351,   -2612,
+        -653,   -3771,  -943,   -4930,  -1233,  -6089,  -1523,  -7252,  -1813,
+        -8103,  -2026,  -8148,  -2037,  -7118,  -1780,  -6520,  -1630,  -1848,
+        -462,   953,    238,    2112,   528,    3276,   819,    4435,   1108,
+        5594,   1398,
     };
-    short warmup[1024],pcm[128];
-    Psyz_SpuReset(0);Psyz_SpuMemWrite(0x1000,ramp,sizeof(ramp));
-    Psyz_SpuWrite(0x1AA,0xC000);
-    Psyz_SpuWrite(0x180,0x3FFF);Psyz_SpuWrite(0x182,0x3FFF);
-    Psyz_SpuWrite(0x10,0x3FFF);Psyz_SpuWrite(0x12,0x3FFF);
-    Psyz_SpuWrite(0x14,0x1234);Psyz_SpuWrite(0x16,0x200);
-    Psyz_SpuWrite(0x18,0x00FF);Psyz_SpuWrite(0x1A,0x1FC0);
-    Psyz_SpuWrite(0x1E,0x200);Psyz_SpuWrite(0x188,2);
-    Psyz_SpuPullSamples(warmup,512);
-    Psyz_SpuWrite(0x10,0x2000);Psyz_SpuWrite(0x12,0x1000);
-    Psyz_SpuPullSamples(pcm,32);
-    Psyz_SpuWrite(0x180,0x2000);Psyz_SpuWrite(0x182,0x1000);
-    Psyz_SpuPullSamples(pcm+64,32);
-    for(unsigned i=0;i<128;++i)zexpect_s32_eq(expected[i],pcm[i]);
+    short warmup[1024], pcm[128];
+    Psyz_SpuReset(0);
+    Psyz_SpuMemWrite(0x1000, ramp, sizeof(ramp));
+    Psyz_SpuWrite(0x1AA, 0xC000);
+    Psyz_SpuWrite(0x180, 0x3FFF);
+    Psyz_SpuWrite(0x182, 0x3FFF);
+    Psyz_SpuWrite(0x10, 0x3FFF);
+    Psyz_SpuWrite(0x12, 0x3FFF);
+    Psyz_SpuWrite(0x14, 0x1234);
+    Psyz_SpuWrite(0x16, 0x200);
+    Psyz_SpuWrite(0x18, 0x00FF);
+    Psyz_SpuWrite(0x1A, 0x1FC0);
+    Psyz_SpuWrite(0x1E, 0x200);
+    Psyz_SpuWrite(0x188, 2);
+    Psyz_SpuPullSamples(warmup, 512);
+    Psyz_SpuWrite(0x10, 0x2000);
+    Psyz_SpuWrite(0x12, 0x1000);
+    Psyz_SpuPullSamples(pcm, 32);
+    Psyz_SpuWrite(0x180, 0x2000);
+    Psyz_SpuWrite(0x182, 0x1000);
+    Psyz_SpuPullSamples(pcm + 64, 32);
+    for (unsigned i = 0; i < 128; ++i)
+        zexpect_s32_eq(expected[i], pcm[i]);
 }
 
 ZTEST(spu, SetTransferAddrMasksToRamRange) {
@@ -506,29 +516,42 @@ ZTEST(spu, GaussianKeyOnPitchPhase) {
     // 75% headroom attenuation removed. Fractional Gaussian products are
     // summed before shifting, as in the hardware-validated FPGA core.
     static const unsigned char block[16] = {
-        0,7,0x10,0x32,0x54,0x76,0x77,0x65,0x43,0x21,
-        0xef,0xcd,0xab,0x89,0x88,0x9a
-    };
-    static const unsigned pitch[] = {0x800,0x1234,0x2000};
+        0,    7,    0x10, 0x32, 0x54, 0x76, 0x77, 0x65,
+        0x43, 0x21, 0xef, 0xcd, 0xab, 0x89, 0x88, 0x9a};
+    static const unsigned pitch[] = {0x800, 0x1234, 0x2000};
     static const short reference[3][32] = {
-        {0,0,0,0,0,0,2678,7144,10204,12244,14284,16324,18362,20402,22442,24482,26469,27954,28502,28555,28448,27337,24514,22205,22378,22041,18331,14644,14275,13886,10176,6487},
-        {0,0,0,0,0,0,3815,11690,17996,22650,27123,28553,27491,22063,20623,14153,10069,6260,-997,-7866,-12503,-17155,-21793,-26430,-30952,-32626,-31812,-26232,-21237,243,5884,10521},
-        {0,0,0,0,0,0,5356,17852,27954,27337,22047,13889,5730,-8168,-16328,-24486,-32038,-31421,-23696,4084,12244,20402,27954,27337,22041,13886,5729,-8166,-16324,-24480,-32030,-31413},
+        {0,     0,     0,     0,     0,     0,     2678,  7144,
+         10204, 12244, 14284, 16324, 18362, 20402, 22442, 24482,
+         26469, 27954, 28502, 28555, 28448, 27337, 24514, 22205,
+         22378, 22041, 18331, 14644, 14275, 13886, 10176, 6487},
+        {0,      0,      0,      0,      0,      0,      3815,   11690,
+         17996,  22650,  27123,  28553,  27491,  22063,  20623,  14153,
+         10069,  6260,   -997,   -7866,  -12503, -17155, -21793, -26430,
+         -30952, -32626, -31812, -26232, -21237, 243,    5884,   10521},
+        {0,      0,      0,      0,     0,      0,      5356,   17852,
+         27954,  27337,  22047,  13889, 5730,   -8168,  -16328, -24486,
+         -32038, -31421, -23696, 4084,  12244,  20402,  27954,  27337,
+         22041,  13886,  5729,   -8166, -16324, -24480, -32030, -31413},
     };
-    for (unsigned pass=0;pass<3;++pass) {
+    for (unsigned pass = 0; pass < 3; ++pass) {
         short pcm[64];
         Psyz_SpuReset(0);
-        Psyz_SpuMemWrite(0x1000,block,sizeof(block));
-        Psyz_SpuWrite(0x1AA,0xC000);
-        Psyz_SpuWrite(0x180,0x3FFF);Psyz_SpuWrite(0x182,0x3FFF);
-        Psyz_SpuWrite(0x10,0x3FFF);Psyz_SpuWrite(0x12,0x3FFF);
-        Psyz_SpuWrite(0x14,pitch[pass]);Psyz_SpuWrite(0x16,0x200);
-        Psyz_SpuWrite(0x18,0x00FF);Psyz_SpuWrite(0x1A,0x1FC0);
-        Psyz_SpuWrite(0x1E,0x200);Psyz_SpuWrite(0x188,2);
-        Psyz_SpuPullSamples(pcm,32);
-        for (unsigned frame=0;frame<32;++frame) {
-            zexpect_s32_eq(reference[pass][frame],pcm[frame*2]);
-            zexpect_s32_eq(pcm[frame*2],pcm[frame*2+1]);
+        Psyz_SpuMemWrite(0x1000, block, sizeof(block));
+        Psyz_SpuWrite(0x1AA, 0xC000);
+        Psyz_SpuWrite(0x180, 0x3FFF);
+        Psyz_SpuWrite(0x182, 0x3FFF);
+        Psyz_SpuWrite(0x10, 0x3FFF);
+        Psyz_SpuWrite(0x12, 0x3FFF);
+        Psyz_SpuWrite(0x14, pitch[pass]);
+        Psyz_SpuWrite(0x16, 0x200);
+        Psyz_SpuWrite(0x18, 0x00FF);
+        Psyz_SpuWrite(0x1A, 0x1FC0);
+        Psyz_SpuWrite(0x1E, 0x200);
+        Psyz_SpuWrite(0x188, 2);
+        Psyz_SpuPullSamples(pcm, 32);
+        for (unsigned frame = 0; frame < 32; ++frame) {
+            zexpect_s32_eq(reference[pass][frame], pcm[frame * 2]);
+            zexpect_s32_eq(pcm[frame * 2], pcm[frame * 2 + 1]);
         }
     }
 }
@@ -539,85 +562,123 @@ ZTEST(spu, GaussianFmReference) {
     // Independent Beetle PSX 9164674 output without frontend attenuation.
     // Check sustain, key-off, retrigger and clipping. Spaced exact windows
     // catch errors that accumulate FM carrier phase over many samples.
-    static const unsigned char block[16]={
-        0,7,0x10,0x32,0x54,0x76,0x77,0x65,0x43,0x21,
-        0xef,0xcd,0xab,0x89,0x88,0x9a
+    static const unsigned char block[16] = {
+        0,    7,    0x10, 0x32, 0x54, 0x76, 0x77, 0x65,
+        0x43, 0x21, 0xef, 0xcd, 0xab, 0x89, 0x88, 0x9a};
+    static const unsigned starts[4][6] = {
+        {0, 256, 8192, 32768, 65536, 88184},
+        {29998, 30016, 30128, 32768, 65536, 88184},
+        {29998, 30016, 30128, 32768, 65536, 88184},
+        {0, 256, 8192, 32768, 65536, 88184}};
+    static const short reference[4][6][16] = {
+        {
+            {0, 0, 0, 0, 0, 0, 5140, 17768, 28513, 22290, 9104, -8376, -22718,
+             -32639, -21173, 9105},
+            {-32615, -23131, 10457, 24636, 26380, 14116, 5729, -10286, -19397,
+             -27126, -32221, -32613, -30309, -26602, -26131, -26217},
+            {1808, 5645, 8099, 9485, 9820, 9852, 10171, 11731, 14902, 22835,
+             28547, 22155, 13269, -4111, -18234, -31973},
+            {6140, -12357, -26679, -32085, -4117, 11142, 22054, 28530, 23112,
+             20085, 14367, 9243, 5977, 6186, 5479, 5378},
+            {14125, 13338, 8297, 6303, 6092, 6078, 5979, 6223, 3089, -9489,
+             -18633, -28862, -31942, -5523, 13038, 27154},
+            {-10589, -11990, -14030, -21229, -30069, -32037, -13761, 10155,
+             23345, 26380, 14433, -3670, -17342, -29337, -31798, -20088},
+        },
+        {
+            {6960, 6250, 5203, 3718, 3584, -4788, -12852, -20513, -28178,
+             -32628, -27584, -13027, 5821, 13485, 21147, 28066},
+            {14433, 6205, -5833, -13632, -21294, -28958, -32630, -26686, -8643,
+             6602, 14265, 21926, 28332, 26715, 21992, 14229},
+            {-20676, 4386, 12050, 19712, 27191, 28357, 22333, 14135, 5971,
+             -3727, -12198, -19859, -27524, -32612, -28567, -16731},
+            {19569, 27078, 28395, 22277, 14118, 6004, -3439, -12054, -19716,
+             -27380, -32605, -28790, -17596, 5008, 12672, 20350},
+            {-7333, -15002, -22664, -30294, -32609, -26105, -2514, 7971, 15635,
+             23297, 28522, 24707, 19719, 12550, 5203, -8119},
+            {-25802, -32357, -31049, -24146, 3425, 11094, 18756, 26390, 28515,
+             22048, 14283, 6503, -1805, -11241, -18903, -26583},
+        },
+        {
+            {6960, 6250, 5203, 3718, -8931, -16594, -24257, -31609, -32275,
+             -25497, 5518, 17386, 28471, 22428, 6008, -11640},
+            {-25765, 4928, 14059, 21481, 27141, 28547, 28101, 25278, 23112,
+             22649, 22618, 22430, 22084, 22242, 14338, 5479},
+            {-18596, 5709, 15349, 26063, 25835, 14224, -1805, -17916, -31703,
+             -26260, 4482, 15460, 25600, 28433, 22186, 15684},
+            {-31299, -26111, 6060, 19011, 28459, 22064, 14121, 6041, -2791,
+             -9266, -13409, -16466, -18441, -19333, -19413, -19445},
+            {-11385, -13855, -15225, -15559, -15591, -15910, -17470, -20673,
+             -28607, -32620, -25710, 6283, 18676, 28546, 19337, 6052},
+            {-30978, -32246, -31812, -22856, 6123, 17163, 28241, 22248, 7050,
+             -9808, -23620, -32631, -24940, 6458, 15970, 25050},
+        },
+        {
+            {0, 0, 0, 0, 0, 0, 6527, 23551, 22049, 5972, -13189, -29503, -26118,
+             9105, 25419, 22049},
+            {25030, 10933, -9872, -26185, -29113, 5789, 21306, 28012, 14890,
+             6241, -6872, -13775, -19110, -22919, -25182, -25930},
+            {15525, 13556, 6853, 6015, 6140, 6152, 6252, 4728, -4858, -16450,
+             -29384, -27158, 6841, 23154, 23458, 8591},
+            {7956, 24270, 22318, 6714, -12022, -27954, -27761, 3208, 15396,
+             24397, 28544, 26181, 22088, 22132, 20278, 20020},
+            {-12819, -17852, -21325, -23285, -23763, -23811, -24257, -26456,
+             -30856, -29630, 1784, 16542, 28548, 14726, -2726, -20322},
+            {22436, 24413, 27141, 26380, 14115, -227, -18505, -32592, -13303,
+             14425, 28509, 18007, 1558, -18505, -32507, -26077},
+        },
     };
-    static const unsigned starts[4][6]={
-        {0,256,8192,32768,65536,88184},
-        {29998,30016,30128,32768,65536,88184},
-        {29998,30016,30128,32768,65536,88184},
-        {0,256,8192,32768,65536,88184}
-    };
-    static const short reference[4][6][16]={
-      {
-        {0,0,0,0,0,0,5140,17768,28513,22290,9104,-8376,-22718,-32639,-21173,9105},
-        {-32615,-23131,10457,24636,26380,14116,5729,-10286,-19397,-27126,-32221,-32613,-30309,-26602,-26131,-26217},
-        {1808,5645,8099,9485,9820,9852,10171,11731,14902,22835,28547,22155,13269,-4111,-18234,-31973},
-        {6140,-12357,-26679,-32085,-4117,11142,22054,28530,23112,20085,14367,9243,5977,6186,5479,5378},
-        {14125,13338,8297,6303,6092,6078,5979,6223,3089,-9489,-18633,-28862,-31942,-5523,13038,27154},
-        {-10589,-11990,-14030,-21229,-30069,-32037,-13761,10155,23345,26380,14433,-3670,-17342,-29337,-31798,-20088},
-      },
-      {
-        {6960,6250,5203,3718,3584,-4788,-12852,-20513,-28178,-32628,-27584,-13027,5821,13485,21147,28066},
-        {14433,6205,-5833,-13632,-21294,-28958,-32630,-26686,-8643,6602,14265,21926,28332,26715,21992,14229},
-        {-20676,4386,12050,19712,27191,28357,22333,14135,5971,-3727,-12198,-19859,-27524,-32612,-28567,-16731},
-        {19569,27078,28395,22277,14118,6004,-3439,-12054,-19716,-27380,-32605,-28790,-17596,5008,12672,20350},
-        {-7333,-15002,-22664,-30294,-32609,-26105,-2514,7971,15635,23297,28522,24707,19719,12550,5203,-8119},
-        {-25802,-32357,-31049,-24146,3425,11094,18756,26390,28515,22048,14283,6503,-1805,-11241,-18903,-26583},
-      },
-      {
-        {6960,6250,5203,3718,-8931,-16594,-24257,-31609,-32275,-25497,5518,17386,28471,22428,6008,-11640},
-        {-25765,4928,14059,21481,27141,28547,28101,25278,23112,22649,22618,22430,22084,22242,14338,5479},
-        {-18596,5709,15349,26063,25835,14224,-1805,-17916,-31703,-26260,4482,15460,25600,28433,22186,15684},
-        {-31299,-26111,6060,19011,28459,22064,14121,6041,-2791,-9266,-13409,-16466,-18441,-19333,-19413,-19445},
-        {-11385,-13855,-15225,-15559,-15591,-15910,-17470,-20673,-28607,-32620,-25710,6283,18676,28546,19337,6052},
-        {-30978,-32246,-31812,-22856,6123,17163,28241,22248,7050,-9808,-23620,-32631,-24940,6458,15970,25050},
-      },
-      {
-        {0,0,0,0,0,0,6527,23551,22049,5972,-13189,-29503,-26118,9105,25419,22049},
-        {25030,10933,-9872,-26185,-29113,5789,21306,28012,14890,6241,-6872,-13775,-19110,-22919,-25182,-25930},
-        {15525,13556,6853,6015,6140,6152,6252,4728,-4858,-16450,-29384,-27158,6841,23154,23458,8591},
-        {7956,24270,22318,6714,-12022,-27954,-27761,3208,15396,24397,28544,26181,22088,22132,20278,20020},
-        {-12819,-17852,-21325,-23285,-23763,-23811,-24257,-26456,-30856,-29630,1784,16542,28548,14726,-2726,-20322},
-        {22436,24413,27141,26380,14115,-227,-18505,-32592,-13303,14425,28509,18007,1558,-18505,-32507,-26077},
-      },
-    };
-    for(unsigned pass=0;pass<4;++pass) {
-        Psyz_SpuReset(0);Psyz_SpuMemWrite(0x1000,block,sizeof(block));
-        Psyz_SpuWrite(0x1AA,0xC000);
-        Psyz_SpuWrite(0x180,0x3FFF);Psyz_SpuWrite(0x182,0x3FFF);
-        Psyz_SpuWrite(0x184,0);Psyz_SpuWrite(0x186,0);
-        Psyz_SpuWrite(0x190,2);Psyz_SpuWrite(0x192,0);
-        Psyz_SpuWrite(0x194,0);Psyz_SpuWrite(0x196,0);
-        Psyz_SpuWrite(0x198,0);Psyz_SpuWrite(0x19A,0);
-        for(unsigned voice=0;voice<2;++voice) {
-            unsigned base=voice*16;
-            Psyz_SpuWrite(base,voice?0x3FFF:0);Psyz_SpuWrite(base+2,voice?0x3FFF:0);
-            Psyz_SpuWrite(base+4,voice?(pass==3?0x2A88:0x1E12):0x1234);Psyz_SpuWrite(base+6,0x200);
-            Psyz_SpuWrite(base+8,0x00FF);Psyz_SpuWrite(base+10,0x1FC0);
-            Psyz_SpuWrite(base+14,0x200);
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        Psyz_SpuReset(0);
+        Psyz_SpuMemWrite(0x1000, block, sizeof(block));
+        Psyz_SpuWrite(0x1AA, 0xC000);
+        Psyz_SpuWrite(0x180, 0x3FFF);
+        Psyz_SpuWrite(0x182, 0x3FFF);
+        Psyz_SpuWrite(0x184, 0);
+        Psyz_SpuWrite(0x186, 0);
+        Psyz_SpuWrite(0x190, 2);
+        Psyz_SpuWrite(0x192, 0);
+        Psyz_SpuWrite(0x194, 0);
+        Psyz_SpuWrite(0x196, 0);
+        Psyz_SpuWrite(0x198, 0);
+        Psyz_SpuWrite(0x19A, 0);
+        for (unsigned voice = 0; voice < 2; ++voice) {
+            unsigned base = voice * 16;
+            Psyz_SpuWrite(base, voice ? 0x3FFF : 0);
+            Psyz_SpuWrite(base + 2, voice ? 0x3FFF : 0);
+            Psyz_SpuWrite(
+                base + 4, voice ? (pass == 3 ? 0x2A88 : 0x1E12) : 0x1234);
+            Psyz_SpuWrite(base + 6, 0x200);
+            Psyz_SpuWrite(base + 8, 0x00FF);
+            Psyz_SpuWrite(base + 10, 0x1FC0);
+            Psyz_SpuWrite(base + 14, 0x200);
         }
-        Psyz_SpuWrite(0x188,3);
-        for(unsigned cursor=0;cursor<88200;) {
-            unsigned frames=88200-cursor;short pcm[256];
-            if(pass==1 && cursor==30000) {
-                Psyz_SpuWrite(0x18,0x0CFF);
-                Psyz_SpuWrite(0x18C,1); // release the muted modulator only
+        Psyz_SpuWrite(0x188, 3);
+        for (unsigned cursor = 0; cursor < 88200;) {
+            unsigned frames = 88200 - cursor;
+            short pcm[256];
+            if (pass == 1 && cursor == 30000) {
+                Psyz_SpuWrite(0x18, 0x0CFF);
+                Psyz_SpuWrite(0x18C, 1); // release the muted modulator only
             }
-            if(pass==2 && cursor==30000)
-                Psyz_SpuWrite(0x188,1); // retrigger the active modulator only
-            if(frames>128)frames=128;
-            if(pass && cursor<30000 && frames>30000-cursor)frames=30000-cursor;
-            Psyz_SpuPullSamples(pcm,(int)frames);
-            for(unsigned frame=0;frame<frames;++frame)
-                for(unsigned window=0;window<6;++window)
-                    if(cursor+frame>=starts[pass][window] && cursor+frame<starts[pass][window]+16) {
-                        short expected=reference[pass][window][cursor+frame-starts[pass][window]];
-                        zexpect_s32_eq(expected,pcm[frame*2]);
-                        zexpect_s32_eq(expected,pcm[frame*2+1]);
+            if (pass == 2 && cursor == 30000)
+                Psyz_SpuWrite(0x188, 1); // retrigger the active modulator only
+            if (frames > 128)
+                frames = 128;
+            if (pass && cursor < 30000 && frames > 30000 - cursor)
+                frames = 30000 - cursor;
+            Psyz_SpuPullSamples(pcm, (int)frames);
+            for (unsigned frame = 0; frame < frames; ++frame)
+                for (unsigned window = 0; window < 6; ++window)
+                    if (cursor + frame >= starts[pass][window] &&
+                        cursor + frame < starts[pass][window] + 16) {
+                        short expected =
+                            reference[pass][window]
+                                     [cursor + frame - starts[pass][window]];
+                        zexpect_s32_eq(expected, pcm[frame * 2]);
+                        zexpect_s32_eq(expected, pcm[frame * 2 + 1]);
                     }
-            cursor+=frames;
+            cursor += frames;
         }
     }
 }
@@ -627,42 +688,60 @@ ZTEST(spu, GaussianFmReference) {
 ZTEST(spu, AdpcmOneShotEndPipeline) {
     // Independently observed END timing from Beetle PSX 9164674. Decoding
     // runs ahead of playback; the final queued samples must not leak out.
-    static const unsigned pitches[7]={0x400,0x800,0x1000,0x1234,0x2000,0x3000,0x4000};
-    static const unsigned stops[2][7]={
-        {77,41,23,21,14,11,10},
-        {189,97,51,46,28,21,17},
+    static const unsigned pitches[7] = {
+        0x400, 0x800, 0x1000, 0x1234, 0x2000, 0x3000, 0x4000};
+    static const unsigned stops[2][7] = {
+        {77, 41, 23, 21, 14, 11, 10},
+        {189, 97, 51, 46, 28, 21, 17},
     };
-    for(unsigned blocks=1;blocks<=2;++blocks)for(unsigned pass=0;pass<7;++pass) {
-        unsigned char data[32];short pcm[520];
-        memset(data,0x77,sizeof(data));data[0]=0;data[1]=blocks==1?1:0;
-        data[16]=0;data[17]=1;
-        Psyz_SpuReset(0);Psyz_SpuMemWrite(0x1000,data,blocks*16);
-        Psyz_SpuWrite(0x1AA,0xC000);
-        Psyz_SpuWrite(0x180,0x3FFF);Psyz_SpuWrite(0x182,0x3FFF);
-        Psyz_SpuWrite(0x184,0);Psyz_SpuWrite(0x186,0);
-        Psyz_SpuWrite(0x190,0);Psyz_SpuWrite(0x192,0);
-        Psyz_SpuWrite(0x194,0);Psyz_SpuWrite(0x196,0);
-        Psyz_SpuWrite(0x10,0x3FFF);Psyz_SpuWrite(0x12,0x3FFF);
-        Psyz_SpuWrite(0x14,pitches[pass]);Psyz_SpuWrite(0x16,0x200);
-        Psyz_SpuWrite(0x18,0x00FF);Psyz_SpuWrite(0x1A,0x1FC0);
-        Psyz_SpuWrite(0x1E,0x200);Psyz_SpuWrite(0x188,2);
-        Psyz_SpuPullSamples(pcm,260);
-        unsigned stop=stops[blocks-1][pass];
-        zexpect_s32_ne(0,pcm[(stop-1)*2]);
-        for(unsigned frame=stop;frame<260;++frame) {
-            zexpect_s32_eq(0,pcm[frame*2]);
-            zexpect_s32_eq(0,pcm[frame*2+1]);
+    for (unsigned blocks = 1; blocks <= 2; ++blocks)
+        for (unsigned pass = 0; pass < 7; ++pass) {
+            unsigned char data[32];
+            short pcm[520];
+            memset(data, 0x77, sizeof(data));
+            data[0] = 0;
+            data[1] = blocks == 1 ? 1 : 0;
+            data[16] = 0;
+            data[17] = 1;
+            Psyz_SpuReset(0);
+            Psyz_SpuMemWrite(0x1000, data, blocks * 16);
+            Psyz_SpuWrite(0x1AA, 0xC000);
+            Psyz_SpuWrite(0x180, 0x3FFF);
+            Psyz_SpuWrite(0x182, 0x3FFF);
+            Psyz_SpuWrite(0x184, 0);
+            Psyz_SpuWrite(0x186, 0);
+            Psyz_SpuWrite(0x190, 0);
+            Psyz_SpuWrite(0x192, 0);
+            Psyz_SpuWrite(0x194, 0);
+            Psyz_SpuWrite(0x196, 0);
+            Psyz_SpuWrite(0x10, 0x3FFF);
+            Psyz_SpuWrite(0x12, 0x3FFF);
+            Psyz_SpuWrite(0x14, pitches[pass]);
+            Psyz_SpuWrite(0x16, 0x200);
+            Psyz_SpuWrite(0x18, 0x00FF);
+            Psyz_SpuWrite(0x1A, 0x1FC0);
+            Psyz_SpuWrite(0x1E, 0x200);
+            Psyz_SpuWrite(0x188, 2);
+            Psyz_SpuPullSamples(pcm, 260);
+            unsigned stop = stops[blocks - 1][pass];
+            zexpect_s32_ne(0, pcm[(stop - 1) * 2]);
+            for (unsigned frame = stop; frame < 260; ++frame) {
+                zexpect_s32_eq(0, pcm[frame * 2]);
+                zexpect_s32_eq(0, pcm[frame * 2 + 1]);
+            }
+            zexpect_u16_eq(0, Psyz_SpuRead(0x1C));
         }
-        zexpect_u16_eq(0,Psyz_SpuRead(0x1C));
-    }
     // NON replaces ADPCM and must keep the envelope running through END.
-    short pcm[520];Psyz_SpuReset(0);
-    const unsigned char end_block[16]={0,1};
-    Psyz_SpuMemWrite(0x1000,end_block,sizeof(end_block));
-    Psyz_SpuWrite(0x1AA,0xFF00);Psyz_SpuWrite(0x14,0x1000);
-    Psyz_SpuWrite(0x194,2);Psyz_SpuWrite(0x188,2);
-    Psyz_SpuPullSamples(pcm,260);
-    zexpect_s32_ne(0,Psyz_SpuRead(0x1C));
+    short pcm[520];
+    Psyz_SpuReset(0);
+    const unsigned char end_block[16] = {0, 1};
+    Psyz_SpuMemWrite(0x1000, end_block, sizeof(end_block));
+    Psyz_SpuWrite(0x1AA, 0xFF00);
+    Psyz_SpuWrite(0x14, 0x1000);
+    Psyz_SpuWrite(0x194, 2);
+    Psyz_SpuWrite(0x188, 2);
+    Psyz_SpuPullSamples(pcm, 260);
+    zexpect_s32_ne(0, Psyz_SpuRead(0x1C));
 }
 #endif
 
@@ -912,7 +991,7 @@ ZTEST(spu, KeyOffSilencesVoice) {
     pull_samples_nop(56);
     Psyz_SpuWrite(0x18C, 1u << 1); // KEY_OFF voice 1
     pull_samples_nop(2); // latch key-off, then finish the release clock
-    zexpect_u16_eq(0,Psyz_SpuRead(0x1C));
+    zexpect_u16_eq(0, Psyz_SpuRead(0x1C));
     // Zero out the capture region so we observe only post-keyoff writes.
     Psyz_SpuMemWrite(0x0800, zeros, sizeof(zeros));
     pull_samples_nop(64);
@@ -1536,10 +1615,11 @@ static bool all_zero(const unsigned char* p, size_t n) {
     return true;
 }
 
-// Work-RAM regression snapshot for the corrected Gaussian/pipeline/FIR and reverb fractional precision.
-// This snapshot is generated by PsyZ, not captured from hardware. Independent
-// hardware-data checks are GaussianHardwareImpulse and ReverbHardwareFirImpulse;
-// GaussianKeyOnPitchPhase also compares an independently implemented SPU.
+// Work-RAM regression snapshot for the corrected Gaussian/pipeline/FIR and
+// reverb fractional precision. This snapshot is generated by PsyZ, not captured
+// from hardware. Independent hardware-data checks are GaussianHardwareImpulse
+// and ReverbHardwareFirImpulse; GaussianKeyOnPitchPhase also compares an
+// independently implemented SPU.
 ZTEST(spu, reverb_room_work_area) {
     zskip_targets("psp"); // can't capture reverb on PSP SAS
     unsigned char work[kRoomWorkBytes] = {0};
@@ -1557,29 +1637,33 @@ ZTEST(spu, ReverbHardwareFirImpulse) {
     // directly from work RAM. The right-channel upsampler must reproduce
     // the published 39-tap half-band response, including its 19-tick delay.
     static const short coefficients[39] = {
-        -1,0,2,0,-10,0,35,0,-103,0,266,0,-616,0,1332,0,-2960,0,
-        10246,16384,10246,0,-2960,0,1332,0,-616,0,266,0,-103,0,
-        35,0,-10,0,2,0,-1
-    };
-    short impulse=16384,pcm[128];
+        -1,   0, 2,     0, -10,   0,     35,    0, -103,  0, 266,  0, -616, 0,
+        1332, 0, -2960, 0, 10246, 16384, 10246, 0, -2960, 0, 1332, 0, -616, 0,
+        266,  0, -103,  0, 35,    0,     -10,   0, 2,     0, -1};
+    short impulse = 16384, pcm[128];
     Psyz_SpuReset(0);
-    for (unsigned offset=0x1C0;offset<0x200;offset+=2)
-        Psyz_SpuWrite(offset,0);
-    Psyz_SpuMemWrite(0x70000,&impulse,2);
-    Psyz_SpuWrite(0x1A2,0x70000>>3);
-    Psyz_SpuWrite(0x1AA,0xC000); // reverb still reads; work RAM writes disabled
-    Psyz_SpuWrite(0x180,0x3FFF);Psyz_SpuWrite(0x182,0x3FFF);
-    Psyz_SpuWrite(0x184,0);Psyz_SpuWrite(0x186,0x7FFF);
-    Psyz_SpuPullSamples(pcm,64);
-    for (unsigned frame=0;frame<64;++frame) {
-        int expected=frame>0 && frame<39?coefficients[frame]:0; // initial gain latch
-        expected=(expected*32767)>>15;
-        expected=(expected*32766)>>15;
-        zexpect_s32_eq(0,pcm[frame*2]);
-        zexpect_s32_eq(expected,pcm[frame*2+1]);
+    for (unsigned offset = 0x1C0; offset < 0x200; offset += 2)
+        Psyz_SpuWrite(offset, 0);
+    Psyz_SpuMemWrite(0x70000, &impulse, 2);
+    Psyz_SpuWrite(0x1A2, 0x70000 >> 3);
+    Psyz_SpuWrite(
+        0x1AA, 0xC000); // reverb still reads; work RAM writes disabled
+    Psyz_SpuWrite(0x180, 0x3FFF);
+    Psyz_SpuWrite(0x182, 0x3FFF);
+    Psyz_SpuWrite(0x184, 0);
+    Psyz_SpuWrite(0x186, 0x7FFF);
+    Psyz_SpuPullSamples(pcm, 64);
+    for (unsigned frame = 0; frame < 64; ++frame) {
+        int expected = frame > 0 && frame < 39 ? coefficients[frame]
+                                               : 0; // initial gain latch
+        expected = (expected * 32767) >> 15;
+        expected = (expected * 32766) >> 15;
+        zexpect_s32_eq(0, pcm[frame * 2]);
+        zexpect_s32_eq(expected, pcm[frame * 2 + 1]);
     }
-    short unchanged=0;Psyz_SpuMemRead(0x70000,&unchanged,2);
-    zexpect_s32_eq(impulse,unchanged);
+    short unchanged = 0;
+    Psyz_SpuMemRead(0x70000, &unchanged, 2);
+    zexpect_s32_eq(impulse, unchanged);
 }
 
 ZTEST(spu, reverb_master_disabled_leaves_work_area_clear) {
@@ -1687,26 +1771,33 @@ ZTEST(spu_malloc, SpuMallocWithStartAddrSplitsFreeBlock) {
 extern void Sdl3Audio_VBlank(bool pal);
 
 typedef struct {
-    short samples[4414*2];
-    unsigned frames,calls;
+    short samples[4414 * 2];
+    unsigned frames, calls;
     bool overflow;
 } AudioCaptureProof;
 
-static void capture_playback_pcm(const short* samples,int frames,void* userdata) {
-    AudioCaptureProof* proof=userdata;
+static void capture_playback_pcm(
+    const short* samples, int frames, void* userdata) {
+    AudioCaptureProof* proof = userdata;
     ++proof->calls;
-    if(frames<=0 || (unsigned)frames>4414-proof->frames){proof->overflow=true;return;}
-    memcpy(proof->samples+proof->frames*2,samples,(size_t)frames*2*sizeof(short));
-    proof->frames+=(unsigned)frames;
+    if (frames <= 0 || (unsigned)frames > 4414 - proof->frames) {
+        proof->overflow = true;
+        return;
+    }
+    memcpy(proof->samples + proof->frames * 2, samples,
+           (size_t)frames * 2 * sizeof(short));
+    proof->frames += (unsigned)frames;
 }
 
 static void capture_test_voice(void) {
     spu_reset_quiet();
-    Psyz_SpuMemWrite(kSampleAddr,kAdpcmSine,sizeof(kAdpcmSine));
-    Psyz_SpuWrite(0x1AA,0xC000);
-    Psyz_SpuWrite(0x180,0x3FFF);Psyz_SpuWrite(0x182,0x3FFF);
-    spu_voice1_keyon(kSampleAddr,0x1000);
-    Psyz_SpuWrite(0x10,0x3FFF);Psyz_SpuWrite(0x12,0x2000);
+    Psyz_SpuMemWrite(kSampleAddr, kAdpcmSine, sizeof(kAdpcmSine));
+    Psyz_SpuWrite(0x1AA, 0xC000);
+    Psyz_SpuWrite(0x180, 0x3FFF);
+    Psyz_SpuWrite(0x182, 0x3FFF);
+    spu_voice1_keyon(kSampleAddr, 0x1000);
+    Psyz_SpuWrite(0x10, 0x3FFF);
+    Psyz_SpuWrite(0x12, 0x2000);
 }
 #endif
 
@@ -1718,164 +1809,260 @@ typedef struct {
 } SpuConcurrentAccess;
 
 static int SDLCALL access_spu_from_worker(void* userdata) {
-    SpuConcurrentAccess* access=userdata;
-    unsigned char data[8]={1,2,3,4,5,6,7,8};
+    SpuConcurrentAccess* access = userdata;
+    unsigned char data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     short pcm[2];
     SDL_SignalSemaphore(access->entered);
-    switch(access->operation) {
-    case 0: Psyz_SpuInit();break;
-    case 1: Psyz_SpuReset(0);break;
-    case 2: Psyz_SpuReset(1);break;
-    case 3: Psyz_SpuSetTransferAddr(0x1000);break;
-    case 4: (void)Psyz_SpuGetTransferAddr();break;
-    case 5: Psyz_SpuFifoWrite(0x1234);break;
-    case 6: Psyz_SpuFifoWriteBulk(data,sizeof(data));break;
-    case 7: Psyz_SpuMemWrite(0x200,data,sizeof(data));break;
-    case 8: Psyz_SpuMemRead(0x200,data,sizeof(data));break;
-    case 9: Psyz_SpuWrite(0x188,1);break;
-    case 10: (void)Psyz_SpuRead(0x1AA);break;
-    case 11: Psyz_SpuPullSamples(pcm,1);break;
+    switch (access->operation) {
+    case 0:
+        Psyz_SpuInit();
+        break;
+    case 1:
+        Psyz_SpuReset(0);
+        break;
+    case 2:
+        Psyz_SpuReset(1);
+        break;
+    case 3:
+        Psyz_SpuSetTransferAddr(0x1000);
+        break;
+    case 4:
+        (void)Psyz_SpuGetTransferAddr();
+        break;
+    case 5:
+        Psyz_SpuFifoWrite(0x1234);
+        break;
+    case 6:
+        Psyz_SpuFifoWriteBulk(data, sizeof(data));
+        break;
+    case 7:
+        Psyz_SpuMemWrite(0x200, data, sizeof(data));
+        break;
+    case 8:
+        Psyz_SpuMemRead(0x200, data, sizeof(data));
+        break;
+    case 9:
+        Psyz_SpuWrite(0x188, 1);
+        break;
+    case 10:
+        (void)Psyz_SpuRead(0x1AA);
+        break;
+    case 11:
+        Psyz_SpuPullSamples(pcm, 1);
+        break;
     }
-    SDL_SetAtomicInt(&access->done,1);
+    SDL_SetAtomicInt(&access->done, 1);
     return 0;
 }
 
-static void count_concurrent_pcm(const short* samples,int frames,void* userdata) {
+static void count_concurrent_pcm(
+    const short* samples, int frames, void* userdata) {
     (void)samples;
-    SDL_AddAtomicInt((SDL_AtomicInt*)userdata,frames);
+    SDL_AddAtomicInt((SDL_AtomicInt*)userdata, frames);
 }
 #endif
 
 ZTEST(audio_sync, public_spu_access_waits_for_mixer_transaction) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved=clock?SDL_strdup(clock):NULL;
-    Psyz_AudioDestroy();SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK","video",true);
-    zassert_s32_eq(0,Psyz_AudioInit());
-    unsigned early=0,completed=0,started=0;
-    for(unsigned operation=0;operation<12;++operation) {
-        SpuConcurrentAccess access={.operation=operation};
-        access.entered=SDL_CreateSemaphore(0);
-        if(!access.entered)continue;
-        SDL_PropertiesID props=SDL_CreateProperties();
-        SDL_SetPointerProperty(props,SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,(void*)access_spu_from_worker);
-        SDL_SetStringProperty(props,SDL_PROP_THREAD_CREATE_NAME_STRING,"SPU transaction probe");
-        SDL_SetPointerProperty(props,SDL_PROP_THREAD_CREATE_USERDATA_POINTER,&access);
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    char* saved = clock ? SDL_strdup(clock) : NULL;
+    Psyz_AudioDestroy();
+    SDL_SetEnvironmentVariable(
+        SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true);
+    zassert_s32_eq(0, Psyz_AudioInit());
+    unsigned early = 0, completed = 0, started = 0;
+    for (unsigned operation = 0; operation < 12; ++operation) {
+        SpuConcurrentAccess access = {.operation = operation};
+        access.entered = SDL_CreateSemaphore(0);
+        if (!access.entered)
+            continue;
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetPointerProperty(
+            props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,
+            (void*)access_spu_from_worker);
+        SDL_SetStringProperty(
+            props, SDL_PROP_THREAD_CREATE_NAME_STRING, "SPU transaction probe");
+        SDL_SetPointerProperty(
+            props, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, &access);
         /* Hot reset preserves 512 KiB on its caller's stack. */
-        SDL_SetNumberProperty(props,SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER,2*1024*1024);
+        SDL_SetNumberProperty(
+            props, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER, 2 * 1024 * 1024);
         Psyz_AudioLock();
-        SDL_Thread* thread=SDL_CreateThreadWithProperties(props);SDL_DestroyProperties(props);
-        if(thread) {
-            if(SDL_WaitSemaphoreTimeout(access.entered,2000)) {
-                started|=1u<<operation;
+        SDL_Thread* thread = SDL_CreateThreadWithProperties(props);
+        SDL_DestroyProperties(props);
+        if (thread) {
+            if (SDL_WaitSemaphoreTimeout(access.entered, 2000)) {
+                started |= 1u << operation;
                 SDL_Delay(20);
-                if(SDL_GetAtomicInt(&access.done))early|=1u<<operation;
+                if (SDL_GetAtomicInt(&access.done))
+                    early |= 1u << operation;
             }
         }
         Psyz_AudioUnlock();
-        if(thread) {
-            int status=-1;SDL_WaitThread(thread,&status);
-            if(status==0 && SDL_GetAtomicInt(&access.done))completed|=1u<<operation;
+        if (thread) {
+            int status = -1;
+            SDL_WaitThread(thread, &status);
+            if (status == 0 && SDL_GetAtomicInt(&access.done))
+                completed |= 1u << operation;
         }
         SDL_DestroySemaphore(access.entered);
     }
     Psyz_AudioDestroy();
-    if(saved){SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK",saved,true);SDL_free(saved);}
-    else SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0,Psyz_AudioInit());
-    zassert_u32_eq(0xFFF,started);zassert_u32_eq(0xFFF,completed);
-    zassert_u32_eq(0,early);
+    if (saved) {
+        SDL_SetEnvironmentVariable(
+            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
+        SDL_free(saved);
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
+    zassert_u32_eq(0xFFF, started);
+    zassert_u32_eq(0xFFF, completed);
+    zassert_u32_eq(0, early);
 #endif
 }
 
 ZTEST(audio_sync, device_mix_survives_concurrent_rekey_reset_and_ram_transfer) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved=clock?SDL_strdup(clock):NULL;
-    Psyz_AudioDestroy();SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0,Psyz_AudioInit());
-    SDL_AtomicInt rendered={0};capture_test_voice();
-    Psyz_AudioSetCaptureCallback(count_concurrent_pcm,&rendered);
-    for(unsigned i=0;i<20000;++i) {
-        if((i&1023)==0)Psyz_SpuReset(1);
-        Psyz_SpuWrite(0x04,(unsigned short)(1+(i*97)%0x3FFF));
-        if((i&15)==0)Psyz_SpuMemWrite(kSampleAddr,kAdpcmSine,sizeof(kAdpcmSine));
-        Psyz_SpuWrite(0x188,1);
-        if((i&7)==0)Psyz_SpuWrite(0x18C,1);
-        if((i&63)==0)SDL_Delay(1);
-    }
-    for(unsigned wait=0;wait<200 && !SDL_GetAtomicInt(&rendered);++wait)SDL_Delay(5);
-    Psyz_AudioSetCaptureCallback(NULL,NULL);
-    int frames=SDL_GetAtomicInt(&rendered);
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
-    if(saved){SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK",saved,true);SDL_free(saved);}
-    else SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0,Psyz_AudioInit());zassert_s32_eq(1,frames>0);
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
+    SDL_AtomicInt rendered = {0};
+    capture_test_voice();
+    Psyz_AudioSetCaptureCallback(count_concurrent_pcm, &rendered);
+    for (unsigned i = 0; i < 20000; ++i) {
+        if ((i & 1023) == 0)
+            Psyz_SpuReset(1);
+        Psyz_SpuWrite(0x04, (unsigned short)(1 + (i * 97) % 0x3FFF));
+        if ((i & 15) == 0)
+            Psyz_SpuMemWrite(kSampleAddr, kAdpcmSine, sizeof(kAdpcmSine));
+        Psyz_SpuWrite(0x188, 1);
+        if ((i & 7) == 0)
+            Psyz_SpuWrite(0x18C, 1);
+        if ((i & 63) == 0)
+            SDL_Delay(1);
+    }
+    for (unsigned wait = 0; wait < 200 && !SDL_GetAtomicInt(&rendered); ++wait)
+        SDL_Delay(5);
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    int frames = SDL_GetAtomicInt(&rendered);
+    Psyz_AudioDestroy();
+    if (saved) {
+        SDL_SetEnvironmentVariable(
+            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
+        SDL_free(saved);
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
+    zassert_s32_eq(1, frames > 0);
 #endif
 }
 
 ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved=clock?SDL_strdup(clock):NULL;
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
-    zassert_s32_eq(1,SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK","video",true));
-    zassert_s32_eq(0,Psyz_AudioInit());
-    static short expected[4414*2],expected_tail[96*2],tail[96*2];
+    zassert_s32_eq(
+        1, SDL_SetEnvironmentVariable(
+               SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true));
+    zassert_s32_eq(0, Psyz_AudioInit());
+    static short expected[4414 * 2], expected_tail[96 * 2], tail[96 * 2];
     static AudioCaptureProof proof;
-    memset(&proof,0,sizeof(proof));
-    capture_test_voice();Psyz_SpuPullSamples(expected,4414);Psyz_SpuPullSamples(expected_tail,96);
-    unsigned nonzero=0;
-    for(unsigned i=0;i<4414*2;++i)if(expected[i])++nonzero;
-    zassert_s32_eq(1,nonzero>0);
-    capture_test_voice();Psyz_AudioSetCaptureCallback(capture_playback_pcm,&proof);
-    Psyz_AudioPause();Sdl3Audio_VBlank(false);zassert_u32_eq(0,proof.calls);
+    memset(&proof, 0, sizeof(proof));
+    capture_test_voice();
+    Psyz_SpuPullSamples(expected, 4414);
+    Psyz_SpuPullSamples(expected_tail, 96);
+    unsigned nonzero = 0;
+    for (unsigned i = 0; i < 4414 * 2; ++i)
+        if (expected[i])
+            ++nonzero;
+    zassert_s32_eq(1, nonzero > 0);
+    capture_test_voice();
+    Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
+    Psyz_AudioPause();
+    Sdl3Audio_VBlank(false);
+    zassert_u32_eq(0, proof.calls);
     Psyz_AudioUnpause();
-    for(unsigned i=0;i<6;++i)Sdl3Audio_VBlank(false);
-    zassert_u32_eq(6,proof.calls);zassert_u32_eq(4414,proof.frames);zassert_s32_eq(0,proof.overflow);
-    zassert_s32_eq(0,memcmp(expected,proof.samples,sizeof(expected)));
-    Psyz_AudioPause();Sdl3Audio_VBlank(false);zassert_u32_eq(6,proof.calls);
-    Psyz_SpuPullSamples(tail,96);
-    zassert_s32_eq(0,memcmp(expected_tail,tail,sizeof(tail)));zassert_u32_eq(6,proof.calls);
-    Psyz_AudioSetCaptureCallback(NULL,NULL);Psyz_AudioUnpause();Sdl3Audio_VBlank(false);
-    zassert_u32_eq(6,proof.calls);
-    Psyz_AudioSetCaptureCallback(capture_playback_pcm,&proof);
-    Psyz_AudioDestroy();zassert_s32_eq(0,Psyz_AudioInit());Sdl3Audio_VBlank(false);
-    zassert_u32_eq(6,proof.calls);
+    for (unsigned i = 0; i < 6; ++i)
+        Sdl3Audio_VBlank(false);
+    zassert_u32_eq(6, proof.calls);
+    zassert_u32_eq(4414, proof.frames);
+    zassert_s32_eq(0, proof.overflow);
+    zassert_s32_eq(0, memcmp(expected, proof.samples, sizeof(expected)));
+    Psyz_AudioPause();
+    Sdl3Audio_VBlank(false);
+    zassert_u32_eq(6, proof.calls);
+    Psyz_SpuPullSamples(tail, 96);
+    zassert_s32_eq(0, memcmp(expected_tail, tail, sizeof(tail)));
+    zassert_u32_eq(6, proof.calls);
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    Psyz_AudioUnpause();
+    Sdl3Audio_VBlank(false);
+    zassert_u32_eq(6, proof.calls);
+    Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
     Psyz_AudioDestroy();
-    if(saved){SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK",saved,true);SDL_free(saved);}
-    else SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0,Psyz_AudioInit());
+    zassert_s32_eq(0, Psyz_AudioInit());
+    Sdl3Audio_VBlank(false);
+    zassert_u32_eq(6, proof.calls);
+    Psyz_AudioDestroy();
+    if (saved) {
+        SDL_SetEnvironmentVariable(
+            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
+        SDL_free(saved);
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
 #endif
 }
 
 ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved=clock?SDL_strdup(clock):NULL;
-    Psyz_AudioDestroy();SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0,Psyz_AudioInit());Psyz_AudioPause();Psyz_AudioLock();
-    static short expected[4414*2];static AudioCaptureProof proof;
-    memset(&proof,0,sizeof(proof));
-    capture_test_voice();Psyz_SpuPullSamples(expected,4414);capture_test_voice();
-    Psyz_AudioSetCaptureCallback(capture_playback_pcm,&proof);
-    Psyz_AudioUnlock();Psyz_AudioUnpause();
-    for(unsigned wait=0;wait<200;++wait){
-        SDL_Delay(5);Psyz_AudioLock();unsigned frames=proof.frames;Psyz_AudioUnlock();
-        if(frames)break;
-    }
-    Psyz_AudioSetCaptureCallback(NULL,NULL);
-    zassert_s32_eq(1,proof.frames>0);zassert_s32_eq(1,proof.frames<=4414);
-    zassert_s32_eq(0,memcmp(expected,proof.samples,(size_t)proof.frames*2*sizeof(short)));
-    unsigned calls=proof.calls;SDL_Delay(20);zassert_u32_eq(calls,proof.calls);
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
-    if(saved){SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK",saved,true);SDL_free(saved);}
-    else SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(),"PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0,Psyz_AudioInit());
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
+    Psyz_AudioPause();
+    Psyz_AudioLock();
+    static short expected[4414 * 2];
+    static AudioCaptureProof proof;
+    memset(&proof, 0, sizeof(proof));
+    capture_test_voice();
+    Psyz_SpuPullSamples(expected, 4414);
+    capture_test_voice();
+    Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
+    Psyz_AudioUnlock();
+    Psyz_AudioUnpause();
+    for (unsigned wait = 0; wait < 200; ++wait) {
+        SDL_Delay(5);
+        Psyz_AudioLock();
+        unsigned frames = proof.frames;
+        Psyz_AudioUnlock();
+        if (frames)
+            break;
+    }
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    zassert_s32_eq(1, proof.frames > 0);
+    zassert_s32_eq(1, proof.frames <= 4414);
+    zassert_s32_eq(0, memcmp(expected, proof.samples,
+                             (size_t)proof.frames * 2 * sizeof(short)));
+    unsigned calls = proof.calls;
+    SDL_Delay(20);
+    zassert_u32_eq(calls, proof.calls);
+    Psyz_AudioDestroy();
+    if (saved) {
+        SDL_SetEnvironmentVariable(
+            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
+        SDL_free(saved);
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
 #endif
 }
 
@@ -1885,11 +2072,12 @@ ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
 #include <libetc.h>
 static unsigned offline_timer_ticks;
 static bool offline_timer_mutes;
-static long offline_timer_tick(void){
+static long offline_timer_tick(void) {
     ++offline_timer_ticks;
-    if(offline_timer_mutes){
-        unsigned volume=(offline_timer_ticks&1)?0:0x3FFF;
-        Psyz_SpuWrite(0x180,volume);Psyz_SpuWrite(0x182,volume);
+    if (offline_timer_mutes) {
+        unsigned volume = (offline_timer_ticks & 1) ? 0 : 0x3FFF;
+        Psyz_SpuWrite(0x180, volume);
+        Psyz_SpuWrite(0x182, volume);
     }
     return 1;
 }
@@ -1898,47 +2086,74 @@ static long offline_timer_tick(void){
 ZTEST(audio_clock, root_counter_tracks_samples_and_ignores_host_delay) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=getenv("PSYZ_AUDIO_CLOCK");
-    if(!clock || strcmp(clock,"video"))zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
-    Psyz_AudioDestroy();zassert_s32_eq(0,Psyz_AudioInit());
-    offline_timer_ticks=0;
-    zassert_s32_eq(1,SetRCnt(RCntCNT2,0x44E8,RCntMdINTR));
-    long event=OpenEvent(RCntCNT2,EvSpINT,EvMdINTR,offline_timer_tick);
-    zassert_s32_eq(1,event!=-1);zassert_s32_eq(1,EnableEvent(event));
-    zassert_s32_eq(1,StartRCnt(RCntCNT2));
-    for(unsigned i=0;i<6;++i)Sdl3Audio_VBlank(false);
-    zassert_u32_eq(24,offline_timer_ticks);
-    long phase=GetRCnt(RCntCNT2);SDL_Delay(40);
-    zassert_s32_eq(phase,GetRCnt(RCntCNT2));zassert_u32_eq(24,offline_timer_ticks);
-    Psyz_AudioPause();Sdl3Audio_VBlank(false);zassert_u32_eq(24,offline_timer_ticks);
+    const char* clock = getenv("PSYZ_AUDIO_CLOCK");
+    if (!clock || strcmp(clock, "video"))
+        zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
+    Psyz_AudioDestroy();
+    zassert_s32_eq(0, Psyz_AudioInit());
+    offline_timer_ticks = 0;
+    zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
+    long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
+    zassert_s32_eq(1, event != -1);
+    zassert_s32_eq(1, EnableEvent(event));
+    zassert_s32_eq(1, StartRCnt(RCntCNT2));
+    for (unsigned i = 0; i < 6; ++i)
+        Sdl3Audio_VBlank(false);
+    zassert_u32_eq(24, offline_timer_ticks);
+    long phase = GetRCnt(RCntCNT2);
+    SDL_Delay(40);
+    zassert_s32_eq(phase, GetRCnt(RCntCNT2));
+    zassert_u32_eq(24, offline_timer_ticks);
+    Psyz_AudioPause();
+    Sdl3Audio_VBlank(false);
+    zassert_u32_eq(24, offline_timer_ticks);
     Psyz_AudioUnpause();
-    for(unsigned i=0;i<54;++i)Sdl3Audio_VBlank(false);
-    zassert_u32_eq(240,offline_timer_ticks);
-    StopRCnt(RCntCNT2);DisableEvent(event);CloseEvent(event);
+    for (unsigned i = 0; i < 54; ++i)
+        Sdl3Audio_VBlank(false);
+    zassert_u32_eq(240, offline_timer_ticks);
+    StopRCnt(RCntCNT2);
+    DisableEvent(event);
+    CloseEvent(event);
 #endif
 }
 
 ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=getenv("PSYZ_AUDIO_CLOCK");
-    if(!clock || strcmp(clock,"video"))zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
-    Psyz_AudioDestroy();zassert_s32_eq(0,Psyz_AudioInit());
-    static short expected[4414*2];static AudioCaptureProof proof;
-    memset(&proof,0,sizeof(proof));
-    capture_test_voice();Psyz_SpuPullSamples(expected,4414);capture_test_voice();
-    offline_timer_ticks=0;offline_timer_mutes=true;
-    zassert_s32_eq(1,SetRCnt(RCntCNT2,0x44E8,RCntMdINTR));
-    long event=OpenEvent(RCntCNT2,EvSpINT,EvMdINTR,offline_timer_tick);
-    zassert_s32_eq(1,event!=-1);EnableEvent(event);StartRCnt(RCntCNT2);
-    Psyz_AudioSetCaptureCallback(capture_playback_pcm,&proof);
-    for(unsigned i=0;i<6;++i)Sdl3Audio_VBlank(false);
-    Psyz_AudioSetCaptureCallback(NULL,NULL);
-    StopRCnt(RCntCNT2);DisableEvent(event);CloseEvent(event);offline_timer_mutes=false;
-    zassert_u32_eq(24,offline_timer_ticks);zassert_u32_eq(4414,proof.frames);zassert_s32_eq(0,proof.overflow);
-    for(unsigned frame=0;frame<4414;++frame){
-        bool muted=((frame*4/735)&1)!=0;
-        for(unsigned ch=0;ch<2;++ch)zassert_s32_eq(muted?0:expected[frame*2+ch],proof.samples[frame*2+ch]);
+    const char* clock = getenv("PSYZ_AUDIO_CLOCK");
+    if (!clock || strcmp(clock, "video"))
+        zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
+    Psyz_AudioDestroy();
+    zassert_s32_eq(0, Psyz_AudioInit());
+    static short expected[4414 * 2];
+    static AudioCaptureProof proof;
+    memset(&proof, 0, sizeof(proof));
+    capture_test_voice();
+    Psyz_SpuPullSamples(expected, 4414);
+    capture_test_voice();
+    offline_timer_ticks = 0;
+    offline_timer_mutes = true;
+    zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
+    long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
+    zassert_s32_eq(1, event != -1);
+    EnableEvent(event);
+    StartRCnt(RCntCNT2);
+    Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
+    for (unsigned i = 0; i < 6; ++i)
+        Sdl3Audio_VBlank(false);
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    StopRCnt(RCntCNT2);
+    DisableEvent(event);
+    CloseEvent(event);
+    offline_timer_mutes = false;
+    zassert_u32_eq(24, offline_timer_ticks);
+    zassert_u32_eq(4414, proof.frames);
+    zassert_s32_eq(0, proof.overflow);
+    for (unsigned frame = 0; frame < 4414; ++frame) {
+        bool muted = ((frame * 4 / 735) & 1) != 0;
+        for (unsigned ch = 0; ch < 2; ++ch)
+            zassert_s32_eq(muted ? 0 : expected[frame * 2 + ch],
+                           proof.samples[frame * 2 + ch]);
     }
 #endif
 }
@@ -1946,21 +2161,37 @@ ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
 ZTEST(audio_clock, synchronous_wait_services_timer_without_vblank) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock=getenv("PSYZ_AUDIO_CLOCK");
-    if(!clock || strcmp(clock,"video"))zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
-    Psyz_AudioDestroy();zassert_s32_eq(0,Psyz_AudioInit());capture_test_voice();
-    static AudioCaptureProof proof;memset(&proof,0,sizeof(proof));
-    offline_timer_ticks=0;
-    zassert_s32_eq(1,SetRCnt(RCntCNT2,0x44E8,RCntMdINTR));
-    long event=OpenEvent(RCntCNT2,EvSpINT,EvMdINTR,offline_timer_tick);
-    zassert_s32_eq(1,event!=-1);EnableEvent(event);StartRCnt(RCntCNT2);
-    Psyz_AudioSetCaptureCallback(capture_playback_pcm,&proof);
-    int vblank=VSync(-1);
-    for(unsigned i=1;i<=4;++i){zassert_s32_eq(1,Psyz_AudioWaitForTimer());zassert_u32_eq(i,offline_timer_ticks);}
-    zassert_s32_eq(vblank,VSync(-1));zassert_u32_eq(735,proof.frames);
-    zassert_u32_eq(4,proof.calls);zassert_s32_eq(0,proof.overflow);
-    Psyz_AudioPause();zassert_s32_eq(0,Psyz_AudioWaitForTimer());zassert_u32_eq(4,proof.calls);
-    Psyz_AudioSetCaptureCallback(NULL,NULL);Psyz_AudioUnpause();
-    StopRCnt(RCntCNT2);DisableEvent(event);CloseEvent(event);
+    const char* clock = getenv("PSYZ_AUDIO_CLOCK");
+    if (!clock || strcmp(clock, "video"))
+        zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
+    Psyz_AudioDestroy();
+    zassert_s32_eq(0, Psyz_AudioInit());
+    capture_test_voice();
+    static AudioCaptureProof proof;
+    memset(&proof, 0, sizeof(proof));
+    offline_timer_ticks = 0;
+    zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
+    long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
+    zassert_s32_eq(1, event != -1);
+    EnableEvent(event);
+    StartRCnt(RCntCNT2);
+    Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
+    int vblank = VSync(-1);
+    for (unsigned i = 1; i <= 4; ++i) {
+        zassert_s32_eq(1, Psyz_AudioWaitForTimer());
+        zassert_u32_eq(i, offline_timer_ticks);
+    }
+    zassert_s32_eq(vblank, VSync(-1));
+    zassert_u32_eq(735, proof.frames);
+    zassert_u32_eq(4, proof.calls);
+    zassert_s32_eq(0, proof.overflow);
+    Psyz_AudioPause();
+    zassert_s32_eq(0, Psyz_AudioWaitForTimer());
+    zassert_u32_eq(4, proof.calls);
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    Psyz_AudioUnpause();
+    StopRCnt(RCntCNT2);
+    DisableEvent(event);
+    CloseEvent(event);
 #endif
 }

@@ -2013,34 +2013,41 @@ ZTEST(gte, leading_sign_registers) {
 #endif
 
 ZTEST(gte, average_nclip_preserves_clip_return) {
-    SVECTOR vertices[4] = {{-100,-100,0,0},{100,-100,0,0},
-                           {-100,100,0,0},{100,100,0,0}};
-    MATRIX matrix = {{{4096,0,0},{0,4096,0},{0,0,4096}}, {0,0,1000}};
+    SVECTOR vertices[4] = {{-100, -100, 0, 0},
+                           {100, -100, 0, 0},
+                           {-100, 100, 0, 0},
+                           {100, 100, 0, 0}};
+    MATRIX matrix = {{{4096, 0, 0}, {0, 4096, 0}, {0, 0, 4096}}, {0, 0, 1000}};
     for (int quad = 0; quad < 2; ++quad) {
         for (int behind = 0; behind < 2; ++behind) {
             for (int reversed = 0; reversed < 2; ++reversed) {
                 InitGeom();
-                SetGeomOffset(160,120);
+                SetGeomOffset(160, 120);
                 SetGeomScreen(1000);
                 matrix.t[2] = behind ? -1000 : 1000;
                 SetRotMatrix(&matrix);
                 SetTransMatrix(&matrix);
                 GTE_SET_ZSF3(341);
                 GTE_SET_ZSF4(256);
-                int screen[4] = {0x12345678,0x12345678,0x12345678,0x12345678};
+                int screen[4] = {0x12345678, 0x12345678, 0x12345678,
+                                 0x12345678};
                 int p = 0x12345678, depth = 0x12345678, flag = 0;
-                SVECTOR *v1 = &vertices[reversed ? 2 : 1];
-                SVECTOR *v2 = &vertices[reversed ? 1 : 2];
-                long clip = quad ? RotAverageNclip4(&vertices[0],v1,v2,&vertices[3],
-                    &screen[0],&screen[1],&screen[2],&screen[3],&p,&depth,&flag) :
-                    RotAverageNclip3(&vertices[0],v1,v2,&screen[0],&screen[1],&screen[2],&p,&depth,&flag);
+                SVECTOR* v1 = &vertices[reversed ? 2 : 1];
+                SVECTOR* v2 = &vertices[reversed ? 1 : 2];
+                long clip =
+                    quad ? RotAverageNclip4(&vertices[0], v1, v2, &vertices[3],
+                                            &screen[0], &screen[1], &screen[2],
+                                            &screen[3], &p, &depth, &flag)
+                         : RotAverageNclip3(
+                               &vertices[0], v1, v2, &screen[0], &screen[1],
+                               &screen[2], &p, &depth, &flag);
                 int expected = behind ? 159201 : 40000;
-                zexpect_s32_eq(reversed ? -expected : expected,clip);
+                zexpect_s32_eq(reversed ? -expected : expected, clip);
                 if (reversed) {
-                    zexpect_s32_eq(0x12345678,depth);
-                    zexpect_s32_eq(0x12345678,screen[0]);
+                    zexpect_s32_eq(0x12345678, depth);
+                    zexpect_s32_eq(0x12345678, screen[0]);
                 } else {
-                    zexpect_s32_eq(behind ? 0 : quad ? 250 : 249,depth);
+                    zexpect_s32_eq(behind ? 0 : quad ? 250 : 249, depth);
                 }
             }
         }
