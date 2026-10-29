@@ -134,6 +134,51 @@ ZTEST_TEARDOWN(gpu) { gpu_teardown(); }
 /* Off keeps RGB888 shading; Auto remains the PS1 RGB555 reference even
  * when DRAWENV.dtd is zero. Test actual captured GPU pixels, not shader text.
  */
+ZTEST(gpu, interface_pack_preserves_native_and_unmarked_packets) {
+#if defined(PSYZ_TEST_SDL_GPU)
+    extern bool InitPlatform(void);
+    if(!InitPlatform())zskip("requires SDL GPU");
+    gpu_setup();Psyz_GpuSetVramCopy(1);Psyz_VideoSetInternalResolution(4);VSync(0);
+    char root[4096],folder[4096];
+    snprintf(root,sizeof(root),"%spe-ui-%llu",SDL_GetBasePath(),(unsigned long long)SDL_GetTicksNS());
+    snprintf(folder,sizeof(folder),"%s/interface",root);zassert_s32_eq(1,SDL_CreateDirectory(folder));
+    SDL_setenv_unsafe("PSYZ_DUMP_INTERFACE",folder,1);Psyz_GpuSetInterfacePack(root);
+    unsigned short pixels[64*256];for(unsigned i=0;i<64*256;++i)pixels[i]=0x1111;
+    unsigned short palette[16]={0,31};RECT image={640,256,64,256},colors={640,240,16,1};
+    LoadImage(&image,(u_long *)pixels);LoadImage(&colors,(u_long *)palette);DrawSync(0);
+    DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(0,0,640,256));DrawPrim(&page);
+    SPRT sprite;SetSprt(&sprite);setRGB0(&sprite,128,128,128);setXY0(&sprite,30,30);setUV0(&sprite,0,0);setWH(&sprite,12,12);sprite.clut=GetClut(640,240);
+    Psyz_GpuRegisterInterfacePrimitive(&sprite);DrawPrim(&sprite);DrawSync(0);
+    int count;char **files=SDL_GlobDirectory(folder,"*.png",0,&count);zassert_s32_eq(1,count);zexpect_s32_eq(0,strcmp(files[0],"ed6af081e350b68d.png"));
+    char material[4096];snprintf(material,sizeof(material),"%s/ui-%s",root,files[0]);SDL_free(files);
+    SDL_Surface *hd=SDL_CreateSurface(48,48,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,hd);
+    SDL_FillSurfaceRect(hd,NULL,SDL_MapSurfaceRGBA(hd,0,255,0,255));zassert_s32_eq(1,SDL_SavePNG(hd,material));SDL_DestroySurface(hd);
+    Psyz_GpuSetInterfacePack(NULL);Psyz_GpuSetInterfacePack(root);
+    Psyz_GpuRegisterInterfacePrimitive(&sprite);DrawPrim(&sprite);DrawSync(0);
+    /* The same command address, unmarked on the next frame, must remain native. */
+    Psyz_GpuClearInterfacePackets();setXY0(&sprite,60,30);DrawPrim(&sprite);DrawSync(0);
+    /* Unrelated texels on the same native page must not invalidate a glyph. */
+    RECT unrelated={650,257,1,1};unsigned short other=0x2222;LoadImage(&unrelated,(u_long *)&other);DrawSync(0);
+    setXY0(&sprite,90,30);Psyz_GpuRegisterInterfacePrimitive(&sprite);DrawPrim(&sprite);DrawSync(0);
+    /* A palette swap must never reuse the earlier artwork under a new color. */
+    palette[1]=31<<10;LoadImage(&colors,(u_long *)palette);DrawSync(0);
+    setXY0(&sprite,120,30);Psyz_GpuRegisterInterfacePrimitive(&sprite);DrawPrim(&sprite);DrawSync(0);VSync(0);
+    int w,h;unsigned char *rendered=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,rendered);
+    unsigned char *p=rendered+((size_t)35*4*w+35*4)*3;zexpect_s32_eq(0,p[0]);zexpect_s32_eq(255,p[1]);
+    p=rendered+((size_t)35*4*w+65*4)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);
+    p=rendered+((size_t)35*4*w+95*4)*3;zexpect_s32_eq(0,p[0]);zexpect_s32_eq(255,p[1]);
+    p=rendered+((size_t)35*4*w+125*4)*3;zexpect_s32_eq(0,p[1]);zexpect_s32_eq(255,p[2]);free(rendered);
+    unsigned char *native=Psyz_VideoAllocCapturedFrame(&w,&h);zassert_ptr_ne(NULL,native);
+    p=native+((size_t)35*w+35)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);free(native);
+    Psyz_GpuSetInterfacePack(NULL);SDL_unsetenv_unsafe("PSYZ_DUMP_INTERFACE");Psyz_VideoSetInternalResolution(1);
+    SDL_RemovePath(material);files=SDL_GlobDirectory(folder,"*.png",0,&count);
+    for(int i=0;i<count;++i){snprintf(material,sizeof(material),"%s/%s",folder,files[i]);SDL_RemovePath(material);}SDL_free(files);
+    SDL_RemovePath(folder);SDL_RemovePath(root);Psyz_GpuSetVramCopy(0);gpu_teardown();
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");if(backend&&!strcmp(backend,"1"))zskip("requires SDL GPU");
@@ -574,6 +619,25 @@ ZTEST(gpu, rgb24_hd_backdrop_preserves_native_ui_and_vram) {
         unsigned char *after=Psyz_VideoAllocCapturedFrame(&w,&h);zassert_ptr_ne(NULL,after);
         zassert_s32_eq(320,w);zassert_s32_eq(240,h);zassert_s32_eq(0,memcmp(original,after,320*240*3));free(after);
     }
+    /* The title's native CPU compositor stays authoritative while its
+     * original image node supplies position and fade for an HD material. */
+    char root[512],material[1024];snprintf(root,sizeof(root),"%spsyz-rgb-ui-%llu",SDL_GetBasePath(),(unsigned long long)SDL_GetTicksNS());SDL_CreateDirectory(root);
+    const unsigned char node_rgb[]={200,100,50};uint64_t key=UINT64_C(14695981039346656037);
+    const unsigned char dimensions[]={1,0,1,0};
+    for(unsigned i=0;i<4;++i)key=(key^dimensions[i])*UINT64_C(1099511628211);
+    for(unsigned i=0;i<3;++i)key=(key^node_rgb[i])*UINT64_C(1099511628211);
+    snprintf(material,sizeof(material),"%s/ui-rgb-%016llx.png",root,(unsigned long long)key);
+    image=SDL_CreateSurface(4,4,SDL_PIXELFORMAT_RGBA32);SDL_FillSurfaceRect(image,NULL,SDL_MapSurfaceRGBA(image,0,255,0,255));SDL_SavePNG(image,material);SDL_DestroySurface(image);
+    Psyz_GpuSetInterfacePack(root);Psyz_VideoBeginRgb24Interface(0);Psyz_VideoAddRgb24Interface(node_rgb,160,120,1,1,256);
+    unsigned char *enhanced=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,enhanced);
+    const unsigned char expected_ui[]={70,255,120};unsigned ux=(w-640)/2+320;
+    zexpect_s32_eq(0,memcmp(enhanced+(240*w+ux)*3,expected_ui,3));free(enhanced);
+    unsigned char *unchanged=Psyz_VideoAllocCapturedFrame(&w,&h);zexpect_s32_eq(0,memcmp(original,unchanged,320*240*3));free(unchanged);
+    Psyz_VideoAddRgb24Interface(NULL,160,120,1,1,0);enhanced=Psyz_VideoAllocRenderedFrame(&w,&h);ux=(w-640)/2+320;
+    zexpect_s32_eq(0,memcmp(enhanced+(240*w+ux)*3,node_rgb,3));free(enhanced);
+    Psyz_VideoBeginRgb24Interface(0);enhanced=Psyz_VideoAllocRenderedFrame(&w,&h);ux=(w-640)/2+320;
+    zexpect_s32_eq(0,memcmp(enhanced+(240*w+ux)*3,node_rgb,3));free(enhanced);
+    Psyz_GpuSetInterfacePack(NULL);SDL_RemovePath(material);SDL_RemovePath(root);
     Psyz_VideoSetWidescreen(0);Psyz_VideoSetRgb24Backdrop(NULL,NULL,0,0,0,0);
     unsigned char *restored=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,restored);
     zassert_s32_eq(320,w);zassert_s32_eq(240,h);zassert_s32_eq(0,memcmp(original,restored,320*240*3));

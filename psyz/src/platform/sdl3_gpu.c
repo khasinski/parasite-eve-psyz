@@ -247,6 +247,113 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
 }
 
+static void ResetRgb24Interface(void);
+/* Interface artwork is selected only for explicitly marked original UI
+ * commands. Hash page bytes and the exact palette, not VRAM addresses, so
+ * scene uploads and palette changes cannot select unrelated artwork. */
+#define UI_PACKETS 16384u
+#define UI_IMAGES 2048u
+#define UI_ATLAS_SIZE 2048u
+static const void *ui_commands[UI_PACKETS],*ui_queue[UI_PACKETS];
+static char ui_directory[4096];
+static bool ui_tracking_active;
+static SDL_GPUTexture *ui_batch_texture;
+static SDL_GPUSampler *ui_sampler;
+typedef struct { uint64_t key; unsigned x,y,w,h; bool loaded; } UiImage;
+static SDL_GPUTexture *ui_atlas;
+static unsigned ui_atlas_x,ui_atlas_y,ui_atlas_row;
+static int ui_u,ui_v,ui_w,ui_h;
+static UiImage ui_images[UI_IMAGES];
+static unsigned ui_image_next;
+typedef struct { unsigned page,clut; int x,y,w,h; uint64_t key; } UiPage;
+static UiPage ui_pages[64];
+static unsigned ui_page_count;
+static unsigned long long ui_revision;
+static bool UiHas(const void **map,const void *p) {
+    unsigned h=InterpHash(p)&(UI_PACKETS-1);
+    for(unsigned i=0;i<4;++i)if(map[(h+i)&(UI_PACKETS-1)]==p)return true;
+    return false;
+}
+static void UiMap(const void **map,const void *p,bool enabled) {
+    unsigned h=InterpHash(p)&(UI_PACKETS-1),slot=h;
+    for(unsigned i=0;i<4;++i){unsigned n=(h+i)&(UI_PACKETS-1);
+        if(map[n]==p){map[n]=enabled?p:NULL;return;}
+        if(!map[n])slot=n;
+    }
+    if(enabled)map[slot]=p;
+}
+void Psyz_GpuRegisterInterfacePacket(const void *command) {
+    if(command&&ui_tracking_active)UiMap(ui_commands,command,true);
+}
+/* Merged HUD packets include a native draw-mode header and packed sprite
+ * commands. Mark their payload addresses without altering or interpreting it. */
+void Psyz_GpuRegisterInterfacePrimitive(const void *primitive) {
+    if(!primitive||!ui_tracking_active)return;
+    uintptr_t words;memcpy(&words,(const unsigned char *)primitive+sizeof(uintptr_t),sizeof(words));
+    if(!words||words>32)return;
+    const unsigned char *payload=(const unsigned char *)primitive+2*sizeof(uintptr_t);
+    for(size_t offset=0;offset<words*sizeof(uintptr_t);offset+=4)
+        UiMap(ui_commands,payload+offset,true);
+}
+void Psyz_GpuCopyInterfacePacket(const void *from,const void *to) {
+    if(ui_tracking_active)UiMap(ui_queue,to,UiHas(ui_commands,from));
+}
+void Psyz_GpuClearInterfacePackets(void) {
+    memset(ui_commands,0,sizeof(ui_commands));ui_page_count=0;
+}
+void Psyz_GpuSetInterfacePack(const char *directory) {
+    if(!directory)directory="";
+    const char *capture=SDL_getenv("PSYZ_DUMP_INTERFACE");
+    ui_tracking_active=*directory||(capture&&*capture);
+    if(!strcmp(ui_directory,directory))return;
+    Draw_FlushBuffer();ui_batch_texture=NULL;ResetRgb24Interface();
+    if(ui_atlas&&device)SDL_ReleaseGPUTexture(device,ui_atlas);ui_atlas=NULL;
+    memset(ui_images,0,sizeof(ui_images));ui_image_next=0;ui_atlas_x=ui_atlas_y=ui_atlas_row=0;
+    snprintf(ui_directory,sizeof(ui_directory),"%s",directory);
+    ui_page_count=0;memset(ui_commands,0,sizeof(ui_commands));memset(ui_queue,0,sizeof(ui_queue));
+}
+static uint64_t UiHashWord(uint64_t h,unsigned word) {
+    return ((h^(word&255))*UINT64_C(1099511628211)^(word>>8))*UINT64_C(1099511628211);
+}
+static uint64_t UiRegionKey(unsigned page,unsigned clut,int left,int top,int w,int h) {
+    const unsigned char *known;const unsigned short *vram=Psyz_GpuGetVramCopy(&known);
+    unsigned long long revision=Psyz_GpuGetVramRevision();
+    if(revision!=ui_revision){ui_page_count=0;ui_revision=revision;}
+    unsigned mode=(page>>7)&3;
+    if(!vram||!known||mode>1)return 0;
+    for(unsigned i=0;i<ui_page_count;++i)if(ui_pages[i].page==page&&ui_pages[i].clut==clut&&ui_pages[i].x==left&&ui_pages[i].y==top&&ui_pages[i].w==w&&ui_pages[i].h==h)return ui_pages[i].key;
+    unsigned bx=(page&15)*64,by=((page>>4)&1)*256;
+    unsigned palette=((clut>>6)&511)*1024+(clut&63)*16,colors=mode?256:16;
+    if((palette%1024)+colors>1024)return 0;
+    uint64_t hash=UiHashWord(UINT64_C(14695981039346656037),mode);
+    hash=UiHashWord(UiHashWord(hash,w),h);
+    for(int y=top;y<top+h;++y)for(int x=left;x<left+w;++x){
+        unsigned at=(by+(y&255))*1024+((bx+((x&255)>>(mode?1:2)))&1023);
+        if(!known[at])return 0;
+        unsigned index=(vram[at]>>((x&(mode?1:3))*(mode?8:4)))&(mode?255:15);
+        if(!known[palette+index])return 0;
+        hash=UiHashWord(hash,vram[palette+index]);
+    }
+    if(ui_page_count<64)ui_pages[ui_page_count++]=(UiPage){page,clut,left,top,w,h,hash};
+    const char *dump=SDL_getenv("PSYZ_DUMP_INTERFACE");
+    if(dump&&*dump){
+        char path[4096];snprintf(path,sizeof(path),"%s/%016llx.png",dump,(unsigned long long)hash);
+        SDL_PathInfo existing;
+        if(!SDL_GetPathInfo(path,&existing)){
+            SDL_Surface *image=SDL_CreateSurface(w,h,SDL_PIXELFORMAT_RGBA32);
+            if(image){for(int y=0;y<h;++y)for(int x=0;x<w;++x){
+                unsigned at=(by+((top+y)&255))*1024+((bx+(((left+x)&255)>>(mode?1:2)))&1023);
+                unsigned index=(vram[at]>>(((left+x)&(mode?1:3))*(mode?8:4)))&(mode?255:15);
+                unsigned c=known[at]?vram[palette+index]:0;
+                unsigned char *out=(unsigned char *)image->pixels+y*image->pitch+x*4;
+                out[0]=((c&31)*255+15)/31;out[1]=(((c>>5)&31)*255+15)/31;out[2]=(((c>>10)&31)*255+15)/31;out[3]=c?255:0;
+            }SDL_SavePNG(image,path);SDL_DestroySurface(image);}
+        }
+    }
+    return hash;
+}
+static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int h);
+
 /* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
 typedef struct SpriteAtlas {
     uint64_t key;
@@ -475,6 +582,57 @@ static SDL_Surface *LoadHdImage(const char *filename) {
         SDL_DestroySurface(surface);surface=NULL;
     }
     SDL_free(data);return surface;
+}
+
+static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int h) {
+    if(w<=0||h<=0||w>256||h>256)return NULL;
+    uint64_t key=UiRegionKey(page&0x19f,clut,left,top,w,h);
+    if(!key||!*ui_directory||!sprite_atlases_enabled)return NULL;
+    for(unsigned i=0;i<ui_image_next;++i)if(ui_images[i].key==key)return ui_images[i].loaded?ui_images+i:NULL;
+    char path[4096];SDL_Surface *source=NULL;
+    const char *formats[]={"webp","png"};
+    for(unsigned i=0;i<2&&!source;++i){
+        int n=snprintf(path,sizeof(path),"%s/ui-%016llx.%s",ui_directory,(unsigned long long)key,formats[i]);
+        if(n>0&&(size_t)n<sizeof(path))source=LoadHdImage(path);
+    }
+    if(source&&(source->w!=w*4||source->h!=h*4)){SDL_DestroySurface(source);source=NULL;}
+    unsigned sw=w*4+4,sh=h*4+4;
+    if(ui_atlas_x+sw>UI_ATLAS_SIZE){ui_atlas_x=0;ui_atlas_y+=ui_atlas_row;ui_atlas_row=0;}
+    if(ui_image_next==UI_IMAGES || (source&&ui_atlas_y+sh>UI_ATLAS_SIZE)){
+        Draw_FlushBuffer();ui_batch_texture=NULL;
+        if(ui_atlas)SDL_ReleaseGPUTexture(device,ui_atlas);ui_atlas=NULL;
+        ui_image_next=0;ui_atlas_x=ui_atlas_y=ui_atlas_row=0;
+    }
+    UiImage *entry=ui_images+ui_image_next++;*entry=(UiImage){.key=key};
+    if(!source)return NULL;
+    if(!ui_sampler){SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
+        .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
+        ui_sampler=SDL_CreateGPUSampler(device,&sampler);}
+    if(!ui_atlas){SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=UI_ATLAS_SIZE,.height=UI_ATLAS_SIZE,.layer_count_or_depth=1,.num_levels=1};
+        ui_atlas=SDL_CreateGPUTexture(device,&info);}
+    SDL_Surface *rgba=SDL_ConvertSurface(source,SDL_PIXELFORMAT_RGBA32);SDL_DestroySurface(source);
+    SDL_GPUTransferBufferCreateInfo upinfo={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=sw*sh*4};
+    SDL_GPUTransferBuffer *upload=rgba&&ui_atlas&&ui_sampler?SDL_CreateGPUTransferBuffer(device,&upinfo):NULL;
+    unsigned char *mapped=upload?SDL_MapGPUTransferBuffer(device,upload,false):NULL;
+    if(mapped){
+        /* Replicated two-pixel gutters isolate neighbouring glyphs under filtering. */
+        for(unsigned y=0;y<sh;++y)for(unsigned x=0;x<sw;++x){
+            unsigned sx=SDL_clamp((int)x-2,0,w*4-1),sy=SDL_clamp((int)y-2,0,h*4-1);
+            memcpy(mapped+((size_t)y*sw+x)*4,(unsigned char *)rgba->pixels+sy*rgba->pitch+sx*4,4);
+        }
+        SDL_UnmapGPUTransferBuffer(device,upload);
+        SDL_GPUCommandBuffer *cmd=AcquireCmd();SDL_GPUCopyPass *copy=cmd?SDL_BeginGPUCopyPass(cmd):NULL;
+        if(copy){SDL_GPUTextureTransferInfo from={.transfer_buffer=upload,.pixels_per_row=sw,.rows_per_layer=sh};
+            SDL_GPUTextureRegion to={.texture=ui_atlas,.x=ui_atlas_x,.y=ui_atlas_y,.w=sw,.h=sh,.d=1};
+            SDL_UploadToGPUTexture(copy,&from,&to,false);SDL_EndGPUCopyPass(copy);
+            *entry=(UiImage){key,ui_atlas_x+2,ui_atlas_y+2,w*4,h*4,true};
+            ui_atlas_x+=sw;ui_atlas_row=SDL_max(ui_atlas_row,sh);
+        }
+    }
+    if(upload)SDL_ReleaseGPUTransferBuffer(device,upload);if(rgba)SDL_DestroySurface(rgba);
+    return entry->loaded?entry:NULL;
 }
 
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
@@ -1263,6 +1421,43 @@ int Psyz_VideoSetRgb24Backdrop(const char *filename, const unsigned char *refere
     SDL_strlcpy(title_path,filename,sizeof(title_path));return 1;
 }
 
+typedef struct { uint64_t key; SDL_Surface *image; } RgbUiMaterial;
+static RgbUiMaterial rgb_ui_materials[16];
+static unsigned rgb_ui_material_count,rgb_ui_slot;
+static struct { SDL_Surface *image; int x,y,w,h,intensity; } rgb_ui_nodes[2][8];
+static unsigned rgb_ui_count[2];
+static void ResetRgb24Interface(void) {
+    for(unsigned i=0;i<rgb_ui_material_count;++i)if(rgb_ui_materials[i].image)SDL_DestroySurface(rgb_ui_materials[i].image);
+    rgb_ui_material_count=0;rgb_ui_count[0]=rgb_ui_count[1]=0;title_hash=0;
+}
+void Psyz_VideoBeginRgb24Interface(int buffer_y) {
+    rgb_ui_slot=buffer_y>=240;rgb_ui_count[rgb_ui_slot]=0;title_hash=0;
+}
+void Psyz_VideoAddRgb24Interface(const unsigned char *rgb,int x,int y,int w,int h,int intensity) {
+    if(!*ui_directory||w<=0||w>320||h<=0||h>240||x<-320||x>320||y<-240||y>240||rgb_ui_count[rgb_ui_slot]>=8)return;
+    title_hash=0;
+    if(!rgb){unsigned node=rgb_ui_count[rgb_ui_slot]++;rgb_ui_nodes[rgb_ui_slot][node].image=NULL;
+        rgb_ui_nodes[rgb_ui_slot][node].x=x;rgb_ui_nodes[rgb_ui_slot][node].y=y;
+        rgb_ui_nodes[rgb_ui_slot][node].w=w;rgb_ui_nodes[rgb_ui_slot][node].h=h;return;}
+    uint64_t key=UiHashWord(UiHashWord(UINT64_C(14695981039346656037),w),h);
+    for(size_t i=0;i<(size_t)w*h*3;++i)key=(key^rgb[i])*UINT64_C(1099511628211);
+    unsigned at=0;while(at<rgb_ui_material_count&&rgb_ui_materials[at].key!=key)++at;
+    if(at==rgb_ui_material_count){
+        if(at==16)return;char path[4096];
+        SDL_Surface *source=NULL;const char *formats[]={"webp","png"};
+        for(unsigned f=0;f<2&&!source;++f){int n=snprintf(path,sizeof(path),"%s/ui-rgb-%016llx.%s",ui_directory,(unsigned long long)key,formats[f]);
+            if(n>0&&(size_t)n<sizeof(path))source=LoadHdImage(path);}
+        SDL_Surface *image=NULL;
+        if(source){if(source->w==w*4&&source->h==h*4)image=SDL_ConvertSurface(source,SDL_PIXELFORMAT_RGBA32);SDL_DestroySurface(source);}
+        rgb_ui_materials[rgb_ui_material_count++]=(RgbUiMaterial){key,image};
+    }
+    SDL_Surface *image=rgb_ui_materials[at].image;
+    if(image){unsigned node=rgb_ui_count[rgb_ui_slot]++;rgb_ui_nodes[rgb_ui_slot][node].image=image;
+        rgb_ui_nodes[rgb_ui_slot][node].x=x;rgb_ui_nodes[rgb_ui_slot][node].y=y;
+        rgb_ui_nodes[rgb_ui_slot][node].w=w;rgb_ui_nodes[rgb_ui_slot][node].h=h;
+        rgb_ui_nodes[rgb_ui_slot][node].intensity=SDL_clamp(intensity,0,256);}
+}
+
 static SDL_Surface *BuildTitleDisplay(const u8 *rgb) {
     if (!sprite_atlases_enabled || !title_image || display_size.x!=title_width || display_size.y!=title_height) return NULL;
     unsigned n=SDL_clamp((unsigned)(title_image->h/title_height),1u,4u);
@@ -1290,10 +1485,36 @@ static SDL_Surface *BuildTitleDisplay(const u8 *rgb) {
     for (int y=0;y<title_height;++y) for (int x=0;x<title_width;++x) {
         size_t at=((size_t)y*title_width+x)*3;
         if (!memcmp(rgb+at,title_reference+at,3)) continue;
+        bool replaced=false;unsigned ui_slot=display_area.y>=240;
+        for(unsigned i=0;i<rgb_ui_count[ui_slot];++i){
+            if(rgb_ui_nodes[ui_slot][i].image&&x>=rgb_ui_nodes[ui_slot][i].x&&x<rgb_ui_nodes[ui_slot][i].x+rgb_ui_nodes[ui_slot][i].w&&
+               y>=rgb_ui_nodes[ui_slot][i].y&&y<rgb_ui_nodes[ui_slot][i].y+rgb_ui_nodes[ui_slot][i].h){replaced=true;break;}}
+        for(unsigned i=0;replaced&&i<rgb_ui_count[ui_slot];++i)
+            if(!rgb_ui_nodes[ui_slot][i].image&&x>=rgb_ui_nodes[ui_slot][i].x&&x<rgb_ui_nodes[ui_slot][i].x+rgb_ui_nodes[ui_slot][i].w&&
+               y>=rgb_ui_nodes[ui_slot][i].y&&y<rgb_ui_nodes[ui_slot][i].y+rgb_ui_nodes[ui_slot][i].h)replaced=false;
+        if(replaced)continue;
         u8 color[4]={rgb[at],rgb[at+1],rgb[at+2],255};u32 value;memcpy(&value,color,4);
         for (unsigned dy=0;dy<n;++dy) {
             u32 *row=(u32 *)((u8 *)title_output->pixels+(y*n+dy)*title_output->pitch)+margin+x*n;
             for (unsigned dx=0;dx<n;++dx) row[dx]=value;
+        }
+    }
+    unsigned ui_slot=display_area.y>=240;
+    for(unsigned i=0;i<rgb_ui_count[ui_slot];++i){
+        SDL_Surface *source=rgb_ui_nodes[ui_slot][i].image;
+        if(!source)continue;
+        int left=margin+rgb_ui_nodes[ui_slot][i].x*(int)n,top=rgb_ui_nodes[ui_slot][i].y*(int)n;
+        int width=rgb_ui_nodes[ui_slot][i].w*(int)n,height=rgb_ui_nodes[ui_slot][i].h*(int)n;
+        for(int y=0;y<height;++y)for(int x=0;x<width;++x){
+            if(left+x<0||left+x>=(int)w||top+y<0||top+y>=(int)h)continue;
+            bool native_only=false;int nx=rgb_ui_nodes[ui_slot][i].x+x/(int)n,ny=rgb_ui_nodes[ui_slot][i].y+y/(int)n;
+            for(unsigned j=0;j<rgb_ui_count[ui_slot];++j)if(!rgb_ui_nodes[ui_slot][j].image&&
+                nx>=rgb_ui_nodes[ui_slot][j].x&&nx<rgb_ui_nodes[ui_slot][j].x+rgb_ui_nodes[ui_slot][j].w&&
+                ny>=rgb_ui_nodes[ui_slot][j].y&&ny<rgb_ui_nodes[ui_slot][j].y+rgb_ui_nodes[ui_slot][j].h){native_only=true;break;}
+            if(native_only)continue;
+            const u8 *in=(u8 *)source->pixels+(y*source->h/height)*source->pitch+(x*source->w/width)*4;
+            u8 *out=(u8 *)title_output->pixels+(top+y)*title_output->pitch+(left+x)*4;
+            for(unsigned c=0;c<3;++c)out[c]=SDL_max(out[c],(in[c]*rgb_ui_nodes[ui_slot][i].intensity)>>8);
         }
     }
     title_hash=hash;++title_generation;return title_output;
@@ -1741,6 +1962,9 @@ static void QuitPlatform(void) {
     if (device) {
         SDL_WaitForGPUIdle(device);
         ReleaseFrameFences();
+        ui_batch_texture=NULL;ResetRgb24Interface();
+        if(ui_atlas)SDL_ReleaseGPUTexture(device,ui_atlas);ui_atlas=NULL;ui_image_next=0;ui_atlas_x=ui_atlas_y=ui_atlas_row=0;memset(ui_images,0,sizeof(ui_images));
+        if(ui_sampler)SDL_ReleaseGPUSampler(device,ui_sampler);ui_sampler=NULL;ui_page_count=0;
         if (sprite_atlas_texture) SDL_ReleaseGPUTexture(device,sprite_atlas_texture);
         sprite_atlas_texture=NULL;sprite_atlas_cells=0;
         sprite_atlas_count=0;sprite_atlas_bytes=0;next_sprite_atlas=NULL;
@@ -2450,6 +2674,26 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     unsigned atlas_cell=next_sprite_cell;
     bool atlas_extension=next_sprite_extension;
     next_sprite_atlas=NULL;next_sprite_extension=false;
+    UiImage *ui_image=NULL;SDL_GPUTexture *ui_texture=NULL;
+    if(isTextured&&!isLine&&!atlas&&max_len>=3&&
+       (UiHas(ui_queue,packets)||UiHas(ui_commands,packets))){
+        unsigned ui_page=cur_tpage,ui_clut=(unsigned)(packets[2]>>16);
+        if(isPoly&&max_len>(isGouraud?5:4))ui_page=(unsigned)(packets[isGouraud?5:4]>>16);
+        /* Texture windows need an explicit material layout; keep native fallback. */
+        ui_u=(unsigned)packets[2]&255;ui_v=((unsigned)packets[2]>>8)&255;ui_w=ui_h=0;
+        if(isPoly && !isGouraud && max_len>=9 && (code&8)){
+            int max_u=ui_u,max_v=ui_v;
+            for(int i=1;i<4;++i){int u=(unsigned)packets[2+i*2]&255,v=((unsigned)packets[2+i*2]>>8)&255;
+                ui_u=SDL_min(ui_u,u);ui_v=SDL_min(ui_v,v);max_u=SDL_max(max_u,u);max_v=SDL_max(max_v,v);}
+            ui_w=max_u-ui_u+1;ui_h=max_v-ui_v+1;
+        }else if(isTile){
+            switch(code&~3){case 0x64:if(max_len>=4){ui_w=(unsigned)packets[3]&65535;ui_h=((unsigned)packets[3]>>16)&65535;}break;
+                case 0x74:ui_w=ui_h=8;break;case 0x7c:ui_w=ui_h=16;break;}
+        }
+        if(cur_twin==TWIN_PACK(255,255,0,0))ui_image=UiSelect(ui_page,ui_clut,ui_u,ui_v,ui_w,ui_h);
+        if(ui_image)ui_texture=ui_atlas;
+    }
+    if(ui_texture!=ui_batch_texture){Draw_FlushBuffer();ui_batch_texture=ui_texture;}
     /* One shared atlas: selecting a replacement must not split PS1 batches. */
 
     bool isShadeTex = !((code & 1) && isTextured && !isLine);
@@ -2461,6 +2705,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
     for (int i=0;i<6;++i) {v[i].hd_uv[0]=v[i].hd_uv[1]=0;v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;}
+    if(ui_texture)for(int i=0;i<6;++i)v[i].hd_uv[2]=4;
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
         v->g = (unsigned char)(*packets >> 8);
@@ -2563,6 +2808,10 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             SetPolygonAttributes(vertex_cur);
             for (int i = 0; i < nVertices; ++i) {
                 SET_TC(&vertex_cur[i], tpage | TPAGE_POLYGON, clut);
+            }
+            if(ui_image)for(int i=0;i<nVertices;++i){
+                vertex_cur[i].hd_uv[0]=(ui_image->x+((float)vertex_cur[i].u-ui_u)*4)/UI_ATLAS_SIZE;
+                vertex_cur[i].hd_uv[1]=(ui_image->y+((float)vertex_cur[i].v-ui_v)*4)/UI_ATLAS_SIZE;
             }
             Draw_EnqueueBuffer(nVertices, nIndices);
         } else {
@@ -2776,6 +3025,10 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             }
         }
         SET_TC_ALL(vertex_cur, tpage, clut);
+        if(ui_image)for(int i=0;i<4;++i){
+            vertex_cur[i].hd_uv[0]=(ui_image->x+((float)vertex_cur[i].u-ui_u)*4)/UI_ATLAS_SIZE;
+            vertex_cur[i].hd_uv[1]=(ui_image->y+((float)vertex_cur[i].v-ui_v)*4)/UI_ATLAS_SIZE;
+        }
         Draw_EnqueueBuffer(4, 6);
     }
     batch_has_texture |= isTextured;
@@ -3234,8 +3487,8 @@ void Draw_FlushBuffer(void) {
             const SDL_GPUTextureSamplerBinding sampler_binding[3] = {
                 {.texture=vram_sample,.sampler=vram_sampler},
                 {.texture=destination_sample,.sampler=vram_sampler},
-                {.texture=sprite_atlas_texture ? sprite_atlas_texture : vram_sample,
-                 .sampler=sprite_atlas_texture ? sprite_atlas_sampler : vram_sampler}};
+                {.texture=ui_batch_texture ? ui_batch_texture : (sprite_atlas_texture ? sprite_atlas_texture : vram_sample),
+                 .sampler=ui_batch_texture ? ui_sampler : (sprite_atlas_texture ? sprite_atlas_sampler : vram_sampler)}};
             SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,3);
             /* The viewport maps shader x to offset * (1 - grid) + x * grid;
              * the shader squeezes around the centre in its own space, so
