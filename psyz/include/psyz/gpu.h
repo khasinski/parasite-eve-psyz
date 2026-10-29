@@ -65,6 +65,9 @@ int Psyz_GpuSetHorizontalGrid(
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
 /* Retire queued reads and reuse the bounded atlas storage for a new room. */
 void Psyz_GpuResetSpriteAtlases(void);
+/* Presentation switch; native VRAM remains unchanged. */
+void Psyz_GpuSetSpriteAtlasesEnabled(int enabled);
+int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command
  * when selecting inside an OT. Missing keys select ordinary rendering. */
 /* Cell bit 23 marks display-only widescreen extension material. */

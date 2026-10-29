@@ -119,6 +119,7 @@ static unsigned sprite_atlas_cells;
 #define HD_ATLAS_HEIGHT (HD_ATLAS_ROWS*136u)
 static unsigned next_sprite_cell;
 static bool next_sprite_extension;
+static bool sprite_atlases_enabled=true;
 static SDL_GPUSampler *sprite_atlas_sampler;
 
 
@@ -286,6 +287,15 @@ static void SubmitCmd(void) {
     if (pending_cmd) {
         SDL_SubmitGPUCommandBuffer(pending_cmd);
         pending_cmd = NULL;
+    }
+}
+
+int Psyz_GpuGetSpriteAtlasesEnabled(void) {return sprite_atlases_enabled;}
+
+void Psyz_GpuSetSpriteAtlasesEnabled(int enabled) {
+    if(sprite_atlases_enabled!=(enabled!=0)) {
+        if(device)Draw_FlushBuffer();
+        sprite_atlases_enabled=enabled!=0;
     }
 }
 
@@ -1104,7 +1114,7 @@ int Psyz_VideoSetRgb24Backdrop(const char *filename, const unsigned char *refere
 }
 
 static SDL_Surface *BuildTitleDisplay(const u8 *rgb) {
-    if (!title_image || display_size.x!=title_width || display_size.y!=title_height) return NULL;
+    if (!sprite_atlases_enabled || !title_image || display_size.x!=title_width || display_size.y!=title_height) return NULL;
     unsigned n=SDL_clamp((unsigned)(title_image->h/title_height),1u,4u);
     unsigned h=title_height*n,w=widescreen?(h*16u+8u)/9u:title_width*n;
     if (!title_output || title_output->w!=(int)w || title_output->h!=(int)h) {
@@ -2267,7 +2277,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C) ? next_sprite_atlas : NULL;
     unsigned atlas_cell=next_sprite_cell;
     bool atlas_extension=next_sprite_extension;
-    next_sprite_atlas=NULL;
+    next_sprite_atlas=NULL;next_sprite_extension=false;
     /* One shared atlas: selecting a replacement must not split PS1 batches. */
 
     bool isShadeTex = !((code & 1) && isTextured && !isLine);
@@ -2278,7 +2288,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     // This also covers Gouraud's fifth-slot colour read-ahead.
     Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
-    for (int i=0;i<6;++i) v[i].hd_uv[0]=v[i].hd_uv[1]=v[i].hd_uv[2]=0;
+    for (int i=0;i<6;++i) {v[i].hd_uv[0]=v[i].hd_uv[1]=0;v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;}
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
         v->g = (unsigned char)(*packets >> 8);
@@ -2590,7 +2600,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
-                vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen?2:3):1;
+                vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen&&sprite_atlases_enabled?2:3):(sprite_atlases_enabled?1:0);
             }
         }
         SET_TC_ALL(vertex_cur, tpage, clut);
