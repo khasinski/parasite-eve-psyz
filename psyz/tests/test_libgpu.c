@@ -155,15 +155,8 @@ ZTEST(gpu, interface_pack_preserves_native_and_unmarked_packets) {
     SDL_FillSurfaceRect(hd,NULL,SDL_MapSurfaceRGBA(hd,0,255,0,255));zassert_s32_eq(1,SDL_SavePNG(hd,material));SDL_DestroySurface(hd);
     Psyz_GpuSetInterfacePack(NULL);Psyz_GpuSetInterfacePack(root);
     Psyz_GpuRegisterInterfacePrimitive(&sprite);DrawPrim(&sprite);DrawSync(0);
-    /* A Gouraud model face uses its model-wide material rectangle, rather
-     * than a separately generated image for this triangle's UV bounds. */
-    POLY_GT3 face;SetPolyGT3(&face);setRGB0(&face,128,128,128);setRGB1(&face,128,128,128);setRGB2(&face,128,128,128);
-    setXY3(&face,150,30,178,30,150,58);setUV3(&face,0,0,11,0,0,11);
-    face.clut=GetClut(640,240);face.tpage=GetTPage(0,0,640,256);
-    Psyz_GpuRegisterModelMaterial(&face.r0,0,0,12,12);DrawPrim(&face);DrawSync(0);
     /* The same command address, unmarked on the next frame, must remain native. */
     Psyz_GpuClearInterfacePackets();setXY0(&sprite,60,30);DrawPrim(&sprite);DrawSync(0);
-    setXY3(&face,200,30,228,30,200,58);DrawPrim(&face);DrawSync(0);
     /* Unrelated texels on the same native page must not invalidate a glyph. */
     RECT unrelated={650,257,1,1};unsigned short other=0x2222;LoadImage(&unrelated,(u_long *)&other);DrawSync(0);
     setXY0(&sprite,90,30);Psyz_GpuRegisterInterfacePrimitive(&sprite);DrawPrim(&sprite);DrawSync(0);
@@ -174,12 +167,9 @@ ZTEST(gpu, interface_pack_preserves_native_and_unmarked_packets) {
     unsigned char *p=rendered+((size_t)35*4*w+35*4)*3;zexpect_s32_eq(0,p[0]);zexpect_s32_eq(255,p[1]);
     p=rendered+((size_t)35*4*w+65*4)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);
     p=rendered+((size_t)35*4*w+95*4)*3;zexpect_s32_eq(0,p[0]);zexpect_s32_eq(255,p[1]);
-    p=rendered+((size_t)35*4*w+125*4)*3;zexpect_s32_eq(0,p[1]);zexpect_s32_eq(255,p[2]);
-    p=rendered+((size_t)35*4*w+155*4)*3;zexpect_s32_eq(0,p[0]);zexpect_s32_eq(255,p[1]);
-    p=rendered+((size_t)35*4*w+205*4)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);free(rendered);
+    p=rendered+((size_t)35*4*w+125*4)*3;zexpect_s32_eq(0,p[1]);zexpect_s32_eq(255,p[2]);free(rendered);
     unsigned char *native=Psyz_VideoAllocCapturedFrame(&w,&h);zassert_ptr_ne(NULL,native);
-    p=native+((size_t)35*w+35)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);
-    p=native+((size_t)35*w+155)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);free(native);
+    p=native+((size_t)35*w+35)*3;zexpect_s32_eq(255,p[0]);zexpect_s32_eq(0,p[1]);free(native);
     Psyz_GpuSetInterfacePack(NULL);SDL_unsetenv_unsafe("PSYZ_DUMP_INTERFACE");Psyz_VideoSetInternalResolution(1);
     SDL_RemovePath(material);files=SDL_GlobDirectory(folder,"*.png",0,&count);
     for(int i=0;i<count;++i){snprintf(material,sizeof(material),"%s/%s",folder,files[i]);SDL_RemovePath(material);}SDL_free(files);

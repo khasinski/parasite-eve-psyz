@@ -1618,7 +1618,3 @@ void Psyz_VideoBeginRgb24Interface(int buffer_y){(void)buffer_y;}
 void Psyz_VideoAddRgb24Interface(const unsigned char *rgb,int x,int y,int width,int height,int intensity){(void)rgb;(void)x;(void)y;(void)width;(void)height;(void)intensity;}
 
 void Psyz_GpuRegisterInterfacePrimitive(const void *primitive){(void)primitive;}
-
-void Psyz_GpuRegisterModelMaterial(const void *command,int x,int y,int w,int h){(void)command;(void)x;(void)y;(void)w;(void)h;}
-
-int Psyz_GpuModelMaterialsActive(void){return 0;}
