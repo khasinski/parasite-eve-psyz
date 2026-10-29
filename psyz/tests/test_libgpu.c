@@ -560,7 +560,12 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
         zassert_s32_eq(0,memcmp(baseline,native,320*224*sizeof(u16)));
         unsigned changed=0;for(int n=0;n<w*h*3;++n)if(before[n]!=after[n])++changed;
         zassert_s32_eq(wide,changed>0);
-        if(wide)zassert_s32_eq(1,memcmp(before+(40*w+20)*3,after+(40*w+20)*3,3)!=0);
+        if(wide) {
+            zassert_s32_eq(1,memcmp(before+(40*w+20)*3,after+(40*w+20)*3,3)!=0);
+            packet.words[4]=0x7c404040;DrawOTag((OT_TYPE *)&packet);DrawSync(0);
+            int tw,th;u8 *tinted=Psyz_VideoAllocRenderedFrame(&tw,&th);zassert_ptr_ne(NULL,tinted);
+            const u8 half[3]={120,40,20};zassert_s32_eq(0,memcmp(tinted+(40*tw+20)*3,half,3));free(tinted);
+        }
         free(before);free(after);
     }
     free(baseline);free(native);Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);

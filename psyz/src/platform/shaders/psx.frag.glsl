@@ -89,7 +89,7 @@ void main() {
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
         vec4 material=texture(texHD,hdUV.xy);
         if (material.a<0.5) discard;
-        FragColor=vec4(clamp(material.rgb*tint,0.0,1.0),0.0);
+        FragColor=vec4(clamp(material.rgb*tint,0.0,1.0),passMode.x==1u?0.0:1.0);
         return;
     }
     vec4 texColor=textureMode==0u ? vec4(1,1,1,2) :
