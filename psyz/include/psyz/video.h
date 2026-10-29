@@ -23,11 +23,6 @@ void Psyz_SetTitle(const char* str);
 
 /* Optional display-only PNG backdrop for an RGB24 screen. Pixels differing
  * from the supplied native RGB reference remain native UI. NULL disables it. */
-/* Original RGB24 menu nodes, recorded alongside their native compositor. */
-void Psyz_VideoBeginRgb24Interface(int buffer_y);
-/* A NULL RGB source preserves the native compositor in this rectangle. */
-void Psyz_VideoAddRgb24Interface(const unsigned char *rgb, int x, int y,
-    int width, int height, int intensity);
 int Psyz_VideoSetRgb24Backdrop(const char *filename, const unsigned char *reference,
                              int width, int height, int top, int bottom);
 

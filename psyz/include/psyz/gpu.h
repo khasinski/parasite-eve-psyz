@@ -67,14 +67,6 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
 void Psyz_GpuResetSpriteAtlases(void);
 /* Presentation switch; native VRAM remains unchanged. */
 /* Optional display-only midpoint geometry; simulation and native VRAM stay original. */
-/* Original UI command metadata; replacements never alter native VRAM. */
-unsigned long long Psyz_GpuGetVramRevision(void);
-void Psyz_GpuSetInterfacePack(const char *directory);
-void Psyz_GpuRegisterInterfacePacket(const void *command);
-void Psyz_GpuRegisterInterfacePrimitive(const void *primitive);
-void Psyz_GpuClearInterfacePackets(void);
-void Psyz_GpuCopyInterfacePacket(const void *from, const void *to);
-
 int Psyz_GpuSetFrameInterpolation(int enabled);
 int Psyz_GpuGetFrameInterpolation(void);
 unsigned long long Psyz_GpuGetInterpolatedPresentCount(void);

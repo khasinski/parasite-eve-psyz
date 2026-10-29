@@ -33,14 +33,11 @@ static void GPU_clear_cache() { NOT_IMPLEMENTED; }
 #define VRAM_COPY_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define VRAM_COPY_MAX(a, b) ((a) > (b) ? (a) : (b))
 static u16* vram_copy = NULL;
-static unsigned long long vram_revision;
-unsigned long long Psyz_GpuGetVramRevision(void){return vram_revision;}
 static u8* vram_copy_known = NULL;
 static int vram_area_x0, vram_area_y0, vram_area_x1, vram_area_y1;
 static int vram_area_marked = 0;
 
 int Psyz_GpuSetVramCopy(int enabled) {
-    ++vram_revision;
     vram_area_marked = 0;
     if (!enabled) {
         free(vram_copy);
@@ -89,7 +86,6 @@ static void VramCopyLoad(const RECT* rect, const u_long* data) {
         rect->y + rect->h > VRAM_H) {
         return;
     }
-    ++vram_revision;
     vram_area_marked = 0;
     const u16* src = (const u16*)data;
     for (int j = 0; j < rect->h; j++) {
@@ -104,7 +100,6 @@ static void VramCopyFill(RECT rect, u_char r, u_char g, u_char b) {
     if (!VramCopyClip(&rect)) {
         return;
     }
-    ++vram_revision;
     vram_area_marked = 0;
     u16 c = (u16)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
     for (int j = 0; j < rect.h; j++) {
@@ -121,7 +116,6 @@ static void VramCopyMove(RECT rect, int x, int y) {
     if (!VramCopyClip(&rect) || !VramCopyClip(&dst)) {
         return;
     }
-    ++vram_revision;
     vram_area_marked = 0;
     int w = VRAM_COPY_MIN(rect.w, dst.w), h = VRAM_COPY_MIN(rect.h, dst.h);
     for (int j = 0; j < h; j++) {
@@ -137,7 +131,6 @@ static void VramCopyDrawn(void) {
     if (!vram_copy || vram_area_marked) {
         return;
     }
-    ++vram_revision;
     vram_area_marked = 1;
     RECT rect = {(short)vram_area_x0, (short)vram_area_y0,
                  (short)(vram_area_x1 - vram_area_x0 + 1),
@@ -234,15 +227,13 @@ static void DispatchPackets(u_long* buf, int len) {
         case 0xE3:
             vram_area_x0 = (int)op & 0x3FF;
             vram_area_y0 = (int)(op >> 10) & 0x3FF;
-            ++vram_revision;
-    vram_area_marked = 0;
+            vram_area_marked = 0;
             Draw_SetAreaStart((int)op & 0x3FF, (int)(op >> 10) & 0x3FF);
             break;
         case 0xE4:
             vram_area_x1 = (int)op & 0x3FF;
             vram_area_y1 = (int)(op >> 10) & 0x3FF;
-            ++vram_revision;
-    vram_area_marked = 0;
+            vram_area_marked = 0;
             Draw_SetAreaEnd((int)op & 0x3FF, (int)(op >> 10) & 0x3FF);
             break;
         case 0xE5:
@@ -342,14 +333,14 @@ static void GPU_Enqueue(u_long* packets) {
                 u32* prim_data = (u32*)env->code;
                 for (u_long i = 0; i < env->len; i++) {
                     queue_buf[queue_len + i] = prim_data[i];
-                    Psyz_GpuCopyInterpolationPacket(&prim_data[i],&queue_buf[queue_len+i]); Psyz_GpuCopyInterfacePacket(&prim_data[i],&queue_buf[queue_len+i]);
+                    Psyz_GpuCopyInterpolationPacket(&prim_data[i],&queue_buf[queue_len+i]);
                     Psyz_GteCopyQueuedPgxpSxy(
                         &prim_data[i], &queue_buf[queue_len + i], prim_data[i]);
                 }
             } else if (env->len > 0) {
                 memcpy(queue_buf + queue_len, env->code,
                        env->len * sizeof(u_long));
-                for(u_long i=0;i<env->len;++i){Psyz_GpuCopyInterpolationPacket((u_long *)env->code+i,&queue_buf[queue_len+i]); Psyz_GpuCopyInterfacePacket((u_long *)env->code+i,&queue_buf[queue_len+i]);}
+                for(u_long i=0;i<env->len;++i)Psyz_GpuCopyInterpolationPacket((u_long *)env->code+i,&queue_buf[queue_len+i]);
             }
         }
         queue_len += (int)env->len;
@@ -389,13 +380,13 @@ static int psyz_cwb(u32* data, s32 n) {
     if (sizeof(u_long) == 8 && is_packed_command_stream(data, n)) {
         for (int i = 0; i < n; ++i) {
             queue_buf[i] = data[i];
-            Psyz_GpuCopyInterpolationPacket(&data[i],&queue_buf[i]); Psyz_GpuCopyInterfacePacket(&data[i],&queue_buf[i]);
+            Psyz_GpuCopyInterpolationPacket(&data[i],&queue_buf[i]);
             Psyz_GteCopyQueuedPgxpSxy(&data[i], &queue_buf[i], data[i]);
         }
     } else {
         memcpy(queue_buf, data, (size_t)n * sizeof(u_long));
         for (int i = 0; i < n; ++i){
-            Psyz_GpuCopyInterpolationPacket((u_long *)data+i,&queue_buf[i]); Psyz_GpuCopyInterfacePacket((u_long *)data+i,&queue_buf[i]);
+            Psyz_GpuCopyInterpolationPacket((u_long *)data+i,&queue_buf[i]);
             Psyz_GteCopyQueuedPgxpSxy(
                 (u_long*)data + i, &queue_buf[i], (unsigned)queue_buf[i]);
         }

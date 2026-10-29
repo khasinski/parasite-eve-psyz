@@ -84,7 +84,7 @@ vec4 fetchModelTexel(ivec2 position) {
 void main() {
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
-    if (hdUV.z>1.5 && hdUV.z<3.5) {
+    if (hdUV.z>1.5) {
         if (hdUV.z>2.5 || passMode.y<=1u) discard;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
         vec4 material=texture(texHD,hdUV.xy);
@@ -108,16 +108,8 @@ void main() {
             a.a==b.a && a.a==c.a && a.a==d.a)
             texColor=mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
     }
-    bool interfacePixel=hdUV.z>3.5 && passMode.y>1u;
-    vec4 interfaceColor=vec4(0);
-    if(interfacePixel){
-        vec2 uv=hdUV.xy;
-        interfaceColor=texture(texHD,uv);
-        if(interfaceColor.a<0.5){if(passMode.x!=0u)discard;FragColor=vec4(0);return;}
-        texColor.rgb=interfaceColor.rgb;
-    }
     // check for full transparency
-    if (!interfacePixel && texColor == vec4(0, 0, 0, 0)) {
+    if (texColor == vec4(0, 0, 0, 0)) {
         if (passMode.x != 0u) discard;
         FragColor = vec4(0);
         return;
@@ -146,14 +138,10 @@ void main() {
     if ((passMode.w & 2u) != 0u && textureMode != 0u)
         modColor = texColor.rgb * vertexColor.rgb;
     modColor = applyDither(modColor);
-    bool enhancedPixel=interfacePixel;
-    if(interfacePixel){
-        vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
-        modColor=clamp(interfaceColor.rgb*tint,0.0,1.0);
-    }
+    bool enhancedPixel=false;
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
-    if (passMode.y>1u && hdUV.z>0.5 && hdUV.z<1.5 && textureMode!=0u) {
+    if (passMode.y>1u && hdUV.z>0.5 && textureMode!=0u) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;

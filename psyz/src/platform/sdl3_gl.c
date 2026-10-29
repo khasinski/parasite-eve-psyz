@@ -1608,13 +1608,3 @@ void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b){(void)a;(void)
 
 void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b){(void)a;(void)b;}
 void Psyz_GpuSetInterpolationCamera(int x,int y){(void)x;(void)y;}
-
-void Psyz_GpuSetInterfacePack(const char *directory) {(void)directory;}
-void Psyz_GpuRegisterInterfacePacket(const void *command) {(void)command;}
-void Psyz_GpuClearInterfacePackets(void) {}
-void Psyz_GpuCopyInterfacePacket(const void *from,const void *to) {(void)from;(void)to;}
-
-void Psyz_VideoBeginRgb24Interface(int buffer_y){(void)buffer_y;}
-void Psyz_VideoAddRgb24Interface(const unsigned char *rgb,int x,int y,int width,int height,int intensity){(void)rgb;(void)x;(void)y;(void)width;(void)height;(void)intensity;}
-
-void Psyz_GpuRegisterInterfacePrimitive(const void *primitive){(void)primitive;}
