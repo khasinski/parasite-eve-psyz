@@ -134,6 +134,58 @@ ZTEST_TEARDOWN(gpu) { gpu_teardown(); }
 /* Off keeps RGB888 shading; Auto remains the PS1 RGB555 reference even
  * when DRAWENV.dtd is zero. Test actual captured GPU pixels, not shader text.
  */
+ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(backend&&!strcmp(backend,"1"))zskip("requires SDL GPU");
+    extern bool InitPlatform(void);if(!InitPlatform())zskip("requires SDL GPU");
+    const unsigned scales[]={2,8,2,2};
+    for(unsigned test=0;test<4;++test){
+    unsigned scale=scales[test];bool animated=test==3;
+    Psyz_VideoSetInternalResolution(scale);Psyz_VideoSetAntialiasing(test==2);
+    Psyz_VideoSetGeometryCorrection(0);Psyz_VideoSetWidescreen(0);Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
+    Psyz_GpuSetFrameInterpolation(1);Psyz_GpuResetInterpolation();
+    TILE tile[4]={{0}},ui={0};
+    for(unsigned i=0;i<4;++i){setTile(tile+i);setXY0(tile+i,animated?40-10*(i/2):40+21*i,30);setWH(tile+i,16,16);setRGB0(tile+i,255,0,0);}
+    setTile(&ui);setXY0(&ui,150,60);setWH(&ui,16,8);setRGB0(&ui,255,255,255);
+    if(animated){Psyz_GpuRegisterInterpolationBackgroundPair(&tile[0].r0,&tile[1].r0);Psyz_GpuRegisterInterpolationBackgroundPair(&tile[2].r0,&tile[3].r0);}
+    else Psyz_GpuRegisterInterpolationPair(&tile[0].r0,&tile[1].r0);
+    RECT clear={0,0,320,480};ClearImage(&clear,0,0,0);DrawSync(0);
+    for(unsigned i=0;i<2;++i){
+        Psyz_GpuBeginInterpolationFrame();if(animated)Psyz_GpuSetInterpolationCamera(10*i,0);
+        DRAWENV draw;SetDefDrawEnv(&draw,0,240*i,320,240);draw.isbg=0;draw.dtd=0;PutDrawEnv(&draw);
+        DrawPrim(tile+i*(animated?2:1));DrawPrim(&ui);DrawSync(0);
+    }
+    DISPENV display;SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);SetDispMask(1);
+    int nw,nh;unsigned char *native=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,native);
+    Psyz_GpuPrepareInterpolatedPresent(240);
+    unsigned long long count=Psyz_GpuGetInterpolatedPresentCount();
+    unsigned char *images[3];int widths[3],heights[3];
+    VSync(0);images[0]=Psyz_VideoAllocRenderedFrame(&widths[0],&heights[0]);
+    VSync(0);images[1]=Psyz_VideoAllocRenderedFrame(&widths[1],&heights[1]);
+    zexpect_s32_eq(1,(int)(Psyz_GpuGetInterpolatedPresentCount()-count));
+    unsigned char *after=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,after);
+    zexpect_s32_eq(0,memcmp(native,after,(size_t)nw*nh*3));free(native);free(after);
+    SetDefDispEnv(&display,0,240,320,240);PutDispEnv(&display);Psyz_GpuPrepareInterpolatedPresent(-1);
+    VSync(0);images[2]=Psyz_VideoAllocRenderedFrame(&widths[2],&heights[2]);
+    const float positions[]={40,animated?35:50.5f,animated?30:61};
+    for(unsigned i=0;i<3;++i){zassert_ptr_ne(NULL,images[i]);zexpect_s32_eq(320*scale,widths[i]);zexpect_s32_eq(240*scale,heights[i]);
+        int left=320*scale;
+        for(unsigned y=25*scale;y<50*scale;++y)for(unsigned x=0;x<80*scale;++x){unsigned char *p=images[i]+((size_t)y*widths[i]+x)*3;if(p[0]>240&&p[1]<10&&p[2]<10&&(int)x<left)left=x;}
+        printf("Interpolation %ux AA=%u animated=%u sample %u: left=%d, expected=%d\n",scale,test==2,animated,i,left,(int)(positions[i]*scale));
+        zexpect_s32_eq((int)(positions[i]*scale),left);
+        if(i)for(unsigned y=60*scale;y<68*scale;++y)zexpect_s32_eq(0,memcmp(images[0]+((size_t)y*widths[0]+150*scale)*3,images[i]+((size_t)y*widths[i]+150*scale)*3,16*scale*3));
+    }
+    for(unsigned i=0;i<3;++i)free(images[i]);
+    /* A cut/teleport must clear motion history and the current midpoint. */
+    Psyz_GpuResetInterpolation();count=Psyz_GpuGetInterpolatedPresentCount();Psyz_GpuPrepareInterpolatedPresent(0);VSync(0);VSync(0);
+    zexpect_s32_eq(0,(int)(Psyz_GpuGetInterpolatedPresentCount()-count));
+    Psyz_GpuSetFrameInterpolation(0);Psyz_VideoSetAntialiasing(0);Psyz_VideoSetInternalResolution(1);
+    }
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, dithering_off_preserves_color_precision) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char* headless = getenv("PSYZ_HEADLESS");

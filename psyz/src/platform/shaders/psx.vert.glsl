@@ -38,11 +38,12 @@ void main() {
     model = (tex.w & 0x1000u) != 0u ? 1u : 0u;
     uvBounds = atlasBounds;
     polygon = (tex.w & 0x2000u) != 0u ? 1u : 0u;
-    bool usePgxp = polygon != 0u && drawOffset.z != 0.0 && pgxpPos.z > 0.0;
+    bool usePgxp = polygon != 0u && (uint(drawOffset.z)&1u)!=0u && pgxpPos.z > 0.0;
+    bool midpoint = (uint(drawOffset.z)&2u)!=0u && pgxpPos.z>0.0;
     bool hiRes = drawOffset.w != 0.0;
     float bias = (polygon != 0u && !hiRes) ? 0.5 : 0.0;
-    float vx = usePgxp ? pgxpPos.x : (float(pos.x) + bias);
-    float vy = usePgxp ? pgxpPos.y : (float(pos.y) + bias);
+    float vx = (usePgxp || midpoint) ? pgxpPos.x : (float(pos.x) + bias);
+    float vy = (usePgxp || midpoint) ? pgxpPos.y : (float(pos.y) + bias);
     float w = usePgxp ? pgxpPos.z : 1.0;
     float ax = vx + widescreen.z + drawOffset.x;
     // Squeezed before clipping, so drawing left of a buffer at VRAM x 0
@@ -59,7 +60,7 @@ void main() {
     vertexColor = color;
     if (polygon != 0u) {
         vertexColor.rgb =
-            usePgxp ? (color.rgb + (0.5 / 255.0)) : (polygonRGB / 255.0);
+            (usePgxp || midpoint) ? (color.rgb + (0.5 / 255.0)) : (polygonRGB / 255.0);
     }
     // select the right texture coords based on the tpage
     clut = tex.z;
@@ -68,7 +69,7 @@ void main() {
     dither = (texWord & 0x4000u) != 0u ? 1u : 0u;
     vec2 polyUV = hiRes ? (polygonUV - vec2(0.5)) : polygonUV;
     rawUV = polygon != 0u
-                ? (usePgxp ? vec2(tex.xy) : polyUV)
+                ? ((usePgxp || midpoint) ? vec2(tex.xy) : polyUV)
                 : vec2(tex.xy);
     // Determine texture mode and pre-compute parameters
     subPixelMask = 0u;

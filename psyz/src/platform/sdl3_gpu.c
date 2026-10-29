@@ -15,6 +15,8 @@ static bool headless_renderer;
 static bool hidden_gpu_renderer;
 static bool UseSoftwareBackend(void);
 #define PSYZ_SOFTWARE_ROUTING
+static const void *interpolation_packet_current;
+#define PSYZ_CAPTURE_INTERPOLATION(v,n) InterpCapture(interpolation_packet_current,v,n)
 #include "sdl3_draw.h"
 
 #if defined(_WIN32)
@@ -102,6 +104,149 @@ static SDL_GPUCommandBuffer* pending_cmd = NULL;
 static unsigned command_descriptor_limit, command_descriptors;
 static bool descriptor_rollover_reported;
 
+static SDL_GPUCommandBuffer *AcquireCmd(void);
+static SDL_GPUTexture *GetRenderTarget(void);
+/* Presentation-only geometry history. Packet pairs belong to the original
+ * double buffers; UI packets are deliberately never registered. */
+#define INTERP_PAIRS 16384u
+#define INTERP_MAP 65536u
+typedef struct { const void *address; unsigned pair, serial; } InterpAddress;
+typedef struct {
+    const void *a,*b;
+    unsigned serial, frame, count;
+    bool background;
+    uint64_t signature;
+    float position[6][3];
+} InterpPair;
+static InterpAddress interp_addresses[INTERP_MAP],interp_queue[INTERP_MAP];
+static InterpPair interp_pairs[INTERP_PAIRS];
+static unsigned interp_serial,interp_frame,interp_phase,interp_matches;
+static unsigned interp_camera_frame;
+static int interp_camera_x,interp_camera_y;
+static float interp_camera_half_x,interp_camera_half_y;
+static bool interp_camera_previous;
+static int interp_next_y=-1;
+static bool interpolation_enabled,interp_present_mid,interp_pair_ready;
+static SDL_GPUTexture *interpolated_vram;
+static unsigned interpolated_scale;
+static Vertex interpolated_vertices[MAX_VERTEX_COUNT];
+static unsigned long long interpolated_present_count;
+static unsigned InterpHash(const void *p) {
+    uintptr_t n=(uintptr_t)p;return (unsigned)(((n>>2)^(n>>16)^(n>>30))&(INTERP_MAP-1));
+}
+static InterpAddress *InterpFind(InterpAddress *map,const void *p) {
+    unsigned h=InterpHash(p);
+    for(unsigned i=0;i<4;++i){InterpAddress *e=&map[(h+i)&(INTERP_MAP-1)];if(e->address==p)return e;}
+    return NULL;
+}
+static void InterpMap(InterpAddress *map,const void *p,unsigned pair,unsigned serial) {
+    unsigned h=InterpHash(p);InterpAddress *e=InterpFind(map,p);
+    if(!e){e=&map[h];for(unsigned i=0;i<4;++i)if(!map[(h+i)&(INTERP_MAP-1)].address){e=&map[(h+i)&(INTERP_MAP-1)];break;}}
+    *e=(InterpAddress){p,pair,serial};
+}
+void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b) {
+    if(!a||!b)return;
+    unsigned serial=++interp_serial;if(!serial)serial=++interp_serial;
+    unsigned index=serial&(INTERP_PAIRS-1);
+    interp_pairs[index]=(InterpPair){.a=a,.b=b,.serial=serial};
+    InterpMap(interp_addresses,a,index,serial);InterpMap(interp_addresses,b,index,serial);
+}
+void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b) {
+    Psyz_GpuRegisterInterpolationPair(a,b);
+    InterpAddress *e=InterpFind(interp_addresses,a);if(e&&interp_pairs[e->pair].serial==e->serial)interp_pairs[e->pair].background=true;
+}
+void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b) {
+    InterpAddress *x=InterpFind(interp_addresses,a),*y=InterpFind(interp_addresses,b);
+    if(x&&y&&x->pair==y->pair&&x->serial==y->serial&&x->serial&&interp_pairs[x->pair].serial==x->serial)return;
+    Psyz_GpuRegisterInterpolationPair(a,b);
+}
+void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to) {
+    if(!interpolation_enabled)return;
+    InterpAddress *e=InterpFind(interp_addresses,from);
+    if(e && interp_pairs[e->pair].serial==e->serial)
+        InterpMap(interp_queue,to,e->pair,e->serial);
+    else {e=InterpFind(interp_queue,to);if(e)e->serial=0;}
+}
+void Psyz_GpuResetInterpolation(void) {
+    for(unsigned i=0;i<INTERP_PAIRS;++i)interp_pairs[i].frame=0;
+    memset(interp_queue,0,sizeof(interp_queue));
+    interp_pair_ready=false;interp_next_y=-1;interp_phase=0;interp_present_mid=false;interp_matches=0;
+    interp_camera_frame=0;interp_camera_previous=false;
+}
+void Psyz_GpuClearInterpolationPackets(void) {
+    Psyz_GpuResetInterpolation();
+    memset(interp_addresses,0,sizeof(interp_addresses));
+    memset(interp_pairs,0,sizeof(interp_pairs));
+}
+int Psyz_GpuSetFrameInterpolation(int enabled) {
+    if(interpolation_enabled!=(enabled!=0)){Draw_FlushBuffer();interpolation_enabled=enabled!=0;Psyz_GpuResetInterpolation();}
+    if(!interpolation_enabled&&interpolated_vram&&device){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;}
+    Psyz_PgxpSetActive(!headless_renderer&&(set_geometry_correction||set_model_filtering||interpolation_enabled));
+    Psyz_PgxpSetCulling(set_geometry_correction);
+    return 0;
+}
+int Psyz_GpuGetFrameInterpolation(void){return interpolation_enabled;}
+unsigned long long Psyz_GpuGetInterpolatedPresentCount(void){return interpolated_present_count;}
+void Psyz_GpuBeginInterpolationFrame(void) {
+    interp_matches=0;
+    ++interp_frame;if(!interp_frame){Psyz_GpuResetInterpolation();interp_frame=1;}
+    if(!interpolation_enabled||!device||UseSoftwareBackend())return;
+    if(interpolated_vram&&interpolated_scale!=internal_res){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;Psyz_GpuResetInterpolation();}
+    if(!interpolated_vram){
+        SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage=SDL_GPU_TEXTUREUSAGE_COLOR_TARGET|SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=VRAM_W*internal_res,.height=VRAM_H*internal_res,.layer_count_or_depth=1,.num_levels=1};
+        interpolated_vram=SDL_CreateGPUTexture(device,&info);interpolated_scale=internal_res;
+        if(!interpolated_vram){WARNF("60 Hz interpolation: %s",SDL_GetError());return;}
+        SDL_GPUCommandBuffer *cmd=AcquireCmd();if(cmd){SDL_GPUCopyPass *copy=SDL_BeginGPUCopyPass(cmd);
+            SDL_GPUTextureLocation from={.texture=GetRenderTarget()},to={.texture=interpolated_vram};
+            SDL_CopyGPUTextureToTexture(copy,&from,&to,VRAM_W*internal_res,VRAM_H*internal_res,1,false);SDL_EndGPUCopyPass(copy);}
+    }
+}
+void Psyz_GpuSetInterpolationCamera(int x,int y) {
+    interp_camera_previous=interp_camera_frame&&interp_camera_frame+1==interp_frame;
+    int dx=x-interp_camera_x,dy=y-interp_camera_y;
+    if(interp_camera_previous&&(abs(dx)>32||abs(dy)>32)){Psyz_GpuResetInterpolation();interp_camera_previous=false;}
+    interp_camera_half_x=interp_camera_previous?dx*0.5f:0;
+    interp_camera_half_y=interp_camera_previous?dy*0.5f:0;
+    interp_camera_x=x;interp_camera_y=y;interp_camera_frame=interp_frame;
+}
+void Psyz_GpuPrepareInterpolatedPresent(int next_y) {
+    interp_next_y=next_y;interp_phase=0;
+    interp_pair_ready=interpolation_enabled&&interpolated_vram&&interp_matches>0&&next_y>=0&&next_y<VRAM_H;
+}
+static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
+    unsigned offset=(unsigned)(v-vertex_buf);
+    memcpy(interpolated_vertices+offset,v,count*sizeof(*v));
+    for(unsigned i=0;i<count;++i)if(!(geometry_correction&&internal_res>1&&(v[i].t&TPAGE_MODEL)))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
+    if(!interpolation_enabled||count>6)return;
+    InterpAddress *e=InterpFind(interp_queue,packet);
+    if(!e)e=InterpFind(interp_addresses,packet);
+    if(!e||!e->serial)return;
+    InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial)return;
+    uint64_t signature=14695981039346656037ULL;
+    for(unsigned i=0;i<count;++i){const unsigned char *s=(const void *)&v[i].u;
+        for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
+    bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&p->signature==signature;
+    float position[6][3];
+    for(unsigned i=0;i<count;++i){bool projected=geometry_correction&&internal_res>1&&(v[i].t&TPAGE_MODEL)&&v[i].pgxp_pos[2]>0;
+        float bias=(v[i].t&TPAGE_POLYGON)&&internal_res==1?0.5f:0.0f;
+        position[i][0]=projected?v[i].pgxp_pos[0]:(float)v[i].x+bias;
+        position[i][1]=projected?v[i].pgxp_pos[1]:(float)v[i].y+bias;
+        position[i][2]=projected?v[i].pgxp_pos[2]:1;
+        if(SDL_fabsf(position[i][0]-p->position[i][0])>32||SDL_fabsf(position[i][1]-p->position[i][1])>32)valid=false;
+    }
+    /* An authored animation may switch to another tile entry this frame.
+     * Keep that image intact, but move it with the same interpolated camera
+     * as its static neighbours so patch boundaries cannot separate. */
+    bool camera_fallback=!valid&&p->background&&interp_camera_previous;
+    if(valid||camera_fallback)++interp_matches;
+    if(valid||camera_fallback)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
+        out->pgxp_pos[0]=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0]+interp_camera_half_x;
+        out->pgxp_pos[1]=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1]+interp_camera_half_y;
+        out->pgxp_pos[2]=valid?2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]):position[i][2];}
+    memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
+}
+
 /* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
 typedef struct SpriteAtlas {
     uint64_t key;
@@ -155,6 +300,7 @@ static struct {
     int camera_x;
 } ws_picture[2] = {{-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0},
                    {-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0}};
+static float ws_mid_shift[2],ws_mid_qx[2],ws_mid_qy[2],ws_mid_ex[2],ws_mid_ey[2],ws_mid_left[2],ws_mid_right[2];
 /* Psyz_VideoSetWidescreenCentred: drawing ignores the view's shift. */
 static bool ws_centred;
 /* Psyz_VideoSetWidescreenField: drawing is the room, it follows ex, ey. */
@@ -215,7 +361,7 @@ static void WidescreenFieldStep(int picture, float n, float* qx, float* qy) {
 /* The squeeze's fixed point. It moves 3 pixels against each pixel of view
  * shift, so the buffer holds the shifted view around its own centre: game x
  * centre + shift lands on the buffer's centre. */
-static float WidescreenPivot(int shift) {
+static float WidescreenPivot(float shift) {
     return (float)display_size.x * 0.5f -
            (float)shift * WS_SQUEEZE / (1.0f - WS_SQUEEZE);
 }
@@ -937,20 +1083,22 @@ static void ResetVramDirty(void) { vram_dirty = (SDL_Rect){0, 0, 0, 0}; }
 
 // mirror a native VRAM region into the scaled render target
 static void SyncNativeVramToScaled(int x, int y, int w, int h) {
-    if (!scaled_vram_render || w <= 0 || h <= 0) {
+    if ((!scaled_vram_render && !interpolated_vram) || w <= 0 || h <= 0) {
         return;
     }
     SDL_GPUCommandBuffer* cmd = ReserveDrawDescriptors(1);
     if (!cmd) {
         return;
     }
+    SDL_GPUTexture *targets[]={scaled_vram_render,interpolated_scale==internal_res?interpolated_vram:NULL};
+    for(unsigned i=0;i<2;++i){if(!targets[i])continue;
     const SDL_GPUBlitInfo blit = {
         .source = {.texture = vram_render,
                    .x = (Uint32)x,
                    .y = (Uint32)y,
                    .w = (Uint32)w,
                    .h = (Uint32)h},
-        .destination = {.texture = scaled_vram_render,
+        .destination = {.texture = targets[i],
                         .x = (Uint32)(x * internal_res),
                         .y = (Uint32)(y * internal_res),
                         .w = (Uint32)(w * internal_res),
@@ -959,6 +1107,7 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
         .filter = SDL_GPU_FILTER_NEAREST,
     };
     SDL_BlitGPUTexture(cmd, &blit);
+    }
 }
 
 static bool CreateScaledVramTarget(unsigned n) {
@@ -1027,6 +1176,7 @@ static void ApplyPendingInternalRes(void) {
         return;
     }
     Draw_FlushBuffer(); // render pending prims with the old multiplier
+    Psyz_GpuResetInterpolation();
     if (want_scaled && (n != internal_res || !have_scaled)) {
         if (!CreateScaledVramTarget(n)) {
             n = 1;
@@ -1065,7 +1215,7 @@ static void ApplyPendingInternalRes(void) {
     antialiasing = set_antialiasing;
     model_filtering = set_model_filtering;
     Psyz_PgxpSetActive(
-        !UseSoftwareBackend() && (geometry_correction || model_filtering));
+        !UseSoftwareBackend() && (geometry_correction || model_filtering || interpolation_enabled));
     Psyz_PgxpSetCulling(geometry_correction);
     UpdateScissor();
     INFOF("internal resolution set to %dx (%dx%d), geometry_correction=%d", n,
@@ -1381,6 +1531,12 @@ static void PlatformBackend_Present(void) {
     }
 
     ApplyPendingInternalRes();
+    if(!ws_capture_active){
+    interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
+        interpolated_scale==internal_res&&interp_next_y<=VRAM_H-display_size.y&&!display_rgb24&&!debug_show_vram&&game_speed==1&&
+        interp_phase++==1;
+    if(interp_present_mid)++interpolated_present_count;
+    }
 
     SDL_GPUTexture* rgb24 =
         disp_on && display_rgb24 && !debug_show_vram && !present_skip
@@ -1416,9 +1572,9 @@ static void PlatformBackend_Present(void) {
             } else {
                 const Uint32 n = internal_res;
                 SDL_GPUBlitRegion src = {
-                    .texture = GetRenderTarget(),
+                    .texture = interp_present_mid ? interpolated_vram : GetRenderTarget(),
                     .x = (Uint32)display_area.x * n,
-                    .y = (Uint32)display_area.y * n,
+                    .y = (Uint32)(interp_present_mid?interp_next_y:display_area.y) * n,
                     .w = (Uint32)display_size.x * n,
                     .h = (Uint32)display_size.y * n,
                 };
@@ -1457,11 +1613,10 @@ static void PlatformBackend_Present(void) {
                     const float half = WidescreenViewHalf(game_aspect);
                     int picture = -1;
                     for (int i = 0; i < 2; ++i) {
-                        if (ws_picture[i].y == display_area.y)
+                        if (ws_picture[i].y == (interp_present_mid?interp_next_y:display_area.y))
                             picture = i;
                     }
-                    const int shift =
-                        picture >= 0 ? ws_picture[picture].shift : 0;
+                    const float shift=picture>=0 ? (interp_present_mid?ws_mid_shift[picture]:(float)ws_picture[picture].shift) : 0;
                     const float pivot = WidescreenPivot(shift);
                     /* the room is shown where it belongs: the rest of its
                      * shift past the step drawn (WidescreenFieldStep) */
@@ -1469,19 +1624,22 @@ static void PlatformBackend_Present(void) {
                     if (picture >= 0 && ws_picture[picture].field) {
                         float qx, qy;
                         WidescreenFieldStep(picture, (float)n, &qx, &qy);
-                        rest_x = ws_picture[picture].ex - qx;
-                        rest_y = ws_picture[picture].ey - qy;
+                        if(interp_present_mid){qx=ws_mid_qx[picture];qy=ws_mid_qy[picture];}
+                        float ex=interp_present_mid?ws_mid_ex[picture]:ws_picture[picture].ex;
+                        float ey=interp_present_mid?ws_mid_ey[picture]:ws_picture[picture].ey;
+                        rest_x = ex - qx;
+                        rest_y = ey - qy;
                         if (ws_picture[picture].ends_move)
-                            ends_x = ws_picture[picture].ex;
+                            ends_x = ex;
                     }
                     float left = centre + (float)shift - buffer_half;
                     float right = centre + (float)shift + buffer_half;
                     if (picture >= 0 &&
                         ws_picture[picture].left < ws_picture[picture].right) {
                         left = SDL_max(
-                            left, (float)ws_picture[picture].left + ends_x);
+                            left, (interp_present_mid?ws_mid_left[picture]:(float)ws_picture[picture].left) + ends_x);
                         right = SDL_min(
-                            right, (float)ws_picture[picture].right + ends_x);
+                            right, (interp_present_mid?ws_mid_right[picture]:(float)ws_picture[picture].right) + ends_x);
                     }
                     const float view_l = centre + (float)shift - half;
                     const float view_r = centre + (float)shift + half;
@@ -1607,6 +1765,8 @@ static void QuitPlatform(void) {
         if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
         if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
         title_texture=NULL;title_transfer=NULL;title_uploaded=title_generation=0;
+        if(interpolated_vram){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;}
+        Psyz_GpuResetInterpolation();
         if (rgb24_display) {
             SDL_ReleaseGPUTexture(device, rgb24_display);
             rgb24_display = NULL;
@@ -1817,13 +1977,13 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         }
     }
     if (UseSoftwareBackend() || display_rgb24 ||
-        (!scaled_vram_render && !widescreen)) {
+        (!scaled_vram_render && !widescreen && !interp_present_mid)) {
         unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
         if (!pixels)
             *w = *h = 0;
         return pixels;
     }
-    if ((!scaled_vram_render && !widescreen) || display_area.x < 0 ||
+    if ((!scaled_vram_render && !widescreen && !interp_present_mid) || display_area.x < 0 ||
         display_area.y < 0 || display_size.x <= 0 || display_size.y <= 0 ||
         display_area.x > VRAM_W - display_size.x ||
         display_area.y > VRAM_H - display_size.y)
@@ -1877,9 +2037,9 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         return NULL;
     }
     SDL_GPUBlitRegion visible = {
-        .texture = GetRenderTarget(),
+        .texture = interp_present_mid ? interpolated_vram : GetRenderTarget(),
         .x = (Uint32)display_area.x * internal_res,
-        .y = (Uint32)display_area.y * internal_res,
+        .y = (Uint32)(interp_present_mid?interp_next_y:display_area.y) * internal_res,
         .w = (Uint32)display_size.x * internal_res,
         .h = (Uint32)display_size.y * internal_res};
     if (capture_widescreen)
@@ -1973,7 +2133,7 @@ int Psyz_VideoSetGeometryCorrection(int enabled) {
         ApplyPendingInternalRes();
     } else {
         Psyz_PgxpSetActive(!headless_renderer &&
-                           (set_geometry_correction || set_model_filtering));
+                           (set_geometry_correction || set_model_filtering || interpolation_enabled));
     }
     return 0;
 }
@@ -1991,7 +2151,7 @@ int Psyz_VideoSetModelFiltering(int enabled) {
         ApplyPendingInternalRes();
     else
         Psyz_PgxpSetActive(!headless_renderer &&
-                           (set_geometry_correction || set_model_filtering));
+                           (set_geometry_correction || set_model_filtering || interpolation_enabled));
     return 0;
 }
 int Psyz_VideoGetModelFiltering(void) { return set_model_filtering; }
@@ -2091,6 +2251,17 @@ static void SetWidescreenPicture(int buffer_y, int left, int right, bool field,
     ws_picture[slot].ex = field ? dx - (exact_shift - shift) : 0.0f;
     ws_picture[slot].ey = field ? dy : 0.0f;
     ws_picture[slot].camera_x = camera_x;
+    int previous=1-slot;
+    float qx,qy,px,py;WidescreenFieldStep(slot,(float)internal_res,&qx,&qy);
+    bool pair=ws_picture[previous].y>=0&&ws_picture[previous].field==field;
+    if(!pair)previous=slot;
+    WidescreenFieldStep(previous,(float)internal_res,&px,&py);
+    ws_mid_qx[slot]=(qx+px)*0.5f;ws_mid_qy[slot]=(qy+py)*0.5f;
+    ws_mid_shift[slot]=(ws_picture[slot].shift+ws_picture[previous].shift)*0.5f;
+    ws_mid_ex[slot]=(ws_picture[slot].ex+ws_picture[previous].ex)*0.5f;
+    ws_mid_ey[slot]=(ws_picture[slot].ey+ws_picture[previous].ey)*0.5f;
+    ws_mid_left[slot]=(ws_picture[slot].left+ws_picture[previous].left)*0.5f;
+    ws_mid_right[slot]=(ws_picture[slot].right+ws_picture[previous].right)*0.5f;
 }
 
 static void ApplyDisplayPendingChanges() {
@@ -2267,6 +2438,7 @@ static void SetPolygonAttributes(Vertex* vertices) {
 int Draw_PushPrim(u_long* packets, int max_len) {
     if (UseSoftwareBackend())
         return software_rasterizer.push_prim(packets, max_len);
+    interpolation_packet_current=packets;
     int len = max_len;
     int code = (int)(*packets >> 24) & 0xFF;
     bool isPoly = !(code & 0x40);
@@ -2946,14 +3118,27 @@ void Draw_FlushBuffer(void) {
     /* Native VRAM is independently rasterized: gameplay readback and texture
      * feedback must not depend on high-resolution sample positions. */
     for (unsigned target_index = 0;
-         target_index < (scaled_vram_render ? 2u : 1u); ++target_index) {
+         target_index < (scaled_vram_render ? 2u : 1u) + (interpolation_enabled && interpolated_vram && interpolated_scale==internal_res ? 1u : 0u); ++target_index) {
+        bool midpoint=interpolation_enabled&&interpolated_vram&&target_index==(scaled_vram_render?2u:1u);
+        SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
+        if(midpoint){
+            u8 *mid_map=SDL_MapGPUTransferBuffer(device,vtx_transfer,true);
+            if(!mid_map)continue;
+            memcpy(mid_map,interpolated_vertices,vtx_size);SDL_UnmapGPUTransferBuffer(device,vtx_transfer);
+            cmd=AcquireCmd();if(!cmd)continue;
+            SDL_GPUCopyPass *mid_copy=SDL_BeginGPUCopyPass(cmd);
+            SDL_UploadToGPUBuffer(mid_copy,&vtx_src,&vtx_dst,true);SDL_EndGPUCopyPass(mid_copy);
+        }
+        const float target_centre=midpoint&&!ws_centred&&WidescreenDrawPicture()>=0 ?
+            (float)display_area.x+WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()]) : ws_centre;
         unsigned target_scale = target_index ? internal_res : 1;
         float sub_x = 0.0f, sub_y = 0.0f;
         if (target_index || !scaled_vram_render)
             WidescreenFieldStep(
                 field_picture, (float)target_scale, &sub_x, &sub_y);
+        if(midpoint&&field_picture>=0){sub_x=ws_mid_qx[field_picture];sub_y=ws_mid_qy[field_picture];}
         SDL_GPUTexture* destination_sample =
-            target_index ? scaled_blend_sample : blend_sample;
+            target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
         int start = 0;
         while (start < n_indices) {
             bool semi = vertex_buf[index_buf[start]].a == 0x80;
@@ -2975,19 +3160,19 @@ void Draw_FlushBuffer(void) {
                 int x1 = clip.x * (int)target_scale;
                 int y1 = clip.y * (int)target_scale;
                 for (int i = start; i < end; ++i) {
-                    const Vertex* v = &vertex_buf[index_buf[i]];
+                    const Vertex* v = midpoint ? &interpolated_vertices[index_buf[i]] : &vertex_buf[index_buf[i]];
                     float bias = ((v->t & TPAGE_POLYGON) && target_scale == 1)
                                      ? 0.5f
                                      : 0.0f;
                     bool use_pgxp =
-                        target_index && geometry_correction &&
-                        (v->t & TPAGE_POLYGON) && v->pgxp_pos[2] > 0.0f;
+                        (midpoint || (target_index && geometry_correction &&
+                        (v->t & TPAGE_POLYGON))) && v->pgxp_pos[2] > 0.0f;
                     float vx =
                         (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
                     float vy =
                         (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
                     float x = draw_offset.x + (vx + bias) * GetDrawGridXScale();
-                    x = (ws_centre + (x - ws_centre) * ws_squeeze) *
+                    x = (target_centre + (x - target_centre) * ws_squeeze) *
                         target_scale;
                     float y = (draw_offset.y + vy + bias) * target_scale;
                     x0 = SDL_min(x0, (int)SDL_floorf(x) - 1);
@@ -3007,7 +3192,7 @@ void Draw_FlushBuffer(void) {
                 }
                 SDL_GPUCopyPass* blend_copy = SDL_BeginGPUCopyPass(cmd);
                 SDL_GPUTextureLocation from = {
-                    .texture = target_index ? scaled_vram_render : vram_render,
+                    .texture = render_target,
                     .x = (Uint32)x0,
                     .y = (Uint32)y0};
                 SDL_GPUTextureLocation to = from;
@@ -3018,7 +3203,7 @@ void Draw_FlushBuffer(void) {
                 SDL_EndGPUCopyPass(blend_copy);
             }
             const SDL_GPUColorTargetInfo target = {
-                .texture = target_index ? scaled_vram_render : vram_render,
+                .texture = render_target,
                 .load_op = SDL_GPU_LOADOP_LOAD,
                 .store_op = SDL_GPU_STOREOP_STORE,
             };
@@ -3059,10 +3244,10 @@ void Draw_FlushBuffer(void) {
             const float offset_ubo[8] = {
                 (float)draw_offset.x,
                 (float)draw_offset.y,
-                (target_index != 0 && geometry_correction) ? 1.0f : 0.0f,
+                ((target_index != 0 && geometry_correction) ? 1.0f : 0.0f) + (midpoint ? 2.0f : 0.0f),
                 target_scale > 1 ? 1.0f : 0.0f,
                 ws_squeeze,
-                (ws_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,
+                (target_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,
                 sub_x,
                 sub_y};
             SDL_PushGPUVertexUniformData(

@@ -66,6 +66,19 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
 /* Retire queued reads and reuse the bounded atlas storage for a new room. */
 void Psyz_GpuResetSpriteAtlases(void);
 /* Presentation switch; native VRAM remains unchanged. */
+/* Optional display-only midpoint geometry; simulation and native VRAM stay original. */
+int Psyz_GpuSetFrameInterpolation(int enabled);
+int Psyz_GpuGetFrameInterpolation(void);
+unsigned long long Psyz_GpuGetInterpolatedPresentCount(void);
+void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b);
+void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b);
+void Psyz_GpuSetInterpolationCamera(int x,int y);
+void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b);
+void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to);
+void Psyz_GpuResetInterpolation(void);
+void Psyz_GpuClearInterpolationPackets(void);
+void Psyz_GpuBeginInterpolationFrame(void);
+void Psyz_GpuPrepareInterpolatedPresent(int next_y);
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled);
 int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command

@@ -39,6 +39,10 @@ typedef struct {
     float hd_uv[3];
 } Vertex;
 
+#ifdef PSYZ_CAPTURE_INTERPOLATION
+static void InterpCapture(const void *packet,Vertex *v,unsigned count);
+#endif
+
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====
 #define TPAGE_NOTEXTURE 0x8000 // flag untextured poly
 #define TPAGE_DITHER 0x4000    // flag a dithered primitive
@@ -86,6 +90,9 @@ static void Draw_EnqueueBuffer(int vertices, int indices) {
     assert(n_vertices + vertices <= MAX_VERTEX_COUNT);
     assert(n_indices + indices <= MAX_INDEX_COUNT);
 
+#ifdef PSYZ_CAPTURE_INTERPOLATION
+    PSYZ_CAPTURE_INTERPOLATION(vertex_cur,(unsigned)vertices);
+#endif
     vertex_cur += vertices;
     index_cur += indices;
     n_vertices += vertices;
