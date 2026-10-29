@@ -255,8 +255,27 @@ static void ResetRgb24Interface(void);
 #define UI_IMAGES 2048u
 #define UI_ATLAS_SIZE 2048u
 static const void *ui_commands[UI_PACKETS],*ui_queue[UI_PACKETS];
-static char ui_directory[4096];
 static bool ui_tracking_active;
+typedef struct {const void *packet;int x,y,w,h;} ModelMaterialRegion;
+static ModelMaterialRegion model_commands[UI_PACKETS],model_queue[UI_PACKETS];
+static ModelMaterialRegion *ModelRegion(ModelMaterialRegion *map,const void *packet) {
+    unsigned hash=InterpHash(packet)&(UI_PACKETS-1);
+    for(unsigned i=0;i<4;++i)if(map[(hash+i)&(UI_PACKETS-1)].packet==packet)return map+((hash+i)&(UI_PACKETS-1));
+    return NULL;
+}
+static void ModelMap(ModelMaterialRegion *map,const void *packet,const ModelMaterialRegion *region) {
+    unsigned hash=InterpHash(packet)&(UI_PACKETS-1),slot=hash;
+    for(unsigned i=0;i<4;++i){unsigned n=(hash+i)&(UI_PACKETS-1);
+        if(map[n].packet==packet){slot=n;break;}if(!map[n].packet)slot=n;}
+    map[slot]=region?*region:(ModelMaterialRegion){0};
+    if(region)map[slot].packet=packet;
+}
+int Psyz_GpuModelMaterialsActive(void) {return ui_tracking_active;}
+void Psyz_GpuRegisterModelMaterial(const void *command,int x,int y,int w,int h) {
+    if(!ui_tracking_active||!command||x<0||y<0||x>255||y>255||w<=0||h<=0||w>256-x||h>256-y)return;
+    ModelMaterialRegion region={command,x,y,w,h};ModelMap(model_commands,command,&region);
+}
+static char ui_directory[4096];
 static SDL_GPUTexture *ui_batch_texture;
 static SDL_GPUSampler *ui_sampler;
 typedef struct { uint64_t key; unsigned x,y,w,h; bool loaded; } UiImage;
@@ -296,26 +315,29 @@ void Psyz_GpuRegisterInterfacePrimitive(const void *primitive) {
         UiMap(ui_commands,payload+offset,true);
 }
 void Psyz_GpuCopyInterfacePacket(const void *from,const void *to) {
-    if(ui_tracking_active)UiMap(ui_queue,to,UiHas(ui_commands,from));
+    if(ui_tracking_active){UiMap(ui_queue,to,UiHas(ui_commands,from));
+        ModelMap(model_queue,to,ModelRegion(model_commands,from));}
 }
 void Psyz_GpuClearInterfacePackets(void) {
-    memset(ui_commands,0,sizeof(ui_commands));ui_page_count=0;
+    memset(ui_commands,0,sizeof(ui_commands));memset(model_commands,0,sizeof(model_commands));ui_page_count=0;
 }
 void Psyz_GpuSetInterfacePack(const char *directory) {
     if(!directory)directory="";
     const char *capture=SDL_getenv("PSYZ_DUMP_INTERFACE");
-    ui_tracking_active=*directory||(capture&&*capture);
+    const char *models=SDL_getenv("PSYZ_DUMP_MODELS");
+    ui_tracking_active=*directory||(capture&&*capture)||(models&&*models);
     if(!strcmp(ui_directory,directory))return;
     Draw_FlushBuffer();ui_batch_texture=NULL;ResetRgb24Interface();
     if(ui_atlas&&device)SDL_ReleaseGPUTexture(device,ui_atlas);ui_atlas=NULL;
     memset(ui_images,0,sizeof(ui_images));ui_image_next=0;ui_atlas_x=ui_atlas_y=ui_atlas_row=0;
     snprintf(ui_directory,sizeof(ui_directory),"%s",directory);
     ui_page_count=0;memset(ui_commands,0,sizeof(ui_commands));memset(ui_queue,0,sizeof(ui_queue));
+    memset(model_commands,0,sizeof(model_commands));memset(model_queue,0,sizeof(model_queue));
 }
 static uint64_t UiHashWord(uint64_t h,unsigned word) {
     return ((h^(word&255))*UINT64_C(1099511628211)^(word>>8))*UINT64_C(1099511628211);
 }
-static uint64_t UiRegionKey(unsigned page,unsigned clut,int left,int top,int w,int h) {
+static uint64_t UiRegionKey(unsigned page,unsigned clut,int left,int top,int w,int h,bool model) {
     const unsigned char *known;const unsigned short *vram=Psyz_GpuGetVramCopy(&known);
     unsigned long long revision=Psyz_GpuGetVramRevision();
     if(revision!=ui_revision){ui_page_count=0;ui_revision=revision;}
@@ -335,7 +357,7 @@ static uint64_t UiRegionKey(unsigned page,unsigned clut,int left,int top,int w,i
         hash=UiHashWord(hash,vram[palette+index]);
     }
     if(ui_page_count<64)ui_pages[ui_page_count++]=(UiPage){page,clut,left,top,w,h,hash};
-    const char *dump=SDL_getenv("PSYZ_DUMP_INTERFACE");
+    const char *dump=SDL_getenv(model?"PSYZ_DUMP_MODELS":"PSYZ_DUMP_INTERFACE");
     if(dump&&*dump){
         char path[4096];snprintf(path,sizeof(path),"%s/%016llx.png",dump,(unsigned long long)hash);
         SDL_PathInfo existing;
@@ -347,12 +369,13 @@ static uint64_t UiRegionKey(unsigned page,unsigned clut,int left,int top,int w,i
                 unsigned c=known[at]?vram[palette+index]:0;
                 unsigned char *out=(unsigned char *)image->pixels+y*image->pitch+x*4;
                 out[0]=((c&31)*255+15)/31;out[1]=(((c>>5)&31)*255+15)/31;out[2]=(((c>>10)&31)*255+15)/31;out[3]=c?255:0;
-            }SDL_SavePNG(image,path);SDL_DestroySurface(image);}
+            }SDL_SavePNG(image,path);SDL_DestroySurface(image);
+            if(model)INFOF("model material %016llx page=%u clut=%u rect=%d,%d,%d,%d",(unsigned long long)hash,page,clut,left,top,w,h);}
         }
     }
     return hash;
 }
-static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int h);
+static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int h,bool model);
 
 /* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
 typedef struct SpriteAtlas {
@@ -584,9 +607,9 @@ static SDL_Surface *LoadHdImage(const char *filename) {
     SDL_free(data);return surface;
 }
 
-static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int h) {
+static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int h,bool model) {
     if(w<=0||h<=0||w>256||h>256)return NULL;
-    uint64_t key=UiRegionKey(page&0x19f,clut,left,top,w,h);
+    uint64_t key=UiRegionKey(page&0x19f,clut,left,top,w,h,model);
     if(!key||!*ui_directory||!sprite_atlases_enabled)return NULL;
     for(unsigned i=0;i<ui_image_next;++i)if(ui_images[i].key==key)return ui_images[i].loaded?ui_images+i:NULL;
     char path[4096];SDL_Surface *source=NULL;
@@ -595,6 +618,7 @@ static UiImage *UiSelect(unsigned page,unsigned clut,int left,int top,int w,int 
         int n=snprintf(path,sizeof(path),"%s/ui-%016llx.%s",ui_directory,(unsigned long long)key,formats[i]);
         if(n>0&&(size_t)n<sizeof(path))source=LoadHdImage(path);
     }
+    if(model&&SDL_getenv("PSYZ_DUMP_MODELS"))INFOF("model lookup %016llx found=%d",(unsigned long long)key,source!=NULL);
     if(source&&(source->w!=w*4||source->h!=h*4)){SDL_DestroySurface(source);source=NULL;}
     unsigned sw=w*4+4,sh=h*4+4;
     if(ui_atlas_x+sw>UI_ATLAS_SIZE){ui_atlas_x=0;ui_atlas_y+=ui_atlas_row;ui_atlas_row=0;}
@@ -2675,8 +2699,10 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool atlas_extension=next_sprite_extension;
     next_sprite_atlas=NULL;next_sprite_extension=false;
     UiImage *ui_image=NULL;SDL_GPUTexture *ui_texture=NULL;
+    ModelMaterialRegion *model_region=ModelRegion(model_queue,packets);
+    if(!model_region)model_region=ModelRegion(model_commands,packets);
     if(isTextured&&!isLine&&!atlas&&max_len>=3&&
-       (UiHas(ui_queue,packets)||UiHas(ui_commands,packets))){
+       (model_region||UiHas(ui_queue,packets)||UiHas(ui_commands,packets))){
         unsigned ui_page=cur_tpage,ui_clut=(unsigned)(packets[2]>>16);
         if(isPoly&&max_len>(isGouraud?5:4))ui_page=(unsigned)(packets[isGouraud?5:4]>>16);
         /* Texture windows need an explicit material layout; keep native fallback. */
@@ -2690,7 +2716,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             switch(code&~3){case 0x64:if(max_len>=4){ui_w=(unsigned)packets[3]&65535;ui_h=((unsigned)packets[3]>>16)&65535;}break;
                 case 0x74:ui_w=ui_h=8;break;case 0x7c:ui_w=ui_h=16;break;}
         }
-        if(cur_twin==TWIN_PACK(255,255,0,0))ui_image=UiSelect(ui_page,ui_clut,ui_u,ui_v,ui_w,ui_h);
+        if(model_region){ui_u=model_region->x;ui_v=model_region->y;ui_w=model_region->w;ui_h=model_region->h;}
+        if(cur_twin==TWIN_PACK(255,255,0,0))ui_image=UiSelect(ui_page,ui_clut,ui_u,ui_v,ui_w,ui_h,model_region!=NULL);
         if(ui_image)ui_texture=ui_atlas;
     }
     if(ui_texture!=ui_batch_texture){Draw_FlushBuffer();ui_batch_texture=ui_texture;}

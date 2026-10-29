@@ -71,6 +71,9 @@ void Psyz_GpuResetSpriteAtlases(void);
 unsigned long long Psyz_GpuGetVramRevision(void);
 void Psyz_GpuSetInterfacePack(const char *directory);
 void Psyz_GpuRegisterInterfacePacket(const void *command);
+/* Shared original model UV region; presentation metadata, not a packet edit. */
+int Psyz_GpuModelMaterialsActive(void);
+void Psyz_GpuRegisterModelMaterial(const void *command,int x,int y,int w,int h);
 void Psyz_GpuRegisterInterfacePrimitive(const void *primitive);
 void Psyz_GpuClearInterfacePackets(void);
 void Psyz_GpuCopyInterfacePacket(const void *from, const void *to);
