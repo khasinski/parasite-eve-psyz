@@ -1111,14 +1111,10 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
 }
 
 static bool CreateScaledVramTarget(unsigned n) {
-    if (scaled_blend_sample) {
-        SDL_ReleaseGPUTexture(device, scaled_blend_sample);
-        scaled_blend_sample = NULL;
-    }
-    if (scaled_vram_render) {
-        SDL_ReleaseGPUTexture(device, scaled_vram_render);
-        scaled_vram_render = NULL;
-    }
+    /* Settings changes can otherwise leave several generations resident on
+     * a small/shared GPU. Finish the old work before allocating a new pair. */
+    if (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device))
+        return false;
     const SDL_GPUTextureCreateInfo info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
         .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
@@ -1129,20 +1125,22 @@ static bool CreateScaledVramTarget(unsigned n) {
         .layer_count_or_depth = 1,
         .num_levels = 1,
     };
-    scaled_vram_render = SDL_CreateGPUTexture(device, &info);
+    SDL_GPUTexture *render = SDL_CreateGPUTexture(device, &info);
     SDL_GPUTextureCreateInfo sample_info = info;
     sample_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-    scaled_blend_sample = SDL_CreateGPUTexture(device, &sample_info);
-    if (!scaled_vram_render || !scaled_blend_sample) {
-        ERRORF(
-            "scaled VRAM texture creation failed (%dx): %s", n, SDL_GetError());
-        if (scaled_vram_render)
-            SDL_ReleaseGPUTexture(device, scaled_vram_render);
-        if (scaled_blend_sample)
-            SDL_ReleaseGPUTexture(device, scaled_blend_sample);
-        scaled_vram_render = scaled_blend_sample = NULL;
+    SDL_GPUTexture *sample = render ? SDL_CreateGPUTexture(device, &sample_info) : NULL;
+    if (!render || !sample) {
+        ERRORF("scaled VRAM texture creation failed (%dx): %s", n, SDL_GetError());
+        if (render) SDL_ReleaseGPUTexture(device, render);
+        if (sample) SDL_ReleaseGPUTexture(device, sample);
+        /* Release partial allocations before the next draw needs uniforms. */
+        SDL_WaitForGPUIdle(device);
         return false;
     }
+    if (scaled_vram_render) SDL_ReleaseGPUTexture(device, scaled_vram_render);
+    if (scaled_blend_sample) SDL_ReleaseGPUTexture(device, scaled_blend_sample);
+    scaled_vram_render = render;
+    scaled_blend_sample = sample;
     return true;
 }
 
@@ -1179,11 +1177,15 @@ static void ApplyPendingInternalRes(void) {
     Psyz_GpuResetInterpolation();
     if (want_scaled && (n != internal_res || !have_scaled)) {
         if (!CreateScaledVramTarget(n)) {
-            n = 1;
-            set_internal_res = 1;
-            want_scaled = false;
-            set_geometry_correction = false;
-            set_antialiasing = set_model_filtering = false;
+            /* Keep the working target and AA mode, rather than losing the
+             * framebuffer and retrying an impossible size on each setting. */
+            n = internal_res;
+            set_antialiasing = antialiasing;
+            set_internal_res = n / (antialiasing ? 2u : 1u);
+            if (!have_scaled) {
+                set_geometry_correction = set_model_filtering = false;
+            }
+            want_scaled = have_scaled;
         } else {
             // upscale the whole native VRAM into the freshly created scaled
             // target
