@@ -68,6 +68,8 @@ typedef struct {
 
 static SDL_GPUDevice* device = NULL;
 static bool swapchain_ok = false;
+static int swapchain_window_w, swapchain_window_h;
+static SDL_WindowFlags swapchain_window_fullscreen;
 static SDL_GPUTexture* vram_render = NULL;
 static SDL_GPUTexture* rgb24_display = NULL;
 static SDL_GPUTexture* presentation_display = NULL;
@@ -1008,6 +1010,9 @@ bool InitPlatform() {
         WARNF("no swapchain, presentation disabled: %s", SDL_GetError());
     }
 
+    SDL_GetWindowSizeInPixels(sdl3_window, &swapchain_window_w, &swapchain_window_h);
+    swapchain_window_fullscreen = SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN;
+
     if (!CreateGpuResources()) {
         return false;
     }
@@ -1519,6 +1524,31 @@ static SDL_GPUBlitRegion PrescaleWidescreen(
             SDL_clamp((Uint32)SDL_lroundf((y1 - y0) * (float)ky), 1u, ph - py)};
 }
 
+/* SDL's D3D12 ResizeBuffers failure path frees the old views before it knows
+ * whether resizing succeeded. Recreate the claimed swapchain at a frame
+ * boundary instead, while its old views are still valid. Keep VRAM intact. */
+static bool RefreshWindowSwapchain(void) {
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(sdl3_window, &w, &h);
+    SDL_WindowFlags fullscreen = SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN;
+    if (w <= 0 || h <= 0) return false;
+    if (swapchain_ok && w == swapchain_window_w && h == swapchain_window_h &&
+        fullscreen == swapchain_window_fullscreen) return true;
+    Draw_FlushBuffer();
+    if (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device)) return false;
+    if (swapchain_ok) SDL_ReleaseWindowFromGPUDevice(device, sdl3_window);
+    swapchain_ok = SDL_ClaimWindowForGPUDevice(device, sdl3_window);
+    if (!swapchain_ok) {
+        ERRORF("could not recreate window swapchain: %s", SDL_GetError());
+        return false;
+    }
+    swapchain_window_w = w;
+    swapchain_window_h = h;
+    swapchain_window_fullscreen = fullscreen;
+    PlatformBackend_SetDriverVsync(use_driver_vsync);
+    return true;
+}
+
 static void PlatformBackend_Present(void) {
     if (UseSoftwareBackend()) {
         finish_time = SDL_GetPerformanceCounter();
@@ -1533,6 +1563,9 @@ static void PlatformBackend_Present(void) {
     }
 
     ApplyPendingInternalRes();
+    if (!ws_capture_active && !hidden_gpu_renderer &&
+        !SDL_strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") &&
+        !RefreshWindowSwapchain()) return;
     if(!ws_capture_active){
     interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
         interpolated_scale==internal_res&&interp_next_y<=VRAM_H-display_size.y&&!display_rgb24&&!debug_show_vram&&game_speed==1&&
