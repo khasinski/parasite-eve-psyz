@@ -70,6 +70,14 @@ static SDL_GPUDevice* device = NULL;
 static bool swapchain_ok = false;
 static int swapchain_window_w, swapchain_window_h;
 static SDL_WindowFlags swapchain_window_fullscreen;
+static SDL_AtomicInt swapchain_resize_pending;
+static bool SDLCALL WatchSwapchainResize(void *userdata, SDL_Event *event) {
+    (void)userdata;
+    if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && sdl3_window &&
+        event->window.windowID == SDL_GetWindowID(sdl3_window))
+        SDL_SetAtomicInt(&swapchain_resize_pending, 1);
+    return true;
+}
 static SDL_GPUTexture* vram_render = NULL;
 static SDL_GPUTexture* rgb24_display = NULL;
 static SDL_GPUTexture* presentation_display = NULL;
@@ -1010,6 +1018,8 @@ bool InitPlatform() {
         WARNF("no swapchain, presentation disabled: %s", SDL_GetError());
     }
 
+    SDL_SetAtomicInt(&swapchain_resize_pending, 0);
+    SDL_AddEventWatch(WatchSwapchainResize, NULL);
     SDL_GetWindowSizeInPixels(sdl3_window, &swapchain_window_w, &swapchain_window_h);
     swapchain_window_fullscreen = SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN;
 
@@ -1532,11 +1542,13 @@ static bool RefreshWindowSwapchain(void) {
     SDL_GetWindowSizeInPixels(sdl3_window, &w, &h);
     SDL_WindowFlags fullscreen = SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN;
     if (w <= 0 || h <= 0) return false;
-    if (swapchain_ok && w == swapchain_window_w && h == swapchain_window_h &&
+    if (swapchain_ok && !SDL_GetAtomicInt(&swapchain_resize_pending) &&
+        w == swapchain_window_w && h == swapchain_window_h &&
         fullscreen == swapchain_window_fullscreen) return true;
     Draw_FlushBuffer();
     if (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device)) return false;
     if (swapchain_ok) SDL_ReleaseWindowFromGPUDevice(device, sdl3_window);
+    SDL_SetAtomicInt(&swapchain_resize_pending, 0);
     swapchain_ok = SDL_ClaimWindowForGPUDevice(device, sdl3_window);
     if (!swapchain_ok) {
         ERRORF("could not recreate window swapchain: %s", SDL_GetError());
@@ -1763,6 +1775,7 @@ static void PlatformBackend_Present(void) {
 }
 
 static void QuitPlatform(void) {
+    SDL_RemoveEventWatch(WatchSwapchainResize, NULL);
     Sdl3Common_Shutdown();
     if (device) {
         /* Retire acquired command buffers before destroying their device,
