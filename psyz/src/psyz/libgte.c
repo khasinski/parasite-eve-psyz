@@ -1814,12 +1814,14 @@ typedef struct {
     unsigned int sxy;
     unsigned int gen;
     unsigned int queued;
+    unsigned int is_effect;
     float x, y, w;
 } PgxpAddrEntry;
 
 typedef struct {
     unsigned int sxy;
     unsigned int gen;
+    unsigned int is_effect;
     float x, y, w;
 } PgxpSxyEntry;
 
@@ -1830,7 +1832,11 @@ typedef struct {
 
 static int pgxp_active = 0;
 static int pgxp_culling = 1;
+static int pgxp_effect_enabled = 0;
+static int pgxp_effect_mode = 0;
 void Psyz_PgxpSetCulling(int enabled) { pgxp_culling = enabled != 0; }
+void Psyz_PgxpSetEffectEnabled(int enabled) { pgxp_effect_enabled = enabled != 0; }
+void Psyz_GteSetPgxpEffectMode(int enabled) { pgxp_effect_mode = enabled != 0; }
 static unsigned int pgxp_frame_gen = 1;
 static int pgxp_matrix_valid = 0;
 static double pgxp_rot[3][3];
@@ -1857,6 +1863,7 @@ void Psyz_PgxpSetActive(int active) {
     pgxp_active = active != 0;
     if (!pgxp_active) {
         pgxp_matrix_valid = 0;
+        pgxp_effect_mode = 0;
     }
 }
 
@@ -1868,6 +1875,7 @@ void Psyz_PgxpNextFrame(void) {
         pgxp_frame_gen = 1;
     }
     pgxp_matrix_valid = 0;
+    pgxp_effect_mode = 0;
 }
 
 void Psyz_GteSetPgxpMatrix(const double rot[3][3], const double trans[3]) {
@@ -1905,6 +1913,7 @@ static inline void PgxpStoreAddr(const void* dst, PgxpSxyEntry entry) {
         .addr = addr,
         .sxy = entry.sxy,
         .gen = entry.gen,
+        .is_effect = entry.is_effect,
         .x = entry.x,
         .y = entry.y,
         .w = entry.w,
@@ -1962,6 +1971,7 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     out = (PgxpSxyEntry){
         .sxy = sxy,
         .gen = pgxp_frame_gen,
+        .is_effect = (unsigned int)pgxp_effect_mode,
         .x = sx_f,
         .y = sy_f,
         .w = w_f,
@@ -1969,6 +1979,86 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     set[1] = set[0];
     set[0] = out;
     return out;
+}
+
+int Psyz_GteGetLastPgxpVertex(float* x, float* y, float* w) {
+    if (!pgxp_active || pgxp_fifo[2].gen != pgxp_frame_gen) {
+        return 0;
+    }
+    *x = pgxp_fifo[2].x;
+    *y = pgxp_fifo[2].y;
+    *w = pgxp_fifo[2].w;
+    return 1;
+}
+
+void Psyz_GteStorePgxpVertex(
+    const void* dst, unsigned int sxy, float x, float y, float w) {
+    if (!pgxp_active || !dst) {
+        return;
+    }
+    PgxpStoreAddr(dst, (PgxpSxyEntry){
+                           .sxy = sxy,
+                           .gen = pgxp_frame_gen,
+                           .is_effect = (unsigned int)pgxp_effect_mode,
+                           .x = x,
+                           .y = y,
+                           .w = w,
+                       });
+}
+
+void Psyz_GteProjectFloatVertex(
+    double vx, double vy, double vz, const void* dst, unsigned int sxy) {
+    if (!pgxp_active || !dst) {
+        return;
+    }
+    short sx = (short)(sxy & 0xFFFFu);
+    short sy = (short)((sxy >> 16) & 0xFFFFu);
+    double fx, fy, fz;
+    if (pgxp_matrix_valid) {
+        fx = pgxp_trans[0] + pgxp_rot[0][0] * vx + pgxp_rot[0][1] * vy +
+             pgxp_rot[0][2] * vz;
+        fy = pgxp_trans[1] + pgxp_rot[1][0] * vx + pgxp_rot[1][1] * vy +
+             pgxp_rot[1][2] * vz;
+        fz = pgxp_trans[2] + pgxp_rot[2][0] * vx + pgxp_rot[2][1] * vy +
+             pgxp_rot[2][2] * vz;
+    } else {
+        fx = (double)M.t[0] +
+             ((double)M.m[0][0] * vx + (double)M.m[0][1] * vy +
+              (double)M.m[0][2] * vz) *
+                 (1.0 / 4096.0);
+        fy = (double)M.t[1] +
+             ((double)M.m[1][0] * vx + (double)M.m[1][1] * vy +
+              (double)M.m[1][2] * vz) *
+                 (1.0 / 4096.0);
+        fz = (double)M.t[2] +
+             ((double)M.m[2][0] * vx + (double)M.m[2][1] * vy +
+              (double)M.m[2][2] * vz) *
+                 (1.0 / 4096.0);
+    }
+    double ir1_f = CLAMP(fx, -32768.0, 32767.0);
+    double ir2_f = CLAMP(fy, -32768.0, 32767.0);
+    double sz_f = CLAMP(fz, 0.0, 65535.0);
+    double h_f = (double)(unsigned short)H;
+    double scale_f = (h_f >= sz_f * 2.0 || sz_f <= 0.0)
+                         ? ((double)0x1FFFF / 65536.0)
+                         : (h_f / sz_f);
+    float sx_f = (float)CLAMP((double)OFX + ir1_f * scale_f, -1024.0, 1023.0);
+    float sy_f = (float)CLAMP((double)OFY + ir2_f * scale_f, -1024.0, 1023.0);
+    float w_f = (float)(sz_f > 1.0 ? sz_f : 1.0);
+    if (sx <= -1024 || sx >= 1023 || sy <= -1024 || sy >= 1023 ||
+        fabsf(sx_f - ((float)sx + 0.5f)) > 16.0f ||
+        fabsf(sy_f - ((float)sy + 0.5f)) > 16.0f) {
+        sx_f = (float)sx + 0.5f;
+        sy_f = (float)sy + 0.5f;
+    }
+    PgxpStoreAddr(dst, (PgxpSxyEntry){
+                           .sxy = sxy,
+                           .gen = pgxp_frame_gen,
+                           .is_effect = (unsigned int)pgxp_effect_mode,
+                           .x = sx_f,
+                           .y = sy_f,
+                           .w = w_f,
+                       });
 }
 
 int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
@@ -1983,10 +2073,13 @@ int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
         for (unsigned int i = 0; i < PGXP_ADDR_WAYS; ++i) {
             if ((aset[i].gen == pgxp_frame_gen || aset[i].queued) &&
                 aset[i].addr == addr && aset[i].sxy == sxy) {
+                if (aset[i].is_effect && !pgxp_effect_enabled) {
+                    return 0;
+                }
                 *x = aset[i].x;
                 *y = aset[i].y;
                 *w = aset[i].w;
-                return 1;
+                return aset[i].is_effect ? 2 : 1;
             }
         }
     }
@@ -1996,7 +2089,7 @@ int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
 int Psyz_GtePgxpNclip3(
     const void* s0, unsigned int xy0, const void* s1, unsigned int xy1,
     const void* s2, unsigned int xy2, int int_area) {
-    if (!pgxp_active || !pgxp_culling) {
+    if (!pgxp_active || !(pgxp_culling || (pgxp_effect_mode && pgxp_effect_enabled))) {
         return int_area;
     }
     float x0, y0, w0, x1, y1, w1, x2, y2, w2;
@@ -2017,7 +2110,7 @@ int Psyz_GtePgxpNclip3(
 int Psyz_GtePgxpNclip4(const void* s0, unsigned int xy0, const void* s1,
                        unsigned int xy1, const void* s2, unsigned int xy2,
                        const void* s3, unsigned int xy3, int int_area) {
-    if (!pgxp_active || !pgxp_culling) {
+    if (!pgxp_active || !(pgxp_culling || (pgxp_effect_mode && pgxp_effect_enabled))) {
         return int_area;
     }
     float x0, y0, w0, x1, y1, w1, x2, y2, w2, x3, y3, w3;
@@ -2042,10 +2135,12 @@ void Psyz_GteCopyPgxpSxy(const void* src, const void* dst, unsigned int sxy) {
         return;
     }
     float x = 0.0f, y = 0.0f, w = 0.0f;
-    if (Psyz_PgxpLookupVertex(src, sxy, &x, &y, &w)) {
+    int kind = Psyz_PgxpLookupVertex(src, sxy, &x, &y, &w);
+    if (kind) {
         PgxpStoreAddr(dst, (PgxpSxyEntry){
                                .sxy = sxy,
                                .gen = pgxp_frame_gen,
+                               .is_effect = (unsigned int)(kind == 2),
                                .x = x,
                                .y = y,
                                .w = w,
@@ -2975,6 +3070,11 @@ long RotTransPers3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0, int* sxy1,
     *(unsigned int*)sxy0 = s0;
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy0, pgxp_fifo[0]);
+        PgxpStoreAddr(sxy1, pgxp_fifo[1]);
+        PgxpStoreAddr(sxy2, pgxp_fifo[2]);
+    }
     *p = ir0;
     *flag = (int)fl;
     return z;
@@ -2986,6 +3086,9 @@ long RotTransPers4(
     int flag1, flag2;
     RotTransPers3(v0, v1, v2, sxy0, sxy1, sxy2, p, &flag1);
     RotTransPers(v3, sxy3, p, &flag2);
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy3, pgxp_fifo[2]);
+    }
     *flag = flag1 | flag2;
     return SZ3 >> 2;
 }
@@ -3006,6 +3109,11 @@ long RotAverage3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0, int* sxy1,
     *(unsigned int*)sxy0 = s0;
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy0, pgxp_fifo[0]);
+        PgxpStoreAddr(sxy1, pgxp_fifo[1]);
+        PgxpStoreAddr(sxy2, pgxp_fifo[2]);
+    }
     *flag = (int)fl;
     *p = ir0;
     return otz;
@@ -3016,11 +3124,15 @@ long RotAverage4(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0,
     unsigned s0, s1, s2, s3, fl1, fl2;
     int ir0;
     long otz;
+    PgxpSxyEntry f0, f1, f2;
     V0 = *v0;
     V1 = *v1;
     V2 = *v2;
     RTPT_BODY(1, 0, s0, s1, s2);
     fl1 = FLAG;
+    f0 = pgxp_fifo[0];
+    f1 = pgxp_fifo[1];
+    f2 = pgxp_fifo[2];
     V0 = *v3;
     RTPS_BODY(1, 0, s3);
     fl2 = FLAG;
@@ -3031,6 +3143,12 @@ long RotAverage4(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0,
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
     *(unsigned int*)sxy3 = s3;
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy0, f0);
+        PgxpStoreAddr(sxy1, f1);
+        PgxpStoreAddr(sxy2, f2);
+        PgxpStoreAddr(sxy3, pgxp_fifo[2]);
+    }
     *p = ir0;
     *flag = (int)(fl1 | fl2);
     return otz;
@@ -3053,6 +3171,11 @@ long RotAverageNclip3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0,
         *(unsigned int*)sxy0 = s0;
         *(unsigned int*)sxy1 = s1;
         *(unsigned int*)sxy2 = s2;
+        if (pgxp_active && pgxp_effect_mode) {
+            PgxpStoreAddr(sxy0, pgxp_fifo[0]);
+            PgxpStoreAddr(sxy1, pgxp_fifo[1]);
+            PgxpStoreAddr(sxy2, pgxp_fifo[2]);
+        }
         *p = ir0;
         *otz = OTZ;
         return clip;
@@ -3065,11 +3188,15 @@ long RotAverageNclip4(
     SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0, int* sxy1,
     int* sxy2, int* sxy3, int* p, int* otz, int* flag) {
     unsigned s0, s1, s2, s3, fl1, fl2;
+    PgxpSxyEntry f0, f1, f2;
     V0 = *v0;
     V1 = *v1;
     V2 = *v2;
     RTPT_BODY(1, 0, s0, s1, s2);
     fl1 = FLAG;
+    f0 = pgxp_fifo[0];
+    f1 = pgxp_fifo[1];
+    f2 = pgxp_fifo[2];
     NCLIP();
     const int clip = MAC0;
     if (clip > 0) {
@@ -3083,6 +3210,12 @@ long RotAverageNclip4(
         *(unsigned int*)sxy1 = s1;
         *(unsigned int*)sxy2 = s2;
         *(unsigned int*)sxy3 = s3;
+        if (pgxp_active && pgxp_effect_mode) {
+            PgxpStoreAddr(sxy0, f0);
+            PgxpStoreAddr(sxy1, f1);
+            PgxpStoreAddr(sxy2, f2);
+            PgxpStoreAddr(sxy3, pgxp_fifo[2]);
+        }
         *p = ir0;
         *flag = (int)(fl1 | fl2);
         *otz = OTZ;

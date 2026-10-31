@@ -109,12 +109,18 @@ static int writePacket(Vertex* v, int code, int n, u_long* packet, u16* pOut) {
     }
     v->x = s11(((short*)packet)[0]);
     v->y = s11(((short*)packet)[1]);
-    if (!Psyz_PgxpLookupVertex(
+    v->t = 0;
+    {
+        int pgxp_kind = Psyz_PgxpLookupVertex(
             packet, *(const unsigned int*)packet, &v->pgxp_pos[0],
-            &v->pgxp_pos[1], &v->pgxp_pos[2])) {
-        v->pgxp_pos[0] = (float)v->x + 0.5f;
-        v->pgxp_pos[1] = (float)v->y + 0.5f;
-        v->pgxp_pos[2] = -1.0f;
+            &v->pgxp_pos[1], &v->pgxp_pos[2]);
+        if (!pgxp_kind) {
+            v->pgxp_pos[0] = (float)v->x + 0.5f;
+            v->pgxp_pos[1] = (float)v->y + 0.5f;
+            v->pgxp_pos[2] = -1.0f;
+        } else if (pgxp_kind == 1) {
+            v->t = TPAGE_MODEL;
+        }
     }
     packet++;
     n--;

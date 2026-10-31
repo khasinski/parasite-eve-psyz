@@ -232,6 +232,7 @@ static PsyzVideoStats gpu_stats = {0};
 static unsigned game_speed = 1;
 static Uint64 last_present_time = 0;
 static bool present_skip = false; // this frame is not shown
+static bool frame_presented = false; // swapchain image was acquired and queued this frame
 
 static Uint32 WallVblankCount(void) {
     return (Uint32)((double)SDL_GetTicksNS() * target_frame_rate * game_speed /
@@ -457,9 +458,10 @@ static void WaitForNextFrame(void) {
     Psyz_WebWaitForNextFrame();
 #else
     /* Above normal speed driver VSync no longer paces every frame (most are
-     * not shown), so the limiter does, at the faster rate. */
+     * not shown), so the limiter does, at the faster rate. Also fall back to
+     * software pacing when no swapchain image was presented (e.g. minimized). */
     const double frame_time_us = target_frame_time_us / game_speed;
-    if ((!use_driver_vsync || game_speed > 1) &&
+    if ((!use_driver_vsync || !frame_presented || game_speed > 1) &&
         vsync_mode != PSYZ_VSYNC_LIMITLESS) {
         double time_to_wait_us =
             frame_time_us - elapsed_us + drift_compensation;

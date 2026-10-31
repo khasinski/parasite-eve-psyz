@@ -21,6 +21,20 @@ int Psyz_VideoSetGeometryCorrection(int enabled) {
 
 int Psyz_VideoGetGeometryCorrection(void) { return 0; }
 
+int Psyz_VideoSetDynamicLighting(int enabled) {
+    (void)enabled;
+    return -1;
+}
+
+int Psyz_VideoGetDynamicLighting(void) { return 0; }
+
+int Psyz_VideoSetEffectGeometryCorrection(int enabled) {
+    (void)enabled;
+    return -1;
+}
+
+int Psyz_VideoGetEffectGeometryCorrection(void) { return 0; }
+
 int Draw_SetHorizontalGrid(
     unsigned int source_width, unsigned int target_width) {
     if (source_width == 0 || target_width == 0) {

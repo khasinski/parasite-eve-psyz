@@ -1608,3 +1608,7 @@ void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b){(void)a;(void)
 
 void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b){(void)a;(void)b;}
 void Psyz_GpuSetInterpolationCamera(int x,int y){(void)x;(void)y;}
+int Psyz_VideoSetDynamicLighting(int enabled){(void)enabled;return -1;}
+int Psyz_VideoGetDynamicLighting(void){return 0;}
+int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}
+int Psyz_VideoGetEffectGeometryCorrection(void){return 0;}

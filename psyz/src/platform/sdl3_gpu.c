@@ -68,6 +68,7 @@ typedef struct {
 
 static SDL_GPUDevice* device = NULL;
 static bool swapchain_ok = false;
+static SDL_GPUPresentMode swapchain_present_mode = SDL_GPU_PRESENTMODE_VSYNC;
 static int swapchain_window_w, swapchain_window_h;
 static SDL_WindowFlags swapchain_window_fullscreen;
 static SDL_AtomicInt swapchain_resize_pending;
@@ -100,6 +101,9 @@ static Uint32 prescale_width, prescale_height;
 static unsigned set_internal_res = 1;
 static bool geometry_correction = false;
 static bool set_geometry_correction = false;
+static bool dynamic_lighting = false;
+static bool effect_geometry_correction = false;
+static bool set_effect_geometry_correction = false;
 static SDL_GPUBuffer* vbuf = NULL;
 static SDL_GPUBuffer* ibuf = NULL;
 static SDL_GPUBuffer* clear_vbuf = NULL;
@@ -190,9 +194,13 @@ void Psyz_GpuClearInterpolationPackets(void) {
 }
 int Psyz_GpuSetFrameInterpolation(int enabled) {
     if(interpolation_enabled!=(enabled!=0)){Draw_FlushBuffer();interpolation_enabled=enabled!=0;Psyz_GpuResetInterpolation();}
-    if(!interpolation_enabled&&interpolated_vram&&device){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;}
-    Psyz_PgxpSetActive(!headless_renderer&&(set_geometry_correction||set_model_filtering||interpolation_enabled));
+    if(!interpolation_enabled&&device){
+        if(interpolated_vram){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;}
+        interpolated_scale=0;
+    }
+    Psyz_PgxpSetActive(!headless_renderer&&(set_geometry_correction||set_effect_geometry_correction||set_model_filtering||interpolation_enabled));
     Psyz_PgxpSetCulling(set_geometry_correction);
+    Psyz_PgxpSetEffectEnabled(set_effect_geometry_correction);
     return 0;
 }
 int Psyz_GpuGetFrameInterpolation(void){return interpolation_enabled;}
@@ -201,8 +209,9 @@ void Psyz_GpuBeginInterpolationFrame(void) {
     interp_matches=0;
     ++interp_frame;if(!interp_frame){Psyz_GpuResetInterpolation();interp_frame=1;}
     if(!interpolation_enabled||!device||UseSoftwareBackend())return;
-    if(interpolated_vram&&interpolated_scale!=internal_res){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;Psyz_GpuResetInterpolation();}
+    if(interpolated_vram&&interpolated_scale!=internal_res){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;interpolated_scale=0;Psyz_GpuResetInterpolation();}
     if(!interpolated_vram){
+        if(interpolated_scale==internal_res)return;
         SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
             .usage=SDL_GPU_TEXTUREUSAGE_COLOR_TARGET|SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=VRAM_W*internal_res,.height=VRAM_H*internal_res,.layer_count_or_depth=1,.num_levels=1};
         interpolated_vram=SDL_CreateGPUTexture(device,&info);interpolated_scale=internal_res;
@@ -227,8 +236,8 @@ void Psyz_GpuPrepareInterpolatedPresent(int next_y) {
 static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     unsigned offset=(unsigned)(v-vertex_buf);
     memcpy(interpolated_vertices+offset,v,count*sizeof(*v));
-    for(unsigned i=0;i<count;++i)if(!(geometry_correction&&internal_res>1&&(v[i].t&TPAGE_MODEL)))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
-    if(!interpolation_enabled||count>6)return;
+    for(unsigned i=0;i<count;++i)if(!((geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0.0f))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
+    if(!interpolation_enabled||(!interpolated_vram&&interpolated_scale==internal_res)||count>6)return;
     InterpAddress *e=InterpFind(interp_queue,packet);
     if(!e)e=InterpFind(interp_addresses,packet);
     if(!e||!e->serial)return;
@@ -238,7 +247,7 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
         for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&p->signature==signature;
     float position[6][3];
-    for(unsigned i=0;i<count;++i){bool projected=geometry_correction&&internal_res>1&&(v[i].t&TPAGE_MODEL)&&v[i].pgxp_pos[2]>0;
+    for(unsigned i=0;i<count;++i){bool projected=(geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0;
         float bias=(v[i].t&TPAGE_POLYGON)&&internal_res==1?0.5f:0.0f;
         position[i][0]=projected?v[i].pgxp_pos[0]:(float)v[i].x+bias;
         position[i][1]=projected?v[i].pgxp_pos[1]:(float)v[i].y+bias;
@@ -521,11 +530,17 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
         .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=HD_ATLAS_WIDTH,.height=HD_ATLAS_HEIGHT,.layer_count_or_depth=1,.num_levels=1};
     if (!sprite_atlas_texture) sprite_atlas_texture=SDL_CreateGPUTexture(device,&info);
+    if (!sprite_atlas_sampler) {
+        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
+        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
+    }
     SDL_GPUTexture *texture=sprite_atlas_texture;
     SDL_GPUTransferBufferCreateInfo upload_info={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=(Uint32)bytes};
-    SDL_GPUTransferBuffer *upload=SDL_CreateGPUTransferBuffer(device,&upload_info);
+    SDL_GPUTransferBuffer *upload=(texture && sprite_atlas_sampler) ? SDL_CreateGPUTransferBuffer(device,&upload_info) : NULL;
     void *mapped=upload ? SDL_MapGPUTransferBuffer(device,upload,false) : NULL;
-    if (!texture || !mapped) {
+    if (!texture || !sprite_atlas_sampler || !mapped) {
         if (mapped) SDL_UnmapGPUTransferBuffer(device,upload);
         if (upload) SDL_ReleaseGPUTransferBuffer(device,upload);
         SDL_DestroySurface(rgba); return -1;
@@ -538,6 +553,39 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
         u8 *target=(u8 *)mapped+(size_t)(cell*2+reference)*68*68*4;
         for (unsigned row=0;row<68;++row)
             memcpy(target+(size_t)row*68*4,(u8 *)rgba->pixels+(size_t)(sy+row)*rgba->pitch+sx*4,68*4);
+        if (reference==0) {
+            u8 solid[68][68];
+            for (unsigned row=0;row<68;++row) {
+                u8 *line=target+(size_t)row*68*4;
+                for (unsigned col=0;col<68;++col) solid[row][col]=line[col*4+3]>=128;
+                for (unsigned col=1;col<68;++col) {
+                    if (!solid[row][col] && solid[row][col-1]) {
+                        memcpy(line+col*4,line+(col-1)*4,3);
+                        solid[row][col]=1;
+                    }
+                }
+                for (unsigned col=67;col>0;--col) {
+                    if (!solid[row][col-1] && solid[row][col]) {
+                        memcpy(line+(col-1)*4,line+col*4,3);
+                        solid[row][col-1]=1;
+                    }
+                }
+            }
+            for (unsigned col=0;col<68;++col) {
+                for (unsigned row=1;row<68;++row) {
+                    if (!solid[row][col] && solid[row-1][col]) {
+                        memcpy(target+((size_t)row*68+col)*4,target+((size_t)(row-1)*68+col)*4,3);
+                        solid[row][col]=1;
+                    }
+                }
+                for (unsigned row=67;row>0;--row) {
+                    if (!solid[row-1][col] && solid[row][col]) {
+                        memcpy(target+((size_t)(row-1)*68+col)*4,target+((size_t)row*68+col)*4,3);
+                        solid[row-1][col]=1;
+                    }
+                }
+            }
+        }
     }
     SDL_UnmapGPUTransferBuffer(device,upload);SDL_DestroySurface(rgba);
     SDL_GPUCommandBuffer *cmd=AcquireCmd();
@@ -554,13 +602,6 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     SDL_EndGPUCopyPass(copy);
     SDL_ReleaseGPUTransferBuffer(device,upload);
-    if (!sprite_atlas_sampler) {
-        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
-            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
-        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
-    }
-    if (!sprite_atlas_sampler) return -1;
     sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells};
     sprite_atlas_cells+=cells;
     sprite_atlas_bytes+=bytes;
@@ -612,7 +653,7 @@ static void SubmitFrame(void) {
     if (!pending_cmd) {
         return;
     }
-    if (swapchain_ok) {
+    if (swapchain_ok && frame_presented) {
         SubmitCmd();
         return;
     }
@@ -1014,7 +1055,9 @@ bool InitPlatform() {
     // useful for offscreen rendering with SDL_VIDEODRIVER=offscreen
     swapchain_ok = !hidden_gpu_renderer &&
                    SDL_ClaimWindowForGPUDevice(device, sdl3_window);
-    if (!swapchain_ok && !hidden_gpu_renderer) {
+    if (swapchain_ok) {
+        swapchain_present_mode = SDL_GPU_PRESENTMODE_VSYNC;
+    } else if (!hidden_gpu_renderer) {
         WARNF("no swapchain, presentation disabled: %s", SDL_GetError());
     }
 
@@ -1059,9 +1102,17 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
             mode = SDL_GPU_PRESENTMODE_MAILBOX;
         }
     }
-    return SDL_SetGPUSwapchainParameters(
-               device, sdl3_window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode) &&
-           enable;
+    if (mode != swapchain_present_mode) {
+        if (!SDL_SetGPUSwapchainParameters(
+                device, sdl3_window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
+            ERRORF("could not set swapchain present mode: %s", SDL_GetError());
+            SDL_ReleaseWindowFromGPUDevice(device, sdl3_window);
+            swapchain_ok = false;
+            return false;
+        }
+        swapchain_present_mode = mode;
+    }
+    return enable && mode == SDL_GPU_PRESENTMODE_VSYNC;
 }
 
 static void UpdateScissor(void);
@@ -1125,9 +1176,34 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     }
 }
 
+static void ReleaseTransientDisplayTextures(void) {
+    if (!device) return;
+    if (interpolated_vram) {
+        SDL_ReleaseGPUTexture(device, interpolated_vram);
+        interpolated_vram = NULL;
+    }
+    interpolated_scale = 0;
+    if (presentation_display) {
+        SDL_ReleaseGPUTexture(device, presentation_display);
+        presentation_display = NULL;
+        presentation_width = presentation_height = 0;
+    }
+    if (antialias_display) {
+        SDL_ReleaseGPUTexture(device, antialias_display);
+        antialias_display = NULL;
+        antialias_width = antialias_height = 0;
+    }
+    if (prescale_display) {
+        SDL_ReleaseGPUTexture(device, prescale_display);
+        prescale_display = NULL;
+        prescale_width = prescale_height = 0;
+    }
+}
+
 static bool CreateScaledVramTarget(unsigned n) {
     /* Settings changes can otherwise leave several generations resident on
      * a small/shared GPU. Finish the old work before allocating a new pair. */
+    ReleaseTransientDisplayTextures();
     if (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device))
         return false;
     const SDL_GPUTextureCreateInfo info = {
@@ -1156,6 +1232,7 @@ static bool CreateScaledVramTarget(unsigned n) {
     if (scaled_blend_sample) SDL_ReleaseGPUTexture(device, scaled_blend_sample);
     scaled_vram_render = render;
     scaled_blend_sample = sample;
+    SDL_WaitForGPUIdle(device);
     return true;
 }
 
@@ -1178,9 +1255,11 @@ static unsigned AdjustInternalRes(unsigned scale) {
 static void ApplyPendingInternalRes(void) {
     unsigned n =
         AdjustInternalRes(set_internal_res * (set_antialiasing ? 2u : 1u));
-    bool want_scaled = n > 1 || set_geometry_correction || set_model_filtering;
+    bool want_scaled = n > 1 || set_geometry_correction ||
+                       set_effect_geometry_correction || set_model_filtering;
     bool have_scaled = scaled_vram_render != NULL;
     if (n == internal_res && set_geometry_correction == geometry_correction &&
+        set_effect_geometry_correction == effect_geometry_correction &&
         set_antialiasing == antialiasing &&
         set_model_filtering == model_filtering && want_scaled == have_scaled) {
         return;
@@ -1191,17 +1270,28 @@ static void ApplyPendingInternalRes(void) {
     Draw_FlushBuffer(); // render pending prims with the old multiplier
     Psyz_GpuResetInterpolation();
     if (want_scaled && (n != internal_res || !have_scaled)) {
-        if (!CreateScaledVramTarget(n)) {
+        bool created = CreateScaledVramTarget(n);
+        if (!created) {
             /* Keep the working target and AA mode, rather than losing the
              * framebuffer and retrying an impossible size on each setting. */
+            unsigned requested_n = n;
             n = internal_res;
             set_antialiasing = antialiasing;
             set_internal_res = n / (antialiasing ? 2u : 1u);
+            if (!have_scaled && requested_n > 1 &&
+                (set_geometry_correction || set_effect_geometry_correction ||
+                 set_model_filtering) &&
+                CreateScaledVramTarget(1)) {
+                have_scaled = true;
+                created = true;
+            }
             if (!have_scaled) {
-                set_geometry_correction = set_model_filtering = false;
+                set_geometry_correction = set_effect_geometry_correction =
+                    set_model_filtering = false;
             }
             want_scaled = have_scaled;
-        } else {
+        }
+        if (created) {
             // upscale the whole native VRAM into the freshly created scaled
             // target
             SDL_GPUCommandBuffer* cmd = ReserveDrawDescriptors(1);
@@ -1220,6 +1310,7 @@ static void ApplyPendingInternalRes(void) {
             }
         }
     } else if (!want_scaled && scaled_vram_render) {
+        ReleaseTransientDisplayTextures();
         SDL_ReleaseGPUTexture(device, scaled_vram_render);
         scaled_vram_render = NULL;
         if (scaled_blend_sample) {
@@ -1227,13 +1318,22 @@ static void ApplyPendingInternalRes(void) {
             scaled_blend_sample = NULL;
         }
     }
+    if (!set_antialiasing && antialias_display) {
+        SDL_ReleaseGPUTexture(device, antialias_display);
+        antialias_display = NULL;
+        antialias_width = antialias_height = 0;
+    }
     internal_res = n;
     geometry_correction = set_geometry_correction;
+    effect_geometry_correction = set_effect_geometry_correction;
     antialiasing = set_antialiasing;
     model_filtering = set_model_filtering;
     Psyz_PgxpSetActive(
-        !UseSoftwareBackend() && (geometry_correction || model_filtering || interpolation_enabled));
+        !UseSoftwareBackend() &&
+        (geometry_correction || effect_geometry_correction ||
+         model_filtering || interpolation_enabled));
     Psyz_PgxpSetCulling(geometry_correction);
+    Psyz_PgxpSetEffectEnabled(effect_geometry_correction);
     UpdateScissor();
     INFOF("internal resolution set to %dx (%dx%d), geometry_correction=%d", n,
           VRAM_W * n, VRAM_H * n, (int)geometry_correction);
@@ -1317,16 +1417,23 @@ static SDL_Surface *BuildTitleDisplay(const u8 *rgb) {
 }
 
 static SDL_GPUTexture *UploadTitleDisplay(SDL_Surface *surface) {
-    if (!title_texture || title_texture_width!=(unsigned)surface->w || title_texture_height!=(unsigned)surface->h) {
+    if (!title_texture || !title_transfer || title_texture_width!=(unsigned)surface->w || title_texture_height!=(unsigned)surface->h) {
         if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
         if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
         title_texture=NULL;title_transfer=NULL;title_uploaded=0;
-        title_texture_width=surface->w;title_texture_height=surface->h;
         SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
             .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=surface->w,.height=surface->h,.layer_count_or_depth=1,.num_levels=1};
         title_texture=SDL_CreateGPUTexture(device,&info);
         SDL_GPUTransferBufferCreateInfo transfer={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=surface->w*surface->h*4};
-        title_transfer=SDL_CreateGPUTransferBuffer(device,&transfer);
+        title_transfer=title_texture?SDL_CreateGPUTransferBuffer(device,&transfer):NULL;
+        if (!title_texture || !title_transfer) {
+            if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
+            if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
+            title_texture=NULL;title_transfer=NULL;
+            title_texture_width=title_texture_height=0;
+            return NULL;
+        }
+        title_texture_width=surface->w;title_texture_height=surface->h;
     }
     if (!title_texture || !title_transfer) return NULL;
     if (title_uploaded==title_generation) return title_texture;
@@ -1413,8 +1520,8 @@ static SDL_GPUBlitRegion PrepareDisplayTexture(
             .num_levels = 1,
         };
         presentation_display = SDL_CreateGPUTexture(device, &info);
-        presentation_width = src.w;
-        presentation_height = src.h;
+        presentation_width = presentation_display ? src.w : 0;
+        presentation_height = presentation_display ? src.h : 0;
     }
     if (!presentation_display)
         return src;
@@ -1443,8 +1550,8 @@ static SDL_GPUBlitRegion PrepareDisplayTexture(
                 .num_levels = 1,
             };
             antialias_display = SDL_CreateGPUTexture(device, &info);
-            antialias_width = width;
-            antialias_height = height;
+            antialias_width = antialias_display ? width : 0;
+            antialias_height = antialias_display ? height : 0;
         }
         if (antialias_display) {
             const SDL_GPUBlitInfo resolve = {
@@ -1554,19 +1661,22 @@ static bool RefreshWindowSwapchain(void) {
         ERRORF("could not recreate window swapchain: %s", SDL_GetError());
         return false;
     }
+    swapchain_present_mode = SDL_GPU_PRESENTMODE_VSYNC;
     swapchain_window_w = w;
     swapchain_window_h = h;
     swapchain_window_fullscreen = fullscreen;
     PlatformBackend_SetDriverVsync(use_driver_vsync);
-    return true;
+    return swapchain_ok;
 }
 
 static void PlatformBackend_Present(void) {
+    frame_presented = false;
     if (UseSoftwareBackend()) {
         finish_time = SDL_GetPerformanceCounter();
         return;
     }
     if (!sdl3_window && !InitPlatform()) {
+        finish_time = SDL_GetPerformanceCounter();
         return;
     }
     if (!ws_capture_active && Sdl3Common_IsInBackground()) {
@@ -1574,10 +1684,14 @@ static void PlatformBackend_Present(void) {
         return;
     }
 
+    Draw_FlushBuffer();
     ApplyPendingInternalRes();
+    bool can_present = swapchain_ok && !present_skip;
     if (!ws_capture_active && !hidden_gpu_renderer &&
         !SDL_strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") &&
-        !RefreshWindowSwapchain()) return;
+        !RefreshWindowSwapchain()) {
+        can_present = false;
+    }
     if(!ws_capture_active){
     interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
         interpolated_scale==internal_res&&interp_next_y<=VRAM_H-display_size.y&&!display_rgb24&&!debug_show_vram&&game_speed==1&&
@@ -1586,15 +1700,16 @@ static void PlatformBackend_Present(void) {
     }
 
     SDL_GPUTexture* rgb24 =
-        disp_on && display_rgb24 && !debug_show_vram && !present_skip
+        disp_on && display_rgb24 && !debug_show_vram && (ws_capture_active || can_present)
             ? PrepareRgb24Display()
             : NULL;
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
+        finish_time = SDL_GetPerformanceCounter();
         return;
     }
     // a skipped frame still submits its drawing, without a swapchain image
-    if (ws_capture_active || (swapchain_ok && !present_skip)) {
+    if (ws_capture_active || can_present) {
         SDL_GPUTexture* swapchain = NULL;
         Uint32 sc_w = 0, sc_h = 0;
         if (ws_capture_active) {
@@ -1606,6 +1721,9 @@ static void PlatformBackend_Present(void) {
             WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
         }
         if (swapchain) {
+            if (!ws_capture_active) {
+                frame_presented = true;
+            }
             if (!disp_on) {
                 const SDL_GPUColorTargetInfo blank_target = {
                     .texture = swapchain,
@@ -1766,6 +1884,8 @@ static void PlatformBackend_Present(void) {
                 overlay_render_cb(cmd, pass);
                 SDL_EndGPURenderPass(pass);
             }
+        } else if (!ws_capture_active && overlay_frame_cb) {
+            overlay_frame_cb();
         }
     } else if (overlay_frame_cb) {
         overlay_frame_cb();
@@ -1813,25 +1933,13 @@ static void QuitPlatform(void) {
         if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
         if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
         title_texture=NULL;title_transfer=NULL;title_uploaded=title_generation=0;
-        if(interpolated_vram){SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;}
+        title_texture_width=title_texture_height=0;
+        ReleaseTransientDisplayTextures();
         Psyz_GpuResetInterpolation();
         if (rgb24_display) {
             SDL_ReleaseGPUTexture(device, rgb24_display);
             rgb24_display = NULL;
         }
-        if (presentation_display) {
-            SDL_ReleaseGPUTexture(device, presentation_display);
-            presentation_display = NULL;
-        }
-        presentation_width = presentation_height = 0;
-        if (antialias_display)
-            SDL_ReleaseGPUTexture(device, antialias_display);
-        antialias_display = NULL;
-        antialias_width = antialias_height = 0;
-        if (prescale_display)
-            SDL_ReleaseGPUTexture(device, prescale_display);
-        prescale_display = NULL;
-        prescale_width = prescale_height = 0;
         if (vram_render) {
             SDL_ReleaseGPUTexture(device, vram_render);
             vram_render = NULL;
@@ -2093,8 +2201,15 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     if (capture_widescreen)
         visible =
             (SDL_GPUBlitRegion){.texture = ws_capture, .w = width, .h = height};
-    else if (antialiasing)
+    else if (antialiasing) {
         visible = PrepareDisplayTexture(cmd, visible);
+        if (visible.w != width || visible.h != height) {
+            SubmitCmdAndWait();
+            free(pixels);
+            SDL_ReleaseGPUTransferBuffer(device, transfer);
+            return NULL;
+        }
+    }
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     if (!copy) {
         free(pixels);
@@ -2180,8 +2295,11 @@ int Psyz_VideoSetGeometryCorrection(int enabled) {
     if (sdl3_window && is_platform_init_successful) {
         ApplyPendingInternalRes();
     } else {
+        geometry_correction = set_geometry_correction;
         Psyz_PgxpSetActive(!headless_renderer &&
-                           (set_geometry_correction || set_model_filtering || interpolation_enabled));
+                           (set_geometry_correction || set_effect_geometry_correction ||
+                            set_model_filtering || interpolation_enabled));
+        Psyz_PgxpSetCulling(set_geometry_correction);
     }
     return 0;
 }
@@ -2197,12 +2315,38 @@ int Psyz_VideoSetModelFiltering(int enabled) {
     set_model_filtering = enabled != 0;
     if (sdl3_window && is_platform_init_successful)
         ApplyPendingInternalRes();
-    else
+    else {
+        model_filtering = set_model_filtering;
         Psyz_PgxpSetActive(!headless_renderer &&
-                           (set_geometry_correction || set_model_filtering || interpolation_enabled));
+                           (set_geometry_correction || set_effect_geometry_correction ||
+                            set_model_filtering || interpolation_enabled));
+    }
     return 0;
 }
 int Psyz_VideoGetModelFiltering(void) { return set_model_filtering; }
+
+int Psyz_VideoSetDynamicLighting(int enabled) {
+    dynamic_lighting = enabled != 0;
+    return 0;
+}
+int Psyz_VideoGetDynamicLighting(void) { return dynamic_lighting ? 1 : 0; }
+
+int Psyz_VideoSetEffectGeometryCorrection(int enabled) {
+    set_effect_geometry_correction = enabled != 0;
+    Psyz_PgxpSetEffectEnabled(set_effect_geometry_correction);
+    if (sdl3_window && is_platform_init_successful) {
+        ApplyPendingInternalRes();
+    } else {
+        effect_geometry_correction = set_effect_geometry_correction;
+        Psyz_PgxpSetActive(!headless_renderer &&
+                           (set_geometry_correction || set_effect_geometry_correction ||
+                            set_model_filtering || interpolation_enabled));
+    }
+    return 0;
+}
+int Psyz_VideoGetEffectGeometryCorrection(void) {
+    return set_effect_geometry_correction ? 1 : 0;
+}
 
 int Psyz_VideoSetWidescreen(int enabled) {
     if ((enabled != 0) != widescreen) {
@@ -2210,6 +2354,18 @@ int Psyz_VideoSetWidescreen(int enabled) {
         widescreen = enabled != 0;
         ws_picture[0].y = ws_picture[1].y = -1;
         ws_centred = false;
+        if (!widescreen && device) {
+            if (prescale_display) {
+                SDL_ReleaseGPUTexture(device, prescale_display);
+                prescale_display = NULL;
+                prescale_width = prescale_height = 0;
+            }
+            if (ws_capture) {
+                SDL_ReleaseGPUTexture(device, ws_capture);
+                ws_capture = NULL;
+                ws_capture_width = ws_capture_height = 0;
+            }
+        }
     }
     return 0;
 }
@@ -2483,6 +2639,7 @@ static void SetPolygonAttributes(Vertex* vertices) {
         }
     }
 }
+
 int Draw_PushPrim(u_long* packets, int max_len) {
     if (UseSoftwareBackend())
         return software_rasterizer.push_prim(packets, max_len);
@@ -2508,7 +2665,14 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     // This also covers Gouraud's fifth-slot colour read-ahead.
     Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
-    for (int i=0;i<6;++i) {v[i].hd_uv[0]=v[i].hd_uv[1]=0;v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;}
+    for (int i=0;i<6;++i) {
+        v[i].hd_uv[0]=v[i].hd_uv[1]=0;
+        v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;
+        v[i].pgxp_pos[0] = 0.0f;
+        v[i].pgxp_pos[1] = 0.0f;
+        v[i].pgxp_pos[2] = -1.0f;
+        v[i].t = 0;
+    }
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
         v->g = (unsigned char)(*packets >> 8);
@@ -2596,8 +2760,24 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 }
             }
 
-            if (vertex_cur[0].pgxp_pos[2] > 0.0f)
-                tpage |= TPAGE_MODEL;
+            {
+                bool is_model_poly = true;
+                for (int i = 0; i < nVertices; ++i) {
+                    if (!(vertex_cur[i].t & TPAGE_MODEL) ||
+                        vertex_cur[i].pgxp_pos[2] <= 0.0f) {
+                        is_model_poly = false;
+                        break;
+                    }
+                }
+                if (is_model_poly) {
+                    tpage |= TPAGE_MODEL;
+                    if (!geometry_correction) {
+                        for (int i = 0; i < nVertices; ++i) {
+                            vertex_cur[i].pgxp_pos[2] = -1.0f;
+                        }
+                    }
+                }
+            }
             if (nVertices == 4) {
                 Vertex second[3] = {vertex_cur[1], vertex_cur[3],
                                     vertex_cur[2]};
@@ -2717,7 +2897,10 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     lt |= TPAGE_DITHER;
                 }
                 for (int k = 0; k < 4; k++) {
-                    q[k].hd_uv[2]=0;
+                    q[k].hd_uv[0] = q[k].hd_uv[1] = q[k].hd_uv[2] = 0;
+                    q[k].pgxp_pos[0] = (float)q[k].x;
+                    q[k].pgxp_pos[1] = (float)q[k].y;
+                    q[k].pgxp_pos[2] = -1.0f;
                     SET_TC(&q[k], lt, -1);
                 }
                 index_cur[0] = base + 0;
@@ -2822,6 +3005,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
                 vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen&&sprite_atlases_enabled?2:3):(sprite_atlases_enabled?1:0);
             }
+        }
+        for (int i = 0; i < 4; ++i) {
+            vertex_cur[i].pgxp_pos[0] = (float)vertex_cur[i].x;
+            vertex_cur[i].pgxp_pos[1] = (float)vertex_cur[i].y;
+            vertex_cur[i].pgxp_pos[2] = -1.0f;
         }
         SET_TC_ALL(vertex_cur, tpage, clut);
         Draw_EnqueueBuffer(4, 6);
@@ -3189,11 +3377,15 @@ void Draw_FlushBuffer(void) {
             target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
         int start = 0;
         while (start < n_indices) {
-            bool semi = vertex_buf[index_buf[start]].a == 0x80;
+            bool semi = vertex_buf[index_buf[start]].a != 0xFF;
             int end = start + 3;
-            if (!semi)
-                while (end < n_indices && vertex_buf[index_buf[end]].a != 0x80)
+            if (!semi) {
+                while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF)
                     end += 3;
+            } else {
+                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81)
+                    end += 3;
+            }
             /* Three sampled textures, up to two draws (color and mask). Reserve
              * both heaps' worst-case sampler use before any destination copy.
              */
@@ -3213,8 +3405,11 @@ void Draw_FlushBuffer(void) {
                                      ? 0.5f
                                      : 0.0f;
                     bool use_pgxp =
-                        (midpoint || (target_index && geometry_correction &&
-                        (v->t & TPAGE_POLYGON))) && v->pgxp_pos[2] > 0.0f;
+                        (midpoint ||
+                         (target_index &&
+                          (geometry_correction || effect_geometry_correction) &&
+                          (v->t & TPAGE_POLYGON))) &&
+                        v->pgxp_pos[2] > 0.0f;
                     float vx =
                         (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
                     float vy =
@@ -3282,8 +3477,8 @@ void Draw_FlushBuffer(void) {
             const SDL_GPUTextureSamplerBinding sampler_binding[3] = {
                 {.texture=vram_sample,.sampler=vram_sampler},
                 {.texture=destination_sample,.sampler=vram_sampler},
-                {.texture=sprite_atlas_texture ? sprite_atlas_texture : vram_sample,
-                 .sampler=sprite_atlas_texture ? sprite_atlas_sampler : vram_sampler}};
+                {.texture=(sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_texture : vram_sample,
+                 .sampler=(sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_sampler : vram_sampler}};
             SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,3);
             /* The viewport maps shader x to offset * (1 - grid) + x * grid;
              * the shader squeezes around the centre in its own space, so
@@ -3292,7 +3487,11 @@ void Draw_FlushBuffer(void) {
             const float offset_ubo[8] = {
                 (float)draw_offset.x,
                 (float)draw_offset.y,
-                ((target_index != 0 && geometry_correction) ? 1.0f : 0.0f) + (midpoint ? 2.0f : 0.0f),
+                ((target_index != 0 &&
+                  (geometry_correction || effect_geometry_correction))
+                     ? 1.0f
+                     : 0.0f) +
+                    (midpoint ? 2.0f : 0.0f),
                 target_scale > 1 ? 1.0f : 0.0f,
                 ws_squeeze,
                 (target_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,

@@ -228,6 +228,12 @@ int Psyz_VideoGetAntialiasing(void);
 /** Palette-aware bilinear filtering for tagged 3D models only. */
 int Psyz_VideoSetModelFiltering(int enabled);
 int Psyz_VideoGetModelFiltering(void);
+/** Per-frame smooth 3D directional/hemisphere lighting for 3D models. */
+int Psyz_VideoSetDynamicLighting(int enabled);
+int Psyz_VideoGetDynamicLighting(void);
+/** Subpixel PGXP geometry correction for fieldfx spells and special effects. */
+int Psyz_VideoSetEffectGeometryCorrection(int enabled);
+int Psyz_VideoGetEffectGeometryCorrection(void);
 
 /**
  * @brief Widescreen: present a 4:3 game at 16:9 with more of its picture
