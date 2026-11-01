@@ -1016,6 +1016,10 @@ void Psyz_CdPump(void) {
         sync_irq_pending = 0;
         memcpy(res, last_result, sizeof(res));
         cb(last_intr, res);
+    } else if (sync_irq_pending) {
+        /* Nobody listens: the interrupt is acknowledged and dropped, as on hardware. A callback
+         * installed after this point only sees interrupts of later commands. */
+        sync_irq_pending = 0;
     }
     while (budget-- > 0 && data_read_active && CD_cbready && !sync_irq_pending) {
         u_char res[8] = {0};
