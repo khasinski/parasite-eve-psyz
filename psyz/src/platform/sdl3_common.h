@@ -203,6 +203,10 @@ int Psyz_VideoSetAspectMode(PsyzAspectMode mode) {
     if (mode != PSYZ_ASPECT_DISPLAY && mode != PSYZ_ASPECT_SQUARE) {
         return -1;
     }
+#ifdef PE_PS5_GPU_NATIVE
+    /* Finish queued vertices with their old aspect-dependent draw contract. */
+    if(aspect_mode!=mode)Draw_FlushBuffer();
+#endif
     aspect_mode = mode;
     return 0;
 }
@@ -232,6 +236,7 @@ static PsyzVideoStats gpu_stats = {0};
 static unsigned game_speed = 1;
 static Uint64 last_present_time = 0;
 static bool present_skip = false; // this frame is not shown
+static bool frame_presented = false; // swapchain image was acquired and queued this frame
 
 static Uint32 WallVblankCount(void) {
     return (Uint32)((double)SDL_GetTicksNS() * target_frame_rate * game_speed /
@@ -457,9 +462,14 @@ static void WaitForNextFrame(void) {
     Psyz_WebWaitForNextFrame();
 #else
     /* Above normal speed driver VSync no longer paces every frame (most are
-     * not shown), so the limiter does, at the faster rate. */
+     * not shown), so the limiter does, at the faster rate. Also fall back to
+     * software pacing when no swapchain image was presented (e.g. minimized). */
     const double frame_time_us = target_frame_time_us / game_speed;
-    if ((!use_driver_vsync || game_speed > 1) &&
+    bool native_missing_present=false;
+#if defined(PE_PS5) && defined(PE_PS5_GPU_NATIVE)
+    native_missing_present=!frame_presented;
+#endif
+    if ((!use_driver_vsync || native_missing_present || game_speed > 1) &&
         vsync_mode != PSYZ_VSYNC_LIMITLESS) {
         double time_to_wait_us =
             frame_time_us - elapsed_us + drift_compensation;
@@ -808,6 +818,10 @@ int Psyz_SetGamepadBinding_SDL3(unsigned button, int binding) {
 static unsigned int PadRead_Gamepad(struct Gamepad* g) {
     if (!g || !g->dev)
         return 0;
+#ifdef PE_PS5_PLUGINS
+    extern int pe_ps5_mods_capture_pad(SDL_Gamepad *);
+    if (pe_ps5_mods_capture_pad(g->dev)) return 0;
+#endif
     unsigned int result = 0;
     for (unsigned i = 0; i < 16; ++i) {
         int binding = gamepad_p1[i];
@@ -904,10 +918,17 @@ static void BuildPadFrame(int port, PsyzControllerKind kind, char* buf) {
         unsigned char rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
         if (gamepads[port].dev) {
             SDL_Gamepad* d = gamepads[port].dev;
+#ifdef PE_PS5_PLUGINS
+            extern int pe_ps5_mods_capture_pad(SDL_Gamepad *);
+            if (!pe_ps5_mods_capture_pad(d)) {
+#endif
             rx = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTX));
             ry = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTY));
             lx = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTX));
             ly = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTY));
+#ifdef PE_PS5_PLUGINS
+            }
+#endif
         }
         buf[4] = (char)rx;
         buf[5] = (char)ry;
@@ -1043,7 +1064,15 @@ static void PollEvents(void) {
         }
     }
 #ifndef PLATFORM_IOS
-    if (Psyz_QuitRequested()) {
+    if (Psyz_QuitRequested()
+#ifdef PE_PS5_GPU_NATIVE
+        && !native_quit_in_progress
+#endif
+    ) {
+#ifdef PE_PS5_GPU_NATIVE
+        native_quit_in_progress=true;
+        SDL_Log("[Native quit] stage=event-request");
+#endif
         QuitPlatform();
         exit(0);
     }

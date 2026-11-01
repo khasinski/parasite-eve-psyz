@@ -66,6 +66,22 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
 /* Retire queued reads and reuse the bounded atlas storage for a new room. */
 void Psyz_GpuResetSpriteAtlases(void);
 /* Presentation switch; native VRAM remains unchanged. */
+/* Optional display-only midpoint geometry; simulation and native VRAM stay original. */
+int Psyz_GpuSetFrameInterpolation(int enabled);
+int Psyz_GpuGetFrameInterpolation(void);
+int Psyz_GpuGetFrameInterpolationRequested(void);
+float Psyz_GpuGetPresentedFps(void);
+void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b);
+unsigned long long Psyz_GpuGetInterpolatedPresentCount(void);
+void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b);
+void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b);
+void Psyz_GpuSetInterpolationCamera(int x,int y);
+void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b);
+void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to);
+void Psyz_GpuResetInterpolation(void);
+void Psyz_GpuClearInterpolationPackets(void);
+void Psyz_GpuBeginInterpolationFrame(void);
+void Psyz_GpuPrepareInterpolatedPresent(int next_y);
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled);
 int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command
@@ -139,8 +155,43 @@ int Psyz_GpuExeque(void);
  */
 void Psyz_GpuDisplayCommand(unsigned int word);
 
+/* Temporary bounded native resolution-transition metadata observation. */
+void Psyz_GpuTraceResolutionRoom(int buffer_y, unsigned tiles, int left, int right, int hd_available, int hd_left, int hd_right, unsigned long long key, unsigned group, unsigned cells, int sidecar_status);
+
+/* Optional dedicated dialogue alpha sheet,416x520 RGBA; no native VRAM edits. */
+int Psyz_GpuLoadDialogueFont(const unsigned char *rgba,unsigned bytes);
+int Psyz_GpuHasDialogueFont(void);
+int Psyz_GpuDialogueStateIdle(void);
+void Psyz_GpuSetDialogueFontEnabled(int enabled);
+int Psyz_GpuReadDialogueFont(unsigned tpage,unsigned clut,unsigned short *texels,unsigned short *palette);
+/* No downloads in generation query; writes touching font/CLUT invalidate. */
+uint64_t Psyz_GpuWatchDialogueFont(unsigned page,unsigned clut);
+uint64_t Psyz_GpuDialogueFontGeneration(unsigned page,unsigned clut);
+void Psyz_GpuInvalidateDialogueFont(void);
+void Psyz_GpuSelectDialogueGlyph(unsigned code);
+int Psyz_GpuRegisterCommandHandlerIfVacant(unsigned int,PsyzGpuCommandHandler,void *);
+
+/* Native player-owned, exact page/CLUT Duck texture replacements. No mesh change. */
+int Psyz_GpuSetHdModels(int enabled, const char *root);
+/* Explicit reload stages an index, then retires old reads before commit. */
+int Psyz_GpuReloadHdModels(const char *root);
+const char *Psyz_GpuHdModelsRoot(void);
+int Psyz_GpuHdModelsStateSafe(void);
+const char *Psyz_GpuHdModelsStatus(void);
+void Psyz_GpuBeginPlayerTextureSet(int bank);
+void Psyz_GpuRegisterPlayerTexturePage(unsigned page, unsigned clut);
+
+/* Two independent native font alphabets/palettes. Context0 dialogue,1 menu. */
+uint64_t Psyz_GpuWatchFontContext(unsigned context,unsigned page,unsigned clut);
+uint64_t Psyz_GpuFontContextGeneration(unsigned context,unsigned page,unsigned clut);
+void Psyz_GpuSetFontContextEnabled(unsigned context,int enabled);
+int Psyz_GpuHasFontContext(unsigned context);
+int Psyz_GpuLoadFontContext(unsigned context,const unsigned char *rgba,unsigned bytes);
+void Psyz_GpuSelectFontGlyph(unsigned context,unsigned code,unsigned crop,unsigned width);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif
+

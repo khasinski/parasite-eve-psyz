@@ -865,3 +865,42 @@ int RestartCallback(void) {
 }
 
 int CheckCallback(void) { return OwnsKernel() && in_interrupt; }
+
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+static uintptr_t state_kernel_owner;
+int Psyz_StateKernelBegin(void){if(OwnsKernel())return 0;KernelLock();if(in_interrupt||in_critical_section||state_kernel_owner){KernelUnlock();return 0;}state_kernel_owner=Psyz_OsThreadSelf();return 1;}
+void Psyz_StateKernelEnd(void){if(state_kernel_owner==Psyz_OsThreadSelf()&&OwnsKernel()){state_kernel_owner=0;KernelUnlock();}}
+#endif
+
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+#include "psyz/state_producers.h"
+#include "psyz/state_audio.h"
+static long (*state_event_handlers[64])();static unsigned state_event_count;
+static void (*state_callbacks[64])(void);static unsigned state_callback_count;
+static uint32_t state_handler_id(long (*p)()){if(!p)return 0;for(unsigned i=0;i<state_event_count;i++)if(state_event_handlers[i]==p)return i+1;if(state_event_count==64)return UINT32_MAX;state_event_handlers[state_event_count++]=p;return state_event_count;}
+static uint32_t state_callback_id(void (*p)(void)){if(!p)return 0;for(unsigned i=0;i<state_callback_count;i++)if(state_callbacks[i]==p)return i+1;if(state_callback_count==64)return UINT32_MAX;state_callbacks[state_callback_count++]=p;return state_callback_count;}
+static void state_kernel_put(unsigned char *o,uint32_t v){for(unsigned i=0;i<4;i++)o[i]=(unsigned char)(v>>(i*8));}
+static uint32_t state_kernel_get(const unsigned char *i){return(uint32_t)i[0]|(uint32_t)i[1]<<8|(uint32_t)i[2]<<16|(uint32_t)i[3]<<24;}
+int Psyz_StateKernelOwned(void){return state_kernel_owner==Psyz_OsThreadSelf()&&OwnsKernel();}
+#define STATE_KERNEL_BYTES 912u
+size_t Psyz_StateKernelBytes(void){return STATE_KERNEL_BYTES;}
+static int state_kernel_walk(const unsigned char *in,unsigned char *out,int apply){size_t at=8;uint64_t now=KernelNowUs();uint32_t v;
+#define VALUE(value,check) do{v=out?(uint32_t)(value):state_kernel_get(in+at);if(!(check))return 0;if(out)state_kernel_put(out+at,v);else if(apply)(value)=(__typeof__(value))v;at+=4;}while(0)
+#define HANDLER(value) do{v=out?state_handler_id(value):state_kernel_get(in+at);if(v==UINT32_MAX||v>state_event_count)return 0;if(out)state_kernel_put(out+at,v);else if(apply)(value)=v?state_event_handlers[v-1]:0;at+=4;}while(0)
+#define CALLBACK(value) do{v=out?state_callback_id(value):state_kernel_get(in+at);if(v==UINT32_MAX||v>state_callback_count)return 0;if(out)state_kernel_put(out+at,v);else if(apply)(value)=v?state_callbacks[v-1]:0;at+=4;}while(0)
+VALUE(audio_time_fraction,v<PSYZ_SPU_SAMPLE_RATE);long state_clock=AtomicLoad(&audio_clock),state_speed=AtomicLoad(&host_clock_speed),state_paused=AtomicLoad(&host_clock_paused);VALUE(state_clock,v==(uint32_t)AtomicLoad(&audio_clock));VALUE(state_speed,v==(uint32_t)AtomicLoad(&host_clock_speed));VALUE(state_paused,v==(uint32_t)AtomicLoad(&host_clock_paused));
+for(unsigned i=0;i<16;i++){long status=AtomicLoad(&events[i].status);VALUE(status,v==EvStUNUSED||v==EvStWAIT||v==EvStACTIVE||v==EvStALREADY);if(apply&&!out)AtomicStore(&events[i].status,status);VALUE(events[i].desc,1);VALUE(events[i].spec,1);VALUE(events[i].mode,v==0||v==EvMdINTR||v==EvMdNOINTR);HANDLER(events[i].handler);}
+VALUE(irq_mask,!(v&~IRQ_ALL));VALUE(irq_latched,!(v&~IRQ_ALL));VALUE(irq_saved_mask,!(v&~IRQ_ALL));VALUE(callbacks_running,v<=1);for(unsigned i=0;i<4;i++){VALUE(rcnt_auto_ack[i],v<=1);}
+for(unsigned i=0;i<3;i++){RootCounter *c=&counters[i];uint64_t age=c->period_us?now-c->last_us:0,left=c->period_us?c->next_us-now:0;uint32_t lo=(uint32_t)age,hi=(uint32_t)(age>>32),l=(uint32_t)left,h=(uint32_t)(left>>32);VALUE(lo,1);VALUE(hi,1);VALUE(l,1);VALUE(h,1);VALUE(c->period_us,v<=864000000u);VALUE(c->period_frac,1);VALUE(c->frac_acc,1);VALUE(c->clock_hz,1);VALUE(c->ticks_per_us_q15,1);VALUE(c->target,v<=65536);VALUE(c->irq,v<=1);if(!out){uint32_t clock=state_kernel_get(in+at-16),fraction=state_kernel_get(in+at-24),acc=state_kernel_get(in+at-20);if(clock?(fraction>=clock||acc>=clock):(fraction||acc))return 0;uint64_t a=(uint64_t)lo|((uint64_t)hi<<32);int64_t left=(int64_t)((uint64_t)l|((uint64_t)h<<32));if(a>86400000000ull||left< -86400000000ll||left>86400000000ll)return 0;}if(apply&&!out){c->last_us=c->period_us?now-((uint64_t)lo|((uint64_t)hi<<32)):0;c->next_us=c->period_us?now+((uint64_t)l|((uint64_t)h<<32)):0;}}
+VALUE(pending_len,v<=32);for(unsigned i=0;i<32;i++){VALUE(pending[i].desc,1);VALUE(pending[i].spec,1);}
+VALUE(posted_len,v<=16);for(unsigned i=0;i<16;i++){CALLBACK(posted[i]);}
+for(unsigned i=0;i<8;i++){CALLBACK(vsync_callbacks[i]);}for(unsigned i=0;i<IRQ_COUNT;i++){CALLBACK(irq_callbacks[i]);}
+#undef VALUE
+#undef HANDLER
+#undef CALLBACK
+if(apply&&!out){uint64_t deadline=now+MAX_CATCHUP_US;for(unsigned i=0;i<3;i++)if(counters[i].period_us&&IsDue(counters[i].next_us,deadline))deadline=counters[i].next_us;AtomicTimeStore(&poll_deadline_us,deadline);Psyz_OsBellRing(bell_irq);if(pending_len||posted_len)Psyz_OsBellRing(bell_events);}
+return at==STATE_KERNEL_BYTES;}
+int Psyz_StateKernelCapture(unsigned char *out,size_t bytes){if(!out||bytes!=STATE_KERNEL_BYTES||!Psyz_StateKernelOwned()||!Psyz_StateAudioOwned()||AtomicLoad(&event_waiters))return 0;Psyz_OsLock(post_lock);memcpy(out,"PEKERN01",8);int ok=state_kernel_walk(0,out,0);Psyz_OsUnlock(post_lock);return ok;}
+int Psyz_StateKernelValidate(const unsigned char *in,size_t bytes){return in&&bytes==STATE_KERNEL_BYTES&&!memcmp(in,"PEKERN01",8)&&Psyz_StateKernelOwned()&&Psyz_StateAudioOwned()&&!AtomicLoad(&event_waiters)&&state_kernel_walk(in,0,0);}
+int Psyz_StateKernelRestore(const unsigned char *in,size_t bytes){if(!Psyz_StateKernelValidate(in,bytes))return 0;Psyz_OsLock(post_lock);int ok=state_kernel_walk(in,0,1);Psyz_OsUnlock(post_lock);return ok;}
+#endif

@@ -39,6 +39,10 @@ typedef struct {
     float hd_uv[3];
 } Vertex;
 
+#ifdef PSYZ_CAPTURE_INTERPOLATION
+static void InterpCapture(const void *packet,Vertex *v,unsigned count);
+#endif
+
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====
 #define TPAGE_NOTEXTURE 0x8000 // flag untextured poly
 #define TPAGE_DITHER 0x4000    // flag a dithered primitive
@@ -86,6 +90,9 @@ static void Draw_EnqueueBuffer(int vertices, int indices) {
     assert(n_vertices + vertices <= MAX_VERTEX_COUNT);
     assert(n_indices + indices <= MAX_INDEX_COUNT);
 
+#ifdef PSYZ_CAPTURE_INTERPOLATION
+    PSYZ_CAPTURE_INTERPOLATION(vertex_cur,(unsigned)vertices);
+#endif
     vertex_cur += vertices;
     index_cur += indices;
     n_vertices += vertices;
@@ -102,12 +109,18 @@ static int writePacket(Vertex* v, int code, int n, u_long* packet, u16* pOut) {
     }
     v->x = s11(((short*)packet)[0]);
     v->y = s11(((short*)packet)[1]);
-    if (!Psyz_PgxpLookupVertex(
+    v->t = 0;
+    {
+        int pgxp_kind = Psyz_PgxpLookupVertex(
             packet, *(const unsigned int*)packet, &v->pgxp_pos[0],
-            &v->pgxp_pos[1], &v->pgxp_pos[2])) {
-        v->pgxp_pos[0] = (float)v->x + 0.5f;
-        v->pgxp_pos[1] = (float)v->y + 0.5f;
-        v->pgxp_pos[2] = -1.0f;
+            &v->pgxp_pos[1], &v->pgxp_pos[2]);
+        if (!pgxp_kind) {
+            v->pgxp_pos[0] = (float)v->x + 0.5f;
+            v->pgxp_pos[1] = (float)v->y + 0.5f;
+            v->pgxp_pos[2] = -1.0f;
+        } else if (pgxp_kind == 1) {
+            v->t = TPAGE_MODEL;
+        }
     }
     packet++;
     n--;

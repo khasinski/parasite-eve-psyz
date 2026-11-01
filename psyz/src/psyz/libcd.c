@@ -372,6 +372,9 @@ void Psyz_CdShellOpen(int is_open) {
 static void close_track_file(void);
 
 int Psyz_CdSetDiskPath(const char* diskPath) {
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+    extern void Psyz_StateCdChanged(void);Psyz_StateCdChanged();
+#endif
     close_track_file();
     is_disk_loaded = 0;
     g_track_count = 0;
@@ -1308,3 +1311,79 @@ int CdReadSync(int mode, u_char* result) {
 }
 
 void StCdInterrupt(void) { NOT_IMPLEMENTED; }
+
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+#include "psyz/state_audio.h"
+#include "psyz/state_producers.h"
+#include <stdint.h>
+#include <limits.h>
+static uint64_t state_cd_generation=1;
+void Psyz_StateCdChanged(void){if(++state_cd_generation==0)state_cd_generation=1;}
+static CdlCB state_cd_sync,state_cd_ready;static PsyzCdReadCB state_cd_reader;static int state_cd_bound;
+static void state_cd_put(unsigned char *o,uint32_t v){for(unsigned i=0;i<4;i++)o[i]=(unsigned char)(v>>(8*i));}
+static uint32_t state_cd_get(const unsigned char *p){return(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+static int state_cd_canonical(uint32_t v,unsigned k){switch(k){case 1:return v<=255;case 2:return v<=1;case 3:return v<=8;case 4:return v<=CD_BUF_FRAMES;case 5:return v<=XA_DECODED_MAX_FRAMES;case 6:return(int32_t)v>=-32768&&(int32_t)v<=32767;default:return 1;}}
+static int state_cd_walk(const unsigned char *in,unsigned char *out,int apply){size_t at=32;
+#define FIELD(value,kind) do{if(out){state_cd_put(out+at,(uint32_t)(value));}else{uint32_t v=state_cd_get(in+at);if(!state_cd_canonical(v,kind))return 0;if(apply)(value)=(__typeof__(value))v;}at+=4;}while(0)
+FIELD(CD_cbread,0);
+FIELD(CD_debug,0);
+FIELD(CD_status,0);
+FIELD(CD_status1,0);
+FIELD(CD_nopen,0);
+FIELD(CD_mode,1);
+FIELD(CD_com,1);
+FIELD(DS_active,0);
+FIELD(last_result_len,3);
+FIELD(last_intr,0);
+FIELD(is_disk_loaded,2);
+FIELD(data_read_active,2);
+FIELD(data_sector_valid,2);
+FIELD(data_sector_number,0);
+FIELD(data_getsector_count,0);
+FIELD(shell_is_open,2);
+FIELD(cd_buf_pos,4);
+FIELD(cd_buf_count,4);
+FIELD(is_playing,2);
+FIELD(is_muted,2);
+FIELD(need_cdda_rewind,2);
+FIELD(enable_passthrough,2);
+FIELD(xa.active,2);
+FIELD(xa.filter_file,1);
+FIELD(xa.filter_channel,1);
+FIELD(xa.decoded_count,5);
+FIELD(xa.decoded_pos,5);
+FIELD(xa.hist_l_old,0);
+FIELD(xa.hist_l_older,0);
+FIELD(xa.hist_r_old,0);
+FIELD(xa.hist_r_older,0);
+FIELD(xa.phase,0);
+FIELD(xa.cur_abs_sector,0);
+FIELD(xa.stream_ended,2);
+FIELD(xa.silent_sectors_pending,0);
+FIELD(ctx.cd_src_l_dst_l,1);
+FIELD(ctx.cd_src_l_dst_r,1);
+FIELD(ctx.cd_src_r_dst_l,1);
+FIELD(ctx.cd_src_r_dst_r,1);
+FIELD(ctx.adpcm_mute,1);
+FIELD(ctx.is_stereo,1);
+FIELD(ctx.sample_rate,1);
+FIELD(ctx.bits_per_sample,1);
+FIELD(ctx.emphasis,1);
+FIELD(CD_pos.minute,1);
+FIELD(CD_pos.second,1);
+FIELD(CD_pos.sector,1);
+FIELD(CD_pos.track,1);
+for(unsigned i=0;i<8;i++){FIELD(last_result[i],1);}
+for(unsigned i=0;i<2352;i++){FIELD(data_sector[i],1);}
+for(unsigned i=0;i<CD_BUF_FRAMES*2;i++){FIELD(cd_buf[i],6);}
+for(unsigned i=0;i<XA_DECODED_MAX_FRAMES*2;i++){FIELD(xa.decoded[i],6);}
+for(unsigned i=0;i<4;i++){FIELD(xa.rh_l[i],6);FIELD(xa.rh_r[i],6);}
+#undef FIELD
+return at==79584;}
+size_t Psyz_StateCdBytes(void){return 79584;}
+static int state_cd_bindings(void){return Psyz_StateAudioOwned()&&Psyz_StateKernelOwned()&&state_cd_bound&&state_cd_sync==CD_cbsync&&state_cd_ready==CD_cbready&&state_cd_reader==disk_read_cb;}
+int Psyz_StateCdCapture(unsigned char *out,size_t bytes){if(!out||bytes!=79584||!Psyz_StateAudioOwned()||!Psyz_StateKernelOwned()||data_read_active)return 0;if(!state_cd_bound){state_cd_sync=CD_cbsync;state_cd_ready=CD_cbready;state_cd_reader=disk_read_cb;state_cd_bound=1;}if(!state_cd_bindings())return 0;uint32_t track=0;if(track_file){for(int i=0;i<g_track_count;i++)if(track_file_track==&g_tracks[i])track=i+1;if(!track)return 0;}long pos=track_file?ftell(track_file):0;if(pos<0)return 0;memcpy(out,"PECD001!",8);state_cd_put(out+8,(uint32_t)state_cd_generation);state_cd_put(out+12,(uint32_t)(state_cd_generation>>32));state_cd_put(out+16,track);state_cd_put(out+20,(uint32_t)(uint64_t)pos);state_cd_put(out+24,(uint32_t)((uint64_t)pos>>32));state_cd_put(out+28,g_track_count);return state_cd_walk(0,out,0);}
+int Psyz_StateCdValidate(const unsigned char *in,size_t bytes){if(!in||bytes!=79584||memcmp(in,"PECD001!",8)||!state_cd_bindings())return 0;uint64_t generation=(uint64_t)state_cd_get(in+8)|((uint64_t)state_cd_get(in+12)<<32),pos=(uint64_t)state_cd_get(in+20)|((uint64_t)state_cd_get(in+24)<<32);uint32_t track=state_cd_get(in+16);if(generation!=state_cd_generation||state_cd_get(in+28)!=(uint32_t)g_track_count||track>(uint32_t)g_track_count||pos>LONG_MAX||(!track&&pos)||data_read_active)return 0;if(track&&!g_tracks[track-1].is_valid)return 0;if(state_cd_get(in+76)||state_cd_get(in+96)>state_cd_get(in+100)||state_cd_get(in+136)>state_cd_get(in+132)||state_cd_get(in+156)>0x20000u||state_cd_get(in+168)>XA_MAX_SECTOR_GAP)return 0;return state_cd_walk(in,0,0);}
+int Psyz_StateCdRestore(const unsigned char *in,size_t bytes){if(!Psyz_StateCdValidate(in,bytes))return 0;uint32_t track=state_cd_get(in+16);uint64_t pos=(uint64_t)state_cd_get(in+20)|((uint64_t)state_cd_get(in+24)<<32);FILE *next=0;if(track){next=fopen(g_tracks[track-1].file_path,"rb");if(!next)return 0;if(fseek(next,(long)pos,SEEK_SET)){fclose(next);return 0;}}/* New validated handle exists before old one is released. */
+FILE *previous=track_file;track_file=next;track_file_track=track?&g_tracks[track-1]:0;if(previous)fclose(previous);return state_cd_walk(in,0,1);}
+#endif

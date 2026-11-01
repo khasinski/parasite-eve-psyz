@@ -84,7 +84,16 @@ vec4 fetchModelTexel(ivec2 position) {
 void main() {
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
-    if (hdUV.z>1.5) {
+    // Explicit queued dialogue glyph: new alpha is presentation-only.
+    // BLEND_ADD consumes premultiplied color + source coverage. Raw VRAM
+    // retains exactly the original sprite/palette/mask behavior below.
+    if(hdUV.z>3.5 && hdUV.z<4.5 && passMode.y>1u){
+        if(passMode.x==1u)discard;
+        vec4 glyph=texture(texHD,hdUV.xy);
+        vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+        FragColor=vec4(clamp(glyph.rgb*tint,0.0,1.0)*glyph.a,glyph.a);return;
+    }
+    if (hdUV.z>1.5 && hdUV.z<3.5) {
         if (hdUV.z>2.5 || passMode.y<=1u) discard;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
         vec4 material=texture(texHD,hdUV.xy);
@@ -94,7 +103,10 @@ void main() {
     }
     vec4 texColor=textureMode==0u ? vec4(1,1,1,2) :
         fetchModelTexel(ivec2(resolveTexel()));
-    if ((passMode.w & 1u)!=0u && model!=0u && textureMode!=0u) {
+    if (textureMode!=0u && (passMode.w & 1u)!=0u && model!=0u && polygon!=0u) {
+        // Model-only filtering. SPRT also carries field/background tiles: changing
+        // their native sample breaks exact HD reference matching and reveals
+        // tile rectangles. Bit4 intentionally does not enable that unsafe path.
         vec2 pos=rawUV-vec2(0.5);
         ivec2 lo=ivec2(uvBounds.xy),hi=ivec2(uvBounds.zw);
         ivec2 origin=ivec2(floor(pos));vec2 weight=fract(pos);
@@ -141,7 +153,7 @@ void main() {
     bool enhancedPixel=false;
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
-    if (passMode.y>1u && hdUV.z>0.5 && textureMode!=0u) {
+    if (passMode.y>1u && hdUV.z>0.5 && hdUV.z<1.5 && textureMode!=0u) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
@@ -151,6 +163,13 @@ void main() {
             modColor=clamp(enhanced*tint,0.0,1.0);
             enhancedPixel=true;
         }
+    }
+    // Exact source-page/CLUT matching owns identity; native texel still owns
+    // transparent cutouts, STP, mask writes and blend classification.
+    if (passMode.y>1u && hdUV.z>4.5 && polygon!=0u && textureMode!=0u) {
+        vec3 enhanced=texture(texHD,hdUV.xy).rgb;
+        vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+        modColor=clamp(enhanced*tint,0.0,1.0);enhancedPixel=true;
     }
     if (passMode.x == 2u && (enhancedPixel || (passMode.w & 2u) != 0u)) {
         if (colorSemiTrans && isSemiTrans) {

@@ -7,6 +7,20 @@
 extern "C" {
 #endif
 
+/* Terminal GPU state: borrowed error string valid until process exit. No
+ * retry/reinitialization or CPU fallback after failure. Main loop also receives
+ * SDL_EVENT_QUIT; callers can distinguish it from an ordinary user Quit. */
+int Psyz_GpuFailed(void);
+const char *Psyz_GpuFirstError(void);
+int Psyz_GpuRetirementUncertain(void);
+/* One bounded diagnostic on the next prepared viewport; no rendering policy change. */
+void Psyz_GpuTraceAspectOnce(const char *phase);
+/* Optional native FSR1, default off. Strength stops0(strong)..2(soft).
+ * Status0 off,1 bypassed,2 EASU+RCAS recorded,3 original fallback. */
+void Psyz_VideoSetFsr1(int enabled,int sharpness);
+int Psyz_VideoGetFsr1Status(void);
+void Psyz_VideoSetMovieBlur(int enabled);
+
 // Called once after SDL3/SDL_GPU initialization completes.
 // Use this to initialize overlay backends (e.g., ImGui_ImplSDLGPU3_Init).
 // Query swapchain texture format with SDL_GetGPUSwapchainTextureFormat.

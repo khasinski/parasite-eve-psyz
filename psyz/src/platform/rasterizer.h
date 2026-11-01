@@ -28,5 +28,25 @@ typedef struct {
 extern const DrawBackend software_rasterizer;
 void SoftwareRasterizer_Reset(void);
 const u16* SoftwareRasterizer_GetVram(void);
+void SoftwareRasterizer_InvalidateMaterial(void);
+void SoftwareRasterizer_MaterialCoverage(unsigned long long *covered,unsigned long long *total);
+void SoftwareRasterizer_SetMaterialSampler(
+    int (*sample)(unsigned,unsigned,uint16_t,uint16_t[4]));
 
 #endif
+
+void SoftwareRasterizer_Begin2x(int,int,int,int,int);
+unsigned char *SoftwareRasterizer_Alloc2x(int,int,int,int,int);
+void SoftwareRasterizer_FreeGeometry(void);
+void SoftwareRasterizer_ReleaseGeometryFrame(void *pixels);
+int SoftwareRasterizer_GeometryReason(void);
+
+void SoftwareRasterizer_Reject2x(void);
+
+/* CPU wide pages never alias canonical VRAM or the ordinary geometry epoch. */
+void SoftwareRasterizer_WideBegin(int slot,int x,int y,int w,int h,int scale);
+void SoftwareRasterizer_WideContext(int slot,int centred,int field,int shift,float qx,float qy);
+void SoftwareRasterizer_WideReset(void);
+void SoftwareRasterizer_WideReject(void);
+unsigned char *SoftwareRasterizer_WideOutput(int x,int y,int w,int h,int scale,int *ow,int *oh);
+void SoftwareRasterizer_SetExtensionSampler(int (*sample)(unsigned,unsigned,unsigned,unsigned,unsigned,uint16_t*));

@@ -4,6 +4,10 @@
 #include <string.h>
 #include "../internal.h"
 #include "rasterizer.h"
+static bool pe2_sample_visible,pe2_material_used;
+#define PE2_MATERIAL_USED pe2_material_used
+#define PE2_SAMPLE_VISIBLE(value) (pe2_sample_visible)
+#include "cpu-raster2x.h"
 
 typedef struct {
     int x, y;
@@ -13,6 +17,7 @@ typedef struct {
     int x, y;
     int u, v;
     int r, g, b;
+    double fx; /* exact horizontal-grid fraction, presentation only */
 } SwVertex;
 
 #define SEMITRANSP 0x02
@@ -22,6 +27,72 @@ typedef struct {
 #define TRIANGLE 0x20
 
 static u16 vram[VRAM_W * VRAM_H];
+static Pe2Frame raster2x;
+#ifdef PE_PS5
+static PeRenderBuffer geometry_rgb;
+static PeRenderBuffer wide_rgb;
+#endif
+void SoftwareRasterizer_ReleaseGeometryFrame(void *pixels){
+#ifdef PE_PS5
+ if(pixels && (pixels==geometry_rgb.data || pixels==wide_rgb.data))return;
+#endif
+ free(pixels);
+}
+void SoftwareRasterizer_Reject2x(void) { Pe2Reject(&raster2x); SoftwareRasterizer_WideReject(); }
+void SoftwareRasterizer_Begin2x(int x,int y,int w,int h,int scale) {
+    (void)Pe2Begin(&raster2x,scale,vram,VRAM_W,x,y,w,h);
+}
+void SoftwareRasterizer_FreeGeometry(void) {
+    SoftwareRasterizer_WideReset();
+#ifdef PE_PS5
+    raster2x.active=false;raster2x.failed=true;
+    bool rgb_ok=PeRenderRelease(&geometry_rgb),native_ok=PeRenderRelease(&raster2x.direct);
+    /* Drop the alias immediately after successful unmap, even when physical
+     * release or the independent RGB arena needs a later teardown retry. */
+    raster2x.pixels=raster2x.direct.data;
+    if(!raster2x.pixels)raster2x.capacity=0;
+    if(rgb_ok && native_ok)memset(&raster2x,0,sizeof(raster2x));
+#else
+    free(raster2x.pixels);memset(&raster2x,0,sizeof(raster2x));
+#endif
+}
+int SoftwareRasterizer_GeometryReason(void) {
+    return raster2x.reason ? raster2x.reason : PE2_EMPTY;
+}
+unsigned char *SoftwareRasterizer_Alloc2x(int x,int y,int w,int h,int scale) {
+    if(raster2x.scale!=scale){Pe2RejectReason(&raster2x,PE2_CONFIG);return NULL;}
+    const u16 *src=Pe2Output(&raster2x,x,y,w,h);
+    if(!src)return NULL;
+    size_t count=(size_t)raster2x.w*raster2x.h;
+    if(count>PE2_MAX_PIXELS){Pe2RejectReason(&raster2x,PE2_BOUNDS);return NULL;}
+#ifdef PE_PS5
+    unsigned char *out=PeRenderReserve(&geometry_rgb,PE2_MAX_PIXELS*3)?geometry_rgb.data:NULL;
+#else
+    unsigned char *out=malloc(count*3);
+#endif
+    if(!out){Pe2RejectReason(&raster2x,PE2_ALLOC);return NULL;}
+    for(size_t i=0;i<count;++i) {
+        u16 c=src[i];
+        out[i*3]=(unsigned char)(((c&31)<<3)|((c&31)>>2));
+        out[i*3+1]=(unsigned char)((((c>>5)&31)<<3)|(((c>>5)&31)>>2));
+        out[i*3+2]=(unsigned char)((((c>>10)&31)<<3)|(((c>>10)&31)>>2));
+    }
+    return out;
+}
+
+/* Ordered materials borrow the immediately following primitive selection.
+ * No independent shadow, heap frame, texture authority or final overpaint. */
+static int (*material_sample)(unsigned,unsigned,uint16_t,uint16_t[4]);
+void SoftwareRasterizer_InvalidateMaterial(void) {
+    /* No detached detail exists. Direct writes already synchronize geometry;
+     * atlas reset separately rejects the in-flight epoch before freeing art. */
+}
+void SoftwareRasterizer_SetMaterialSampler(
+    int (*sample)(unsigned,unsigned,uint16_t,uint16_t[4])) {material_sample=sample;}
+void SoftwareRasterizer_MaterialCoverage(unsigned long long *covered,unsigned long long *total) {
+    *covered=raster2x.material_covered;*total=raster2x.material_total;
+}
+
 static bool dither_enabled;
 
 static int SoftwareDither(void) {
@@ -31,6 +102,7 @@ static Point draw_offset;
 static Point draw_area_start;
 static Point draw_area_end = {VRAM_W - 1, VRAM_H - 1};
 static u16 cur_tpage;
+static bool pe2_sprite_mode_unsupported;
 static u8 twin_and_x = 0xff;
 static u8 twin_and_y = 0xff;
 static u8 twin_or_x;
@@ -62,14 +134,11 @@ static u16 PackColor(int r, int g, int b, bool mask) {
                  (mask ? 0x8000 : 0));
 }
 
-static void WritePixel(int x, int y, u16 src, bool semi, int abr) {
-    if (x < draw_area_start.x || x > draw_area_end.x || y < draw_area_start.y ||
-        y > draw_area_end.y || x < 0 || x >= VRAM_W || y < 0 || y >= VRAM_H) {
-        return;
-    }
-    u16* out = &vram[y * VRAM_W + x];
+/* Shared native RGB555 destination semantics; caller owns addressing. */
+static bool NativeDestinationWrite(u16 *out,u16 src,bool semi,int abr,
+    bool set_mask_bit,bool preserve_masked) {
     if (preserve_masked && (*out & 0x8000)) {
-        return;
+        return false;
     }
     if (semi) {
         u16 dst = *out;
@@ -105,6 +174,30 @@ static void WritePixel(int x, int y, u16 src, bool semi, int abr) {
     }
     *out =
         (u16)((src & 0x7fff) | ((src | (set_mask_bit ? 0x8000 : 0)) & 0x8000));
+    return true;
+}
+
+static bool WritePixelSource(int x,int y,u16 src,bool semi,int abr,const u16 *material) {
+    if (x < draw_area_start.x || x > draw_area_end.x || y < draw_area_start.y ||
+        y > draw_area_end.y || x < 0 || x >= VRAM_W || y < 0 || y >= VRAM_H) {
+        return false;
+    }
+    u16* out = &vram[y * VRAM_W + x];
+    if (!NativeDestinationWrite(out,src,semi,abr,set_mask_bit,preserve_masked)) return false;
+    if(raster2x.active && !raster2x.failed && raster2x.scale==1 &&
+       x>=raster2x.page_x && x<raster2x.page_x+raster2x.w &&
+       y>=raster2x.page_y && y<raster2x.page_y+raster2x.h) {
+        u16 *destination=&raster2x.pixels[(y-raster2x.page_y)*raster2x.w+x-raster2x.page_x];
+        if(NativeDestinationWrite(destination,material?*material:src,semi,abr,set_mask_bit,preserve_masked)) {
+            raster2x.drawn=true;
+            if(material)++raster2x.material_covered;
+        }
+    }
+    return true;
+}
+
+static bool WritePixel(int x,int y,u16 src,bool semi,int abr) {
+    return WritePixelSource(x,y,src,semi,abr,NULL);
 }
 
 static u16 SampleTexture(int u, int v, u16 tpage, u16 clut) {
@@ -165,9 +258,87 @@ static bool IsTopLeft(const SwVertex* a, const SwVertex* b) {
     return dy < 0 || (dy == 0 && dx > 0);
 }
 
+static int Pe2Dither(int x,int y) {return dither[y&3][x&3];}
+static u16 Pe2PackDither(int r,int g,int b,int d) {
+    return PackColor((r+d)>>3,(g+d)>>3,(b+d)>>3,false);
+}
+typedef struct {u16 tpage,clut;int r,g,b;bool raw;bool do_dither;bool material;} Pe2Texture;
+static u16 Pe2NativeSample(void *ctx,int u,int v,int local_x,int local_y,int scale) {
+    Pe2Texture *t=ctx;u16 texel=SampleTexture(u,v,t->tpage,t->clut);
+    bool visible=texel!=0;
+    pe2_material_used=false;
+    /* Native zero/STP and reference equality precede any art substitution.
+     * The atlas producer uses cell i per 16x16 sprite; px/py are sprite-local,
+     * not texture-page UV. API supplies four samples at atlas offsets 1 and 3
+     * inside each 4x4 source texel. Higher scales reuse those exact samples. */
+    if(texel && t->material && material_sample && scale>0) {
+        unsigned px=(unsigned)(local_x/scale),py=(unsigned)(local_y/scale);
+        u16 samples[4];
+        if(material_sample(px,py,texel,samples)) {
+            unsigned sx=(unsigned)(((local_x%scale)*2+1)/scale);
+            unsigned sy=(unsigned)(((local_y%scale)*2+1)/scale);
+            texel=(u16)((samples[sy*2+sx]&0x7fff)|(texel&0x8000));
+            pe2_material_used=true;
+        }
+    }
+    /* Test source zero before modulation: nonzero texels tinted black still write. */
+    pe2_sample_visible=visible;
+    if(!visible)return 0;
+    return ShadeTexel(texel,t->r,t->g,t->b,t->raw,0,0,false);
+}
+static u16 Pe2NativePolygonSample(void *ctx,int u,int v,int r,int g,int b,int x,int y) {
+    Pe2Texture *t=ctx;u16 texel=SampleTexture(u,v,t->tpage,t->clut);
+    /* Transparency precedes shading; a nonzero texel modulated to black writes.
+     * Raw texture bypasses all vertex RGB through the native shader. */
+    pe2_sample_visible=texel!=0;
+    if(!texel)return 0;
+    return ShadeTexel(texel,r,g,b,t->raw,x,y,t->do_dither && !t->raw);
+}
+/* Full possible 256x256 direct texture footprint, including X wrap.
+ * Compare against every potential canonical destination, not display alone.
+ * Windowing can only reduce this footprint. No snapshots or feedback from 2x. */
+static bool Pe2TextureDisjoint(SwVertex a,SwVertex b,SwVertex c,u16 tpage,u16 clut) {
+    int x0=CLAMP(Min3(a.x,b.x,c.x),0,1023);
+    int x1=CLAMP(Max3(a.x,b.x,c.x),0,1023);
+    int y0=CLAMP(Min3(a.y,b.y,c.y),0,511);
+    int y1=CLAMP(Max3(a.y,b.y,c.y),0,511);
+    int ty=((tpage>>4)&1)*256,tx=(tpage&15)*64;
+    int depth=(tpage>>7)&3;
+    if(depth==3)return false;
+    /* Include all possible packed words, then the entire wrapped CLUT. */
+    if(!(y1<ty || y0>ty+255)) {
+        int words=256>>(2-depth);
+        for(int u=0;u<words;++u){int x=(tx+u)&1023;if(x>=x0 && x<=x1)return false;}
+    }
+    if(depth<2) {
+        int cy=(clut>>6)&511,cx=(clut&63)*16;
+        if(cy>=y0 && cy<=y1)for(int i=0;i<(depth?256:16);++i) {
+            int x=(cx+i)&1023;if(x>=x0 && x<=x1)return false;
+        }
+    }
+    return true;
+}
+#include "cpu-widescreen.h"
+
 static void RasterTriangle(
     SwVertex a, SwVertex b, SwVertex c, bool textured, bool raw_texture,
-    bool semi, bool gouraud, u16 tpage, u16 clut, bool centered) {
+    bool semi, bool gouraud, u16 tpage, u16 clut, bool centered, bool owned_line) {
+    if(!owned_line)WideTriangle(a,b,c,textured,raw_texture,semi,gouraud,tpage,clut,centered,owned_line);
+    if(raster2x.active && !raster2x.failed && raster2x.scale>1) {
+        Pe2Scissor(&raster2x,draw_area_start.x,draw_area_start.y,
+                   draw_area_end.x,draw_area_end.y);
+        Pe2Vertex pa={a.x,a.y,a.u,a.v,a.r,a.g,a.b};
+        Pe2Vertex pb={b.x,b.y,b.u,b.v,b.r,b.g,b.b};
+        Pe2Vertex pc={c.x,c.y,c.u,c.v,c.r,c.g,c.b};
+        Pe2Texture source={tpage,clut,a.r,a.g,a.b,raw_texture,SoftwareDither()!=0};
+        if(centered && owned_line && !textured && gouraud) {
+            (void)Pe2CenteredLineTriangle(&raster2x,pa,pb,pc,SoftwareDither()!=0,
+                (Pe2Paint){semi,set_mask_bit,preserve_masked,(tpage>>5)&3,NativeDestinationWrite});
+        } else (void)Pe2Triangle(&raster2x,pa,pb,pc,
+            gouraud,SoftwareDither()!=0,textured?Pe2NativePolygonSample:NULL,&source,
+            (Pe2Paint){semi,set_mask_bit,preserve_masked,(tpage>>5)&3,NativeDestinationWrite},
+            (textured && (((tpage>>7)&3)==3 || !Pe2TextureDisjoint(a,b,c,tpage,clut))) || centered);
+    }
     SwVertex anchor = b.x <= a.x ? (c.x <= b.x ? c : b) : (c.x < a.x ? c : a);
     int64_t area =
         (int64_t)(b.x - a.x) * (c.y - a.y) - (int64_t)(b.y - a.y) * (c.x - a.x);
@@ -281,6 +452,7 @@ static SwVertex VertexXY(u32 word, u32 color) {
         v.x = draw_offset.x +
               (v.x - draw_offset.x) * (int)grid_target / (int)grid_source;
     }
+    v.fx = (double)Sign11(word)*(double)grid_target/(double)grid_source + draw_offset.x-v.x;
     v.r = color & 0xff;
     v.g = (color >> 8) & 0xff;
     v.b = (color >> 16) & 0xff;
@@ -288,9 +460,19 @@ static SwVertex VertexXY(u32 word, u32 color) {
 }
 
 static void DrawLine(SwVertex a, SwVertex b, bool semi, u16 tpage) {
+    WideLine(a,b,semi,tpage);
     int dx = abs(b.x - a.x);
     int dy = abs(b.y - a.y);
     if (!dx && !dy) {
+        if(raster2x.active && !raster2x.failed && raster2x.scale>1) {
+            Pe2Scissor(&raster2x,draw_area_start.x,draw_area_start.y,
+                       draw_area_end.x,draw_area_end.y);
+            /* Native single point: first endpoint RGB, no dither, each owned
+             * destination lane independently observes ABR and mask policy. */
+            (void)Pe2Rectangle(&raster2x,a.x,a.y,1,1,0,0,
+                PackColor(a.r>>3,a.g>>3,a.b>>3,false),NULL,NULL,
+                (Pe2Paint){semi,set_mask_bit,preserve_masked,(tpage>>5)&3,NativeDestinationWrite},false);
+        }
         WritePixel(a.x, a.y, PackColor(a.r >> 3, a.g >> 3, a.b >> 3, false),
                    semi, (tpage >> 5) & 3);
         return;
@@ -317,13 +499,31 @@ static void DrawLine(SwVertex a, SwVertex b, bool semi, u16 tpage) {
     q2.y += ey + oy;
     q3.x += ox;
     q3.y += oy;
-    RasterTriangle(q0, q1, q2, false, false, semi, true, tpage, 0, true);
-    RasterTriangle(q0, q2, q3, false, false, semi, true, tpage, 0, true);
+    RasterTriangle(q0, q1, q2, false, false, semi, true, tpage, 0, true, true);
+    RasterTriangle(q0, q2, q3, false, false, semi, true, tpage, 0, true, true);
 }
 
 static void RasterSprite(
     const SwVertex* origin, int w, int source_w, int h, int u, int v,
     bool textured, bool raw_texture, bool semi, u16 clut) {
+    WideSprite(origin,w,source_w,h,u,v,textured,raw_texture,semi,clut);
+#ifdef PE_PS5
+    if(wide_extension)return; /* extension has no canonical primitive */
+#endif
+    if(raster2x.active && !raster2x.failed && raster2x.scale>1) {
+        Pe2Scissor(&raster2x,draw_area_start.x,draw_area_start.y,
+                   draw_area_end.x,draw_area_end.y);
+        SwVertex end=*origin;end.x+=w>0?w-1:0;end.y+=h>0?h-1:0;
+        Pe2Texture source={cur_tpage,clut,origin->r,origin->g,origin->b,raw_texture,false,
+            textured && w==16 && source_w==16 && h==16 &&
+            twin_and_x==255 && twin_and_y==255 && !twin_or_x && !twin_or_y};
+        bool unsupported=pe2_sprite_mode_unsupported || w!=source_w ||
+            (textured && !Pe2TextureDisjoint(*origin,end,end,cur_tpage,clut));
+        (void)Pe2Rectangle(&raster2x,origin->x,origin->y,w,h,u,v,
+            PackColor(origin->r>>3,origin->g>>3,origin->b>>3,false),
+            textured?Pe2NativeSample:NULL,&source,
+            (Pe2Paint){semi,set_mask_bit,preserve_masked,(cur_tpage>>5)&3,NativeDestinationWrite},unsupported);
+    }
     int abr = (cur_tpage >> 5) & 3;
     for (int py = 0; py < h; py++) {
         int y = origin->y + py;
@@ -353,13 +553,34 @@ static void RasterSprite(
                 color = PackColor(
                     origin->r >> 3, origin->g >> 3, origin->b >> 3, false);
             }
-            WritePixel(x, y, color, blend, abr);
+
+            u16 material_color=0;const u16 *replacement=NULL;
+            if(raster2x.active && !raster2x.failed && raster2x.scale==1 && textured) {
+                ++raster2x.material_total;
+                if(material_sample && w==16 && source_w==16 && h==16 &&
+                   !pe2_sprite_mode_unsupported && twin_and_x==255 && twin_and_y==255 &&
+                   !twin_or_x && !twin_or_y) {
+                    u16 samples[4];
+                    u16 basis=SampleTexture(u+px,v+py,cur_tpage,clut);
+                    if(material_sample((unsigned)px,(unsigned)py,basis,samples)) {
+                        /* Native pixel center selects the lower/right 2x lane. */
+                        material_color=ShadeTexel((samples[3]&0x7fff)|(basis&0x8000),
+                            origin->r,origin->g,origin->b,raw_texture,x,y,false);
+                        replacement=&material_color;
+                    }
+                }
+            }
+            WritePixelSource(x,y,color,blend,abr,replacement);
         }
     }
 }
 
 static void Software_Reset(void) {
+    SoftwareRasterizer_WideReject();
+    Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();
+    SoftwareRasterizer_InvalidateMaterial();
     cur_tpage = 0;
+    pe2_sprite_mode_unsupported=false;
     draw_offset = (Point){0, 0};
     draw_area_start = (Point){0, 0};
     draw_area_end = (Point){VRAM_W - 1, VRAM_H - 1};
@@ -369,6 +590,7 @@ static void Software_Reset(void) {
 static void Software_SetTexpageMode(ParamDrawTexpageMode* p) {
     u16 mode = *(u16*)p;
     cur_tpage = mode & 0x1ff;
+    pe2_sprite_mode_unsupported=p->tex_flip_x || p->tex_flip_y || p->tex_y_extra_vram;
     dither_enabled = (mode & 0x200) != 0;
 }
 
@@ -408,12 +630,15 @@ static void Software_SetMask(int bit0, int bit1) {
 }
 
 static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+    SoftwareRasterizer_InvalidateMaterial();
     u16 color = PackColor(r >> 3, g >> 3, b >> 3, set_mask_bit);
+    WideClear(rect,color);
     int x0 = CLAMP(rect->x, 0, VRAM_W);
     int y0 = CLAMP(rect->y, 0, VRAM_H);
     int x1 = CLAMP(rect->x + rect->w, 0, VRAM_W);
     int y1 = CLAMP(rect->y + rect->h, 0, VRAM_H);
     for (int y = y0; y < y1; y++) {
+        Pe2ClearSpan(&raster2x,x0,y,x1-x0,color,preserve_masked);
         for (int x = x0; x < x1; x++) {
             u16* p = &vram[y * VRAM_W + x];
             if (!preserve_masked || !(*p & 0x8000)) {
@@ -424,6 +649,8 @@ static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
 }
 
 static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
+    SoftwareRasterizer_WideReject();
+    SoftwareRasterizer_InvalidateMaterial();
     if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
@@ -433,6 +660,8 @@ static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
         for (int y = 0; y < rect->h; y++) {
             memcpy(&vram[(rect->y + y) * VRAM_W + rect->x], &src[y * rect->w],
                    (size_t)rect->w * sizeof(u16));
+            Pe2CanonicalSpan(&raster2x,rect->x,rect->y+y,rect->w,
+                &vram[(rect->y+y)*VRAM_W+rect->x]);
         }
         return;
     }
@@ -442,6 +671,7 @@ static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
             int vy = rect->y + y;
             if ((unsigned)vx < VRAM_W && (unsigned)vy < VRAM_H) {
                 vram[vy * VRAM_W + vx] = src[y * rect->w + x];
+                Pe2CanonicalSpan(&raster2x,vx,vy,1,&vram[vy*VRAM_W+vx]);
             }
         }
     }
@@ -473,6 +703,8 @@ static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
 }
 
 static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
+    SoftwareRasterizer_WideReject();
+    SoftwareRasterizer_InvalidateMaterial();
     int src_x = CLAMP(rect->x, 0, VRAM_W - 1);
     int src_y = CLAMP(rect->y, 0, VRAM_H - 1);
     int dst_x = CLAMP((int)x, 0, VRAM_W - 1);
@@ -489,14 +721,40 @@ static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     for (int row = 0; row < h; row++) {
         memmove(&vram[(dst_y + row) * VRAM_W + dst_x],
                 &vram[(src_y + row) * VRAM_W + src_x], (size_t)w * sizeof(u16));
+        Pe2CanonicalSpan(&raster2x,dst_x,dst_y+row,w,
+            &vram[(dst_y+row)*VRAM_W+dst_x]);
     }
 }
 
 static int Software_PushPrim(u_long* words, int max_len) {
     if (max_len <= 0) {
+        Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();
         return 0;
     }
     int code = (int)(words[0] >> 24);
+    /* Only native F2/F3/F4/G2/G3/G4 opcodes, plus their semi variants.
+     * Validate the complete packet before any shadow or canonical line write.
+     * 0x44/0x54 and raw/reserved variants remain unsupported. */
+    bool supported_line=code==0x40 || code==0x42 || code==0x48 || code==0x4a ||
+        code==0x4c || code==0x4e || code==0x50 || code==0x52 ||
+        code==0x58 || code==0x5a || code==0x5c || code==0x5e;
+    if(supported_line) {
+        int points=((code>>2)&3)+1;if(points==1)points=2;
+        bool padding=(code&0x0c)!=0;
+        int required=1+points+(points-1)*((code&0x10)!=0)+padding;
+        if(max_len<required || (padding && words[required-1]!=0x55555555u)) {
+            Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();return max_len<required?max_len:required;
+        }
+        if(grid_source!=grid_target)Pe2Reject(&raster2x);
+    }
+    /* Flat/Gouraud triangle/quad, supported lines and existing sprite packets only.
+     * All unsupported commands poison the entire epoch, never a partial mix. */
+    if(!supported_line && code!=0x20 && code!=0x28 && code!=0x24 && code!=0x25 && code!=0x2c && code!=0x2d &&
+       code!=0x30 && code!=0x38 && code!=0x34 && code!=0x35 && code!=0x3c && code!=0x3d &&
+       code!=0x60 && code!=0x68 && code!=0x70 && code!=0x78 &&
+       code!=0x64 && code!=0x65 && code!=0x6c && code!=0x6d &&
+       code!=0x74 && code!=0x75 && code!=0x7c && code!=0x7d)
+        {Pe2Reject(&raster2x); if(!WideOpcodeSupported(code))SoftwareRasterizer_WideReject();}
     bool textured = (code & TEXTURED) != 0;
     bool gouraud = (code & GOURAUD) != 0;
     bool semi = (code & SEMITRANSP) != 0;
@@ -507,6 +765,7 @@ static int Software_PushPrim(u_long* words, int max_len) {
     if (polygon && (code & TRIANGLE)) {
         int count = (code & EXTRA_VERTEX) ? 4 : 3;
         int required = 1 + count * (1 + textured) + (count - 1) * gouraud;
+        if(max_len<required){Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();}
         if (max_len < required) {
             return max_len;
         }
@@ -531,10 +790,10 @@ static int Software_PushPrim(u_long* words, int max_len) {
             }
         }
         RasterTriangle(v[0], v[1], v[2], textured, raw_texture, semi, gouraud,
-                       tpage, clut, false);
+                       tpage, clut, false, false);
         if (count == 4) {
             RasterTriangle(v[1], v[3], v[2], textured, raw_texture, semi,
-                           gouraud, tpage, clut, false);
+                           gouraud, tpage, clut, false, false);
         }
         return at;
     }
@@ -546,6 +805,7 @@ static int Software_PushPrim(u_long* words, int max_len) {
         }
         int required = 1 + points + (points - 1) * gouraud + padding;
         if (max_len < required) {
+            Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();
             return max_len;
         }
         SwVertex prev = {0};
@@ -567,6 +827,7 @@ static int Software_PushPrim(u_long* words, int max_len) {
     }
     if ((code & 0x60) == 0x60) {
         int required = 2 + textured + ((code & 0x18) == 0);
+        if(max_len<required){Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();}
         if (max_len < required) {
             return max_len;
         }
@@ -611,6 +872,7 @@ static int Software_PushPrim(u_long* words, int max_len) {
 }
 
 void SoftwareRasterizer_Reset(void) {
+    SoftwareRasterizer_InvalidateMaterial();
     memset(vram, 0, sizeof(vram));
     Software_Reset();
     grid_source = grid_target = 1;

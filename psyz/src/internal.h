@@ -54,9 +54,19 @@ void Psyz_KernelVBlank(void);
 void Psyz_KernelPoll(void);
 
 // Subpixel GTE->GPU coordinate cache for optional geometry correction.
+/* Bounded diagnostic only; no cache entries, addresses or rendering policy altered. */
+typedef struct {
+    unsigned long long matrix_high, matrix_integer, xy_clip, xy_disagree;
+    unsigned long long lookup_hit, lookup_miss, copy_hit, copy_miss;
+    unsigned samples;
+    struct { float expected_x, expected_y, actual_x, actual_y, depth; unsigned reason; } sample[2];
+} PsyzPgxpReasons;
+void Psyz_PgxpTraceReasonsEnable(int enabled);
+void Psyz_PgxpTraceReasonsTake(PsyzPgxpReasons *out);
 void Psyz_PgxpSetActive(int active);
 void Psyz_PgxpNextFrame(void);
 void Psyz_PgxpSetCulling(int enabled);
+void Psyz_PgxpSetEffectEnabled(int enabled);
 void Psyz_GteCopyQueuedPgxpSxy(
     const void* src, const void* dst, unsigned int sxy);
 int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,

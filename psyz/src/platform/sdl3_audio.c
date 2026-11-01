@@ -212,3 +212,20 @@ void Sdl3Audio_VBlank(bool pal) {
     MixOfflineFrames(frames);
     SDL_UnlockMutex(mutex);
 }
+
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+#include "psyz/state_audio.h"
+static SDL_ThreadID state_audio_owner;
+int Psyz_StateAudioOwned(void){return state_audio_owner&&state_audio_owner==SDL_GetCurrentThreadID();}
+int Psyz_StateAudioBegin(void){if(!is_audio_init||!mutex||Psyz_StateAudioOwned())return 0;SDL_LockMutex(mutex);if(state_audio_owner){SDL_UnlockMutex(mutex);return 0;}state_audio_owner=SDL_GetCurrentThreadID();return 1;}
+void Psyz_StateAudioEnd(void){if(Psyz_StateAudioOwned()){state_audio_owner=0;SDL_UnlockMutex(mutex);}}
+int Psyz_StateAudioDiscardQueued(void){return Psyz_StateAudioOwned()&&(!sdl_stream||SDL_ClearAudioStream(sdl_stream));}
+#endif
+
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+static void state_audio_clock_put(unsigned char *p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(v>>(8*i));}
+static uint32_t state_audio_clock_get(const unsigned char *p){return(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+int Psyz_StateAudioClockCapture(unsigned char *out,size_t n){if(!out||n!=20||!Psyz_StateAudioOwned())return 0;memcpy(out,"PEAUDCLK",8);state_audio_clock_put(out+8,video_clock);state_audio_clock_put(out+12,video_pal);state_audio_clock_put(out+16,video_remainder);return 1;}
+int Psyz_StateAudioClockValidate(const unsigned char *in,size_t n){return in&&n==20&&Psyz_StateAudioOwned()&&!memcmp(in,"PEAUDCLK",8)&&state_audio_clock_get(in+8)==(uint32_t)video_clock&&state_audio_clock_get(in+12)<=1&&state_audio_clock_get(in+16)<(state_audio_clock_get(in+12)?50u:60000u);}
+int Psyz_StateAudioClockRestore(const unsigned char *in,size_t n){if(!Psyz_StateAudioClockValidate(in,n))return 0;video_pal=state_audio_clock_get(in+12)!=0;video_remainder=state_audio_clock_get(in+16);return 1;}
+#endif

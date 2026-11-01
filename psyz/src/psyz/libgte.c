@@ -1814,12 +1814,14 @@ typedef struct {
     unsigned int sxy;
     unsigned int gen;
     unsigned int queued;
+    unsigned int is_effect;
     float x, y, w;
 } PgxpAddrEntry;
 
 typedef struct {
     unsigned int sxy;
     unsigned int gen;
+    unsigned int is_effect;
     float x, y, w;
 } PgxpSxyEntry;
 
@@ -1828,9 +1830,23 @@ typedef struct {
 #define PGXP_SXY_SETS 4096u
 #define PGXP_SXY_WAYS 2u
 
+static int pgxp_reason_trace;
+static PsyzPgxpReasons pgxp_reasons;
+void Psyz_PgxpTraceReasonsEnable(int enabled) {
+    pgxp_reason_trace = enabled != 0;
+    memset(&pgxp_reasons, 0, sizeof(pgxp_reasons));
+}
+void Psyz_PgxpTraceReasonsTake(PsyzPgxpReasons *out) {
+    if (out) *out = pgxp_reasons;
+    memset(&pgxp_reasons, 0, sizeof(pgxp_reasons));
+}
 static int pgxp_active = 0;
 static int pgxp_culling = 1;
+static int pgxp_effect_enabled = 0;
+static int pgxp_effect_mode = 0;
 void Psyz_PgxpSetCulling(int enabled) { pgxp_culling = enabled != 0; }
+void Psyz_PgxpSetEffectEnabled(int enabled) { pgxp_effect_enabled = enabled != 0; }
+void Psyz_GteSetPgxpEffectMode(int enabled) { pgxp_effect_mode = enabled != 0; }
 static unsigned int pgxp_frame_gen = 1;
 static int pgxp_matrix_valid = 0;
 static double pgxp_rot[3][3];
@@ -1857,6 +1873,7 @@ void Psyz_PgxpSetActive(int active) {
     pgxp_active = active != 0;
     if (!pgxp_active) {
         pgxp_matrix_valid = 0;
+        pgxp_effect_mode = 0;
     }
 }
 
@@ -1868,6 +1885,7 @@ void Psyz_PgxpNextFrame(void) {
         pgxp_frame_gen = 1;
     }
     pgxp_matrix_valid = 0;
+    pgxp_effect_mode = 0;
 }
 
 void Psyz_GteSetPgxpMatrix(const double rot[3][3], const double trans[3]) {
@@ -1905,6 +1923,7 @@ static inline void PgxpStoreAddr(const void* dst, PgxpSxyEntry entry) {
         .addr = addr,
         .sxy = entry.sxy,
         .gen = entry.gen,
+        .is_effect = entry.is_effect,
         .x = entry.x,
         .y = entry.y,
         .w = entry.w,
@@ -1916,6 +1935,10 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     PgxpSxyEntry out = {0};
     if (!pgxp_active) {
         return out;
+    }
+    if (pgxp_reason_trace) {
+        if (pgxp_matrix_valid) ++pgxp_reasons.matrix_high;
+        else ++pgxp_reasons.matrix_integer;
     }
     double fx, fy, fz;
     if (pgxp_matrix_valid) {
@@ -1951,9 +1974,24 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     float sx_f = (float)CLAMP((double)OFX + ir1_f * scale_f, -1024.0, 1023.0);
     float sy_f = (float)CLAMP((double)OFY + ir2_f * scale_f, -1024.0, 1023.0);
     float w_f = (float)(sz_f > 1.0 ? sz_f : 1.0);
-    if (sx <= -1024 || sx >= 1023 || sy <= -1024 || sy >= 1023 ||
-        fabsf(sx_f - ((float)sx + 0.5f)) > 16.0f ||
-        fabsf(sy_f - ((float)sy + 0.5f)) > 16.0f) {
+    /* Same original acceptance tests; expose why XY became integer despite w>0. */
+    const int trace_clip = sx <= -1024 || sx >= 1023 || sy <= -1024 || sy >= 1023;
+    const int trace_disagree = fabsf(sx_f - ((float)sx + 0.5f)) > 16.0f ||
+                              fabsf(sy_f - ((float)sy + 0.5f)) > 16.0f;
+    if (trace_clip || trace_disagree) {
+        if (pgxp_reason_trace) {
+            if (trace_clip) ++pgxp_reasons.xy_clip;
+            if (trace_disagree) ++pgxp_reasons.xy_disagree;
+            if (pgxp_reasons.samples < 2) {
+                unsigned i=pgxp_reasons.samples++;
+                pgxp_reasons.sample[i].expected_x=sx_f;
+                pgxp_reasons.sample[i].expected_y=sy_f;
+                pgxp_reasons.sample[i].actual_x=(float)sx+0.5f;
+                pgxp_reasons.sample[i].actual_y=(float)sy+0.5f;
+                pgxp_reasons.sample[i].depth=w_f;
+                pgxp_reasons.sample[i].reason=(trace_clip?1u:0u)|(trace_disagree?2u:0u);
+            }
+        }
         sx_f = (float)sx + 0.5f;
         sy_f = (float)sy + 0.5f;
     }
@@ -1962,6 +2000,7 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     out = (PgxpSxyEntry){
         .sxy = sxy,
         .gen = pgxp_frame_gen,
+        .is_effect = (unsigned int)pgxp_effect_mode,
         .x = sx_f,
         .y = sy_f,
         .w = w_f,
@@ -1969,6 +2008,102 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     set[1] = set[0];
     set[0] = out;
     return out;
+}
+
+int Psyz_GteGetLastPgxpVertex(float* x, float* y, float* w) {
+    if (!pgxp_active || pgxp_fifo[2].gen != pgxp_frame_gen) {
+        return 0;
+    }
+    *x = pgxp_fifo[2].x;
+    *y = pgxp_fifo[2].y;
+    *w = pgxp_fifo[2].w;
+    return 1;
+}
+
+void Psyz_GteStorePgxpVertex(
+    const void* dst, unsigned int sxy, float x, float y, float w) {
+    if (!pgxp_active || !dst) {
+        return;
+    }
+    PgxpStoreAddr(dst, (PgxpSxyEntry){
+                           .sxy = sxy,
+                           .gen = pgxp_frame_gen,
+                           .is_effect = (unsigned int)pgxp_effect_mode,
+                           .x = x,
+                           .y = y,
+                           .w = w,
+                       });
+}
+
+void Psyz_GteProjectFloatVertex(
+    double vx, double vy, double vz, const void* dst, unsigned int sxy) {
+    if (!pgxp_active || !dst) {
+        return;
+    }
+    short sx = (short)(sxy & 0xFFFFu);
+    short sy = (short)((sxy >> 16) & 0xFFFFu);
+    if(pgxp_reason_trace){if(pgxp_matrix_valid)++pgxp_reasons.matrix_high;else ++pgxp_reasons.matrix_integer;}
+    double fx, fy, fz;
+    if (pgxp_matrix_valid) {
+        fx = pgxp_trans[0] + pgxp_rot[0][0] * vx + pgxp_rot[0][1] * vy +
+             pgxp_rot[0][2] * vz;
+        fy = pgxp_trans[1] + pgxp_rot[1][0] * vx + pgxp_rot[1][1] * vy +
+             pgxp_rot[1][2] * vz;
+        fz = pgxp_trans[2] + pgxp_rot[2][0] * vx + pgxp_rot[2][1] * vy +
+             pgxp_rot[2][2] * vz;
+    } else {
+        fx = (double)M.t[0] +
+             ((double)M.m[0][0] * vx + (double)M.m[0][1] * vy +
+              (double)M.m[0][2] * vz) *
+                 (1.0 / 4096.0);
+        fy = (double)M.t[1] +
+             ((double)M.m[1][0] * vx + (double)M.m[1][1] * vy +
+              (double)M.m[1][2] * vz) *
+                 (1.0 / 4096.0);
+        fz = (double)M.t[2] +
+             ((double)M.m[2][0] * vx + (double)M.m[2][1] * vy +
+              (double)M.m[2][2] * vz) *
+                 (1.0 / 4096.0);
+    }
+    double ir1_f = CLAMP(fx, -32768.0, 32767.0);
+    double ir2_f = CLAMP(fy, -32768.0, 32767.0);
+    double sz_f = CLAMP(fz, 0.0, 65535.0);
+    double h_f = (double)(unsigned short)H;
+    double scale_f = (h_f >= sz_f * 2.0 || sz_f <= 0.0)
+                         ? ((double)0x1FFFF / 65536.0)
+                         : (h_f / sz_f);
+    float sx_f = (float)CLAMP((double)OFX + ir1_f * scale_f, -1024.0, 1023.0);
+    float sy_f = (float)CLAMP((double)OFY + ir2_f * scale_f, -1024.0, 1023.0);
+    float w_f = (float)(sz_f > 1.0 ? sz_f : 1.0);
+    /* Same original acceptance tests; expose why XY became integer despite w>0. */
+    const int trace_clip = sx <= -1024 || sx >= 1023 || sy <= -1024 || sy >= 1023;
+    const int trace_disagree = fabsf(sx_f - ((float)sx + 0.5f)) > 16.0f ||
+                              fabsf(sy_f - ((float)sy + 0.5f)) > 16.0f;
+    if (trace_clip || trace_disagree) {
+        if (pgxp_reason_trace) {
+            if (trace_clip) ++pgxp_reasons.xy_clip;
+            if (trace_disagree) ++pgxp_reasons.xy_disagree;
+            if (pgxp_reasons.samples < 2) {
+                unsigned i=pgxp_reasons.samples++;
+                pgxp_reasons.sample[i].expected_x=sx_f;
+                pgxp_reasons.sample[i].expected_y=sy_f;
+                pgxp_reasons.sample[i].actual_x=(float)sx+0.5f;
+                pgxp_reasons.sample[i].actual_y=(float)sy+0.5f;
+                pgxp_reasons.sample[i].depth=w_f;
+                pgxp_reasons.sample[i].reason=(trace_clip?1u:0u)|(trace_disagree?2u:0u);
+            }
+        }
+        sx_f = (float)sx + 0.5f;
+        sy_f = (float)sy + 0.5f;
+    }
+    PgxpStoreAddr(dst, (PgxpSxyEntry){
+                           .sxy = sxy,
+                           .gen = pgxp_frame_gen,
+                           .is_effect = (unsigned int)pgxp_effect_mode,
+                           .x = sx_f,
+                           .y = sy_f,
+                           .w = w_f,
+                       });
 }
 
 int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
@@ -1983,20 +2118,26 @@ int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
         for (unsigned int i = 0; i < PGXP_ADDR_WAYS; ++i) {
             if ((aset[i].gen == pgxp_frame_gen || aset[i].queued) &&
                 aset[i].addr == addr && aset[i].sxy == sxy) {
+                if (aset[i].is_effect && !pgxp_effect_enabled) {
+                    if(pgxp_reason_trace)++pgxp_reasons.lookup_miss;
+                    return 0;
+                }
                 *x = aset[i].x;
                 *y = aset[i].y;
                 *w = aset[i].w;
-                return 1;
+                if (pgxp_reason_trace) ++pgxp_reasons.lookup_hit;
+                return aset[i].is_effect ? 2 : 1;
             }
         }
     }
+    if (pgxp_reason_trace) ++pgxp_reasons.lookup_miss;
     return 0;
 }
 
 int Psyz_GtePgxpNclip3(
     const void* s0, unsigned int xy0, const void* s1, unsigned int xy1,
     const void* s2, unsigned int xy2, int int_area) {
-    if (!pgxp_active || !pgxp_culling) {
+    if (!pgxp_active || !(pgxp_culling || (pgxp_effect_mode && pgxp_effect_enabled))) {
         return int_area;
     }
     float x0, y0, w0, x1, y1, w1, x2, y2, w2;
@@ -2017,7 +2158,7 @@ int Psyz_GtePgxpNclip3(
 int Psyz_GtePgxpNclip4(const void* s0, unsigned int xy0, const void* s1,
                        unsigned int xy1, const void* s2, unsigned int xy2,
                        const void* s3, unsigned int xy3, int int_area) {
-    if (!pgxp_active || !pgxp_culling) {
+    if (!pgxp_active || !(pgxp_culling || (pgxp_effect_mode && pgxp_effect_enabled))) {
         return int_area;
     }
     float x0, y0, w0, x1, y1, w1, x2, y2, w2, x3, y3, w3;
@@ -2042,15 +2183,19 @@ void Psyz_GteCopyPgxpSxy(const void* src, const void* dst, unsigned int sxy) {
         return;
     }
     float x = 0.0f, y = 0.0f, w = 0.0f;
-    if (Psyz_PgxpLookupVertex(src, sxy, &x, &y, &w)) {
+    int kind = Psyz_PgxpLookupVertex(src, sxy, &x, &y, &w);
+    if (kind) {
+        if (pgxp_reason_trace) ++pgxp_reasons.copy_hit;
         PgxpStoreAddr(dst, (PgxpSxyEntry){
                                .sxy = sxy,
                                .gen = pgxp_frame_gen,
+                               .is_effect = (unsigned int)(kind == 2),
                                .x = x,
                                .y = y,
                                .w = w,
                            });
     } else {
+        if (pgxp_reason_trace) ++pgxp_reasons.copy_miss;
         // Queue slots are reused within a frame. A plain 2D write must not
         // inherit metadata from a previous model vertex at the same address.
         PgxpAddrEntry* set = pgxp_addr_cache[PgxpHashAddr(dst)];
@@ -2975,6 +3120,11 @@ long RotTransPers3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0, int* sxy1,
     *(unsigned int*)sxy0 = s0;
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy0, pgxp_fifo[0]);
+        PgxpStoreAddr(sxy1, pgxp_fifo[1]);
+        PgxpStoreAddr(sxy2, pgxp_fifo[2]);
+    }
     *p = ir0;
     *flag = (int)fl;
     return z;
@@ -2986,6 +3136,9 @@ long RotTransPers4(
     int flag1, flag2;
     RotTransPers3(v0, v1, v2, sxy0, sxy1, sxy2, p, &flag1);
     RotTransPers(v3, sxy3, p, &flag2);
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy3, pgxp_fifo[2]);
+    }
     *flag = flag1 | flag2;
     return SZ3 >> 2;
 }
@@ -3006,6 +3159,11 @@ long RotAverage3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0, int* sxy1,
     *(unsigned int*)sxy0 = s0;
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy0, pgxp_fifo[0]);
+        PgxpStoreAddr(sxy1, pgxp_fifo[1]);
+        PgxpStoreAddr(sxy2, pgxp_fifo[2]);
+    }
     *flag = (int)fl;
     *p = ir0;
     return otz;
@@ -3016,11 +3174,15 @@ long RotAverage4(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0,
     unsigned s0, s1, s2, s3, fl1, fl2;
     int ir0;
     long otz;
+    PgxpSxyEntry f0, f1, f2;
     V0 = *v0;
     V1 = *v1;
     V2 = *v2;
     RTPT_BODY(1, 0, s0, s1, s2);
     fl1 = FLAG;
+    f0 = pgxp_fifo[0];
+    f1 = pgxp_fifo[1];
+    f2 = pgxp_fifo[2];
     V0 = *v3;
     RTPS_BODY(1, 0, s3);
     fl2 = FLAG;
@@ -3031,6 +3193,12 @@ long RotAverage4(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0,
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
     *(unsigned int*)sxy3 = s3;
+    if (pgxp_active && pgxp_effect_mode) {
+        PgxpStoreAddr(sxy0, f0);
+        PgxpStoreAddr(sxy1, f1);
+        PgxpStoreAddr(sxy2, f2);
+        PgxpStoreAddr(sxy3, pgxp_fifo[2]);
+    }
     *p = ir0;
     *flag = (int)(fl1 | fl2);
     return otz;
@@ -3053,6 +3221,11 @@ long RotAverageNclip3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0,
         *(unsigned int*)sxy0 = s0;
         *(unsigned int*)sxy1 = s1;
         *(unsigned int*)sxy2 = s2;
+        if (pgxp_active && pgxp_effect_mode) {
+            PgxpStoreAddr(sxy0, pgxp_fifo[0]);
+            PgxpStoreAddr(sxy1, pgxp_fifo[1]);
+            PgxpStoreAddr(sxy2, pgxp_fifo[2]);
+        }
         *p = ir0;
         *otz = OTZ;
         return clip;
@@ -3065,11 +3238,15 @@ long RotAverageNclip4(
     SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0, int* sxy1,
     int* sxy2, int* sxy3, int* p, int* otz, int* flag) {
     unsigned s0, s1, s2, s3, fl1, fl2;
+    PgxpSxyEntry f0, f1, f2;
     V0 = *v0;
     V1 = *v1;
     V2 = *v2;
     RTPT_BODY(1, 0, s0, s1, s2);
     fl1 = FLAG;
+    f0 = pgxp_fifo[0];
+    f1 = pgxp_fifo[1];
+    f2 = pgxp_fifo[2];
     NCLIP();
     const int clip = MAC0;
     if (clip > 0) {
@@ -3083,6 +3260,12 @@ long RotAverageNclip4(
         *(unsigned int*)sxy1 = s1;
         *(unsigned int*)sxy2 = s2;
         *(unsigned int*)sxy3 = s3;
+        if (pgxp_active && pgxp_effect_mode) {
+            PgxpStoreAddr(sxy0, f0);
+            PgxpStoreAddr(sxy1, f1);
+            PgxpStoreAddr(sxy2, f2);
+            PgxpStoreAddr(sxy3, pgxp_fifo[2]);
+        }
         *p = ir0;
         *flag = (int)(fl1 | fl2);
         *otz = OTZ;
@@ -3583,3 +3766,239 @@ static void (*const gte_ops[64])(unsigned int cmd) = {
 };
 
 void Psyz_GteCommand(unsigned int cmd) { gte_ops[cmd & 0x3F](cmd); }
+
+/* Explicit numeric GTE component. Stable endian scalar encoding, no pointers. */
+#include <psyz/state_numeric.h>
+typedef struct PeGteNumeric {
+    SVECTOR v0;
+    SVECTOR v1;
+    SVECTOR v2;
+    CVECTOR rgbc;
+    unsigned short otz;
+    short ir0;
+    short ir1;
+    short ir2;
+    short ir3;
+    short sx0;
+    short sy0;
+    short sx1;
+    short sy1;
+    short sx2;
+    short sy2;
+    short sxp;
+    short syp;
+    unsigned short sz0;
+    unsigned short sz1;
+    unsigned short sz2;
+    unsigned short sz3;
+    int mac0;
+    int mac1;
+    int mac2;
+    int mac3;
+    unsigned int rgb0;
+    unsigned int rgb1;
+    unsigned int rgb2;
+    unsigned int res1;
+    unsigned int lzcs;
+    unsigned int lzcr;
+    MATRIX m;
+    MATRIX l1;
+    MATRIX l2;
+    int ofx;
+    int ofy;
+    unsigned short h;
+    short dqa;
+    int dqb;
+    short zsf3;
+    short zsf4;
+    unsigned int flag;
+    MATRIX stack[20];
+    unsigned int depth;
+} PeGteNumeric;
+static void pe_gte_put(unsigned char *out,size_t *at,unsigned int value,unsigned bytes){for(unsigned i=0;i<bytes;i++)out[(*at)++]=(unsigned char)(value>>(8*i));}
+static unsigned int pe_gte_get(const unsigned char *in,size_t *at,unsigned bytes){unsigned int value=0;for(unsigned i=0;i<bytes;i++)value|=(unsigned int)in[(*at)++]<<(8*i);return value;}
+static void pe_gte_put_matrix(unsigned char *out,size_t *at,const MATRIX *matrix) {
+    for(unsigned r=0;r<3;r++)for(unsigned c=0;c<3;c++)pe_gte_put(out,at,(unsigned int)matrix->m[r][c],2);
+    pe_gte_put(out,at,0,2); /* reserved wire padding, no native padding */
+    for(unsigned i=0;i<3;i++)pe_gte_put(out,at,(unsigned int)matrix->t[i],4);
+}
+static int pe_gte_get_matrix(const unsigned char *in,size_t *at,MATRIX *matrix) {
+    memset(matrix,0,sizeof *matrix);
+    for(unsigned r=0;r<3;r++)for(unsigned c=0;c<3;c++)matrix->m[r][c]=(short)pe_gte_get(in,at,2);
+    if(pe_gte_get(in,at,2)!=0)return -1;
+    for(unsigned i=0;i<3;i++)matrix->t[i]=(int)pe_gte_get(in,at,4);
+    return 0;
+}
+size_t Psyz_GteNumericStateBytes(void){return 874;}
+int Psyz_GteCaptureNumericState(unsigned char *out,size_t capacity){size_t at=8;if(!out||capacity<874)return -1;memcpy(out,"PEGTE001",8);
+    pe_gte_put(out,&at,(unsigned int)GTE(v0).vx,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v0).vy,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v0).vz,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v0).pad,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v1).vx,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v1).vy,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v1).vz,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v1).pad,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v2).vx,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v2).vy,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v2).vz,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(v2).pad,2);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgbc).r,1);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgbc).g,1);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgbc).b,1);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgbc).cd,1);
+    pe_gte_put(out,&at,(unsigned int)GTE(otz),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(ir0),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(ir1),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(ir2),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(ir3),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sx0),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sy0),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sx1),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sy1),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sx2),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sy2),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sxp),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(syp),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sz0),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sz1),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sz2),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(sz3),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(mac0),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(mac1),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(mac2),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(mac3),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgb0),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgb1),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(rgb2),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(res1),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(lzcs),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(lzcr),4);
+    pe_gte_put_matrix(out,&at,&GTE(m));
+    pe_gte_put_matrix(out,&at,&GTE(l1));
+    pe_gte_put_matrix(out,&at,&GTE(l2));
+    pe_gte_put(out,&at,(unsigned int)GTE(ofx),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(ofy),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(h),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(dqa),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(dqb),4);
+    pe_gte_put(out,&at,(unsigned int)GTE(zsf3),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(zsf4),2);
+    pe_gte_put(out,&at,(unsigned int)GTE(flag),4);
+    pe_gte_put(out,&at,(unsigned int)s_matrixStackDepth,4);
+    for(unsigned i=0;i<20;i++)pe_gte_put_matrix(out,&at,&s_matrixStack[i]);
+    return at==874?0:-1;
+}
+static int pe_gte_decode_numeric(const unsigned char *in,size_t bytes,PeGteNumeric *state){size_t at=8;if(!in||!state||bytes!=874||memcmp(in,"PEGTE001",8))return -1;
+    state->v0.vx=(short)pe_gte_get(in,&at,2);
+    state->v0.vy=(short)pe_gte_get(in,&at,2);
+    state->v0.vz=(short)pe_gte_get(in,&at,2);
+    state->v0.pad=(short)pe_gte_get(in,&at,2);
+    state->v1.vx=(short)pe_gte_get(in,&at,2);
+    state->v1.vy=(short)pe_gte_get(in,&at,2);
+    state->v1.vz=(short)pe_gte_get(in,&at,2);
+    state->v1.pad=(short)pe_gte_get(in,&at,2);
+    state->v2.vx=(short)pe_gte_get(in,&at,2);
+    state->v2.vy=(short)pe_gte_get(in,&at,2);
+    state->v2.vz=(short)pe_gte_get(in,&at,2);
+    state->v2.pad=(short)pe_gte_get(in,&at,2);
+    state->rgbc.r=(unsigned char)pe_gte_get(in,&at,1);
+    state->rgbc.g=(unsigned char)pe_gte_get(in,&at,1);
+    state->rgbc.b=(unsigned char)pe_gte_get(in,&at,1);
+    state->rgbc.cd=(unsigned char)pe_gte_get(in,&at,1);
+    state->otz=(unsigned short)pe_gte_get(in,&at,2);
+    state->ir0=(short)pe_gte_get(in,&at,2);
+    state->ir1=(short)pe_gte_get(in,&at,2);
+    state->ir2=(short)pe_gte_get(in,&at,2);
+    state->ir3=(short)pe_gte_get(in,&at,2);
+    state->sx0=(short)pe_gte_get(in,&at,2);
+    state->sy0=(short)pe_gte_get(in,&at,2);
+    state->sx1=(short)pe_gte_get(in,&at,2);
+    state->sy1=(short)pe_gte_get(in,&at,2);
+    state->sx2=(short)pe_gte_get(in,&at,2);
+    state->sy2=(short)pe_gte_get(in,&at,2);
+    state->sxp=(short)pe_gte_get(in,&at,2);
+    state->syp=(short)pe_gte_get(in,&at,2);
+    state->sz0=(unsigned short)pe_gte_get(in,&at,2);
+    state->sz1=(unsigned short)pe_gte_get(in,&at,2);
+    state->sz2=(unsigned short)pe_gte_get(in,&at,2);
+    state->sz3=(unsigned short)pe_gte_get(in,&at,2);
+    state->mac0=(int)pe_gte_get(in,&at,4);
+    state->mac1=(int)pe_gte_get(in,&at,4);
+    state->mac2=(int)pe_gte_get(in,&at,4);
+    state->mac3=(int)pe_gte_get(in,&at,4);
+    state->rgb0=(unsigned int)pe_gte_get(in,&at,4);
+    state->rgb1=(unsigned int)pe_gte_get(in,&at,4);
+    state->rgb2=(unsigned int)pe_gte_get(in,&at,4);
+    state->res1=(unsigned int)pe_gte_get(in,&at,4);
+    state->lzcs=(unsigned int)pe_gte_get(in,&at,4);
+    state->lzcr=(unsigned int)pe_gte_get(in,&at,4);
+    if(pe_gte_get_matrix(in,&at,&state->m))return -1;
+    if(pe_gte_get_matrix(in,&at,&state->l1))return -1;
+    if(pe_gte_get_matrix(in,&at,&state->l2))return -1;
+    state->ofx=(int)pe_gte_get(in,&at,4);
+    state->ofy=(int)pe_gte_get(in,&at,4);
+    state->h=(unsigned short)pe_gte_get(in,&at,2);
+    state->dqa=(short)pe_gte_get(in,&at,2);
+    state->dqb=(int)pe_gte_get(in,&at,4);
+    state->zsf3=(short)pe_gte_get(in,&at,2);
+    state->zsf4=(short)pe_gte_get(in,&at,2);
+    state->flag=(unsigned int)pe_gte_get(in,&at,4);
+    state->depth=pe_gte_get(in,&at,4);if(state->depth>20)return -1;
+    for(unsigned i=0;i<20;i++)if(pe_gte_get_matrix(in,&at,&state->stack[i]))return -1;
+    return at==874?0:-1;
+}
+int Psyz_GteValidateNumericState(const unsigned char *in,size_t bytes){PeGteNumeric state={0};return pe_gte_decode_numeric(in,bytes,&state);}
+int Psyz_GteRestoreNumericState(const unsigned char *in,size_t bytes){PeGteNumeric state={0};if(pe_gte_decode_numeric(in,bytes,&state))return -1;
+    GTE(v0)=state.v0;
+    GTE(v1)=state.v1;
+    GTE(v2)=state.v2;
+    GTE(rgbc)=state.rgbc;
+    GTE(otz)=state.otz;
+    GTE(ir0)=state.ir0;
+    GTE(ir1)=state.ir1;
+    GTE(ir2)=state.ir2;
+    GTE(ir3)=state.ir3;
+    GTE(sx0)=state.sx0;
+    GTE(sy0)=state.sy0;
+    GTE(sx1)=state.sx1;
+    GTE(sy1)=state.sy1;
+    GTE(sx2)=state.sx2;
+    GTE(sy2)=state.sy2;
+    GTE(sxp)=state.sxp;
+    GTE(syp)=state.syp;
+    GTE(sz0)=state.sz0;
+    GTE(sz1)=state.sz1;
+    GTE(sz2)=state.sz2;
+    GTE(sz3)=state.sz3;
+    GTE(mac0)=state.mac0;
+    GTE(mac1)=state.mac1;
+    GTE(mac2)=state.mac2;
+    GTE(mac3)=state.mac3;
+    GTE(rgb0)=state.rgb0;
+    GTE(rgb1)=state.rgb1;
+    GTE(rgb2)=state.rgb2;
+    GTE(res1)=state.res1;
+    GTE(lzcs)=state.lzcs;
+    GTE(lzcr)=state.lzcr;
+    GTE(m)=state.m;
+    GTE(l1)=state.l1;
+    GTE(l2)=state.l2;
+    GTE(ofx)=state.ofx;
+    GTE(ofy)=state.ofy;
+    GTE(h)=state.h;
+    GTE(dqa)=state.dqa;
+    GTE(dqb)=state.dqb;
+    GTE(zsf3)=state.zsf3;
+    GTE(zsf4)=state.zsf4;
+    GTE(flag)=state.flag;
+    memcpy(s_matrixStack,state.stack,sizeof s_matrixStack);s_matrixStackDepth=(int)state.depth;
+    /* Pointer-addressed presentation caches cannot survive restoration. */
+    memset(pgxp_fifo,0,sizeof pgxp_fifo);memset(pgxp_addr_cache,0,sizeof pgxp_addr_cache);memset(pgxp_sxy_cache,0,sizeof pgxp_sxy_cache);
+    pgxp_matrix_valid=0;pgxp_effect_mode=0;if(++pgxp_frame_gen==0)pgxp_frame_gen=1;
+    return 0;
+}
+
+#if PE_NATIVE_STATE_CPU_COMPONENTS
+void Psyz_StateInvalidatePgxp(void){memset(pgxp_fifo,0,sizeof pgxp_fifo);memset(pgxp_addr_cache,0,sizeof pgxp_addr_cache);memset(pgxp_sxy_cache,0,sizeof pgxp_sxy_cache);pgxp_matrix_valid=0;pgxp_effect_mode=0;if(++pgxp_frame_gen==0)pgxp_frame_gen=1;}
+#endif

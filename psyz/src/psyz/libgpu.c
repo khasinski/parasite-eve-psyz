@@ -1,4 +1,8 @@
+#include <psyz/gpu.h>
 #include <psyz.h>
+#ifdef PE_PS5_GPU_NATIVE
+#include <psyz/video.h>
+#endif
 #include <libgpu.h>
 #include <psyz/gte.h>
 #include "../../../decomp/src/libgpu/libgpu_private.h"
@@ -166,6 +170,11 @@ int Psyz_GpuRegisterCommandHandler(
     return 0;
 }
 
+int Psyz_GpuRegisterCommandHandlerIfVacant(unsigned int opcode,PsyzGpuCommandHandler handler,void *data){
+    if(opcode>255||!handler||(user_gpu_commands[opcode].handler&&user_gpu_commands[opcode].handler!=handler))return -1;
+    return Psyz_GpuRegisterCommandHandler(opcode,handler,data);
+}
+
 int Psyz_GpuSetHorizontalGrid(
     unsigned int source_width, unsigned int target_width) {
     return Draw_SetHorizontalGrid(source_width, target_width);
@@ -273,8 +282,15 @@ int Psyz_GpuExeque() {
         DispatchPackets(queue_buf, queue_len);
         Draw_FlushBuffer();
     }
-    Draw_ExequeSync();
+    int sync_result=Draw_ExequeSync();
     queue_len = 0;
+#ifdef PE_PS5_GPU_NATIVE
+    /* Original OT admission may already have drained complete chunks.
+     * Even an empty remaining queue is now fully consumed, never a GPU fence. */
+    Psyz_VideoMovieQueueConsumed(sync_result==0);
+#else
+    (void)sync_result;
+#endif
     return queue_len;
 }
 
@@ -332,12 +348,14 @@ static void GPU_Enqueue(u_long* packets) {
                 u32* prim_data = (u32*)env->code;
                 for (u_long i = 0; i < env->len; i++) {
                     queue_buf[queue_len + i] = prim_data[i];
+                    Psyz_GpuCopyInterpolationPacket(&prim_data[i],&queue_buf[queue_len+i]);
                     Psyz_GteCopyQueuedPgxpSxy(
                         &prim_data[i], &queue_buf[queue_len + i], prim_data[i]);
                 }
             } else if (env->len > 0) {
                 memcpy(queue_buf + queue_len, env->code,
                        env->len * sizeof(u_long));
+                for(u_long i=0;i<env->len;++i)Psyz_GpuCopyInterpolationPacket((u_long *)env->code+i,&queue_buf[queue_len+i]);
             }
         }
         queue_len += (int)env->len;
@@ -377,13 +395,16 @@ static int psyz_cwb(u32* data, s32 n) {
     if (sizeof(u_long) == 8 && is_packed_command_stream(data, n)) {
         for (int i = 0; i < n; ++i) {
             queue_buf[i] = data[i];
+            Psyz_GpuCopyInterpolationPacket(&data[i],&queue_buf[i]);
             Psyz_GteCopyQueuedPgxpSxy(&data[i], &queue_buf[i], data[i]);
         }
     } else {
         memcpy(queue_buf, data, (size_t)n * sizeof(u_long));
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < n; ++i){
+            Psyz_GpuCopyInterpolationPacket((u_long *)data+i,&queue_buf[i]);
             Psyz_GteCopyQueuedPgxpSxy(
                 (u_long*)data + i, &queue_buf[i], (unsigned)queue_buf[i]);
+        }
     }
     queue_len = n;
     return Psyz_GpuExeque();

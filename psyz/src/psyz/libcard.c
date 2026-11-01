@@ -18,7 +18,11 @@ static inline int validate_chan(long chan) {
 }
 
 void _bu_init(void) {
-#ifdef _MSC_VER
+#ifdef PE_PS5
+    char path[4096];
+    Psyz_AdjustPath(path, "bu00:*", sizeof(path));
+    Psyz_AdjustPath(path, "bu10:*", sizeof(path));
+#elif defined(_MSC_VER)
     NOT_IMPLEMENTED;
 #elif __MINGW32__
     mkdir("bu00");

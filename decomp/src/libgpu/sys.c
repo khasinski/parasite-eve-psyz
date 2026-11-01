@@ -1,3 +1,6 @@
+#ifdef PE_PS5_GPU_NATIVE
+#include <psyz/video.h>
+#endif
 #include <common.h>
 #include <libetc.h>
 #include <libgte.h>
@@ -335,8 +338,14 @@ void DrawOTag(OT_TYPE* p) {
     if (info.level >= 2) {
         GPU_printf("DrawOTag(%08x)...\n", p);
     }
+    #ifdef PE_PS5_GPU_NATIVE
+    int native_accepted =
+    #endif
     D_800B8920->addque2(
         (int (*)(u_long, u_long))D_800B8920->cwc, (u_long)p, 0, 0);
+#ifdef PE_PS5_GPU_NATIVE
+    Psyz_VideoMovieFrameQueued(native_accepted==0);
+#endif
 }
 
 DRAWENV* PutDrawEnv(DRAWENV* env) {
@@ -358,9 +367,15 @@ void DrawOTagEnv(OT_TYPE* p, DRAWENV* env) {
     }
     SetDrawEnv2(&env->dr_env, env);
     setaddr(&env->dr_env, p);
+    #ifdef PE_PS5_GPU_NATIVE
+    int native_accepted =
+    #endif
     D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->cwc,
                         (u_long)&env->dr_env, sizeof(DR_ENV), 0);
     __builtin_memcpy(&info.draw, env, sizeof(DRAWENV));
+#ifdef PE_PS5_GPU_NATIVE
+    Psyz_VideoMovieFrameQueued(native_accepted==0);
+#endif
 }
 
 DRAWENV* GetDrawEnv(DRAWENV* env) {
@@ -437,6 +452,10 @@ DISPENV* PutDispEnv(DISPENV* env) {
         D_800B8920->ctl(mode);
     }
     memcpy((u8*)&info.disp, (u8*)env, sizeof(DISPENV));
+#ifdef PE_PS5_GPU_NATIVE
+    /* Called even when unchanged mode/range registers are cached. */
+    Psyz_VideoMovieDisplayEnvSubmitted();
+#endif
     return env;
 }
 

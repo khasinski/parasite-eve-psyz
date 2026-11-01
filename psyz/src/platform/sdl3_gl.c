@@ -1592,3 +1592,8 @@ void Draw_FlushBuffer(void) {
     SyncScaledVramToNative();
     Draw_ResetBuffer();
 }
+
+int Psyz_VideoSetDynamicLighting(int enabled){(void)enabled;return -1;}
+int Psyz_VideoGetDynamicLighting(void){return 0;}
+int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}
+int Psyz_VideoGetEffectGeometryCorrection(void){return 0;}
