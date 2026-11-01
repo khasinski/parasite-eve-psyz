@@ -110,9 +110,9 @@ void StartTAP(void) {
 }
 
 int PadGetState(int port) {
-    // from PSY-Q 4.2
-    NOT_IMPLEMENTED;
-    return 0;
+    // The emulated controller is always connected and fully identified (PadStateStable).
+    (void)port;
+    return 6;
 }
 
 void PadSetAct(int port, u_char* data, int len) {
@@ -132,6 +132,11 @@ void PadInitMtap(u_char* pad1, u_char* pad2) {
 }
 
 void PadStartCom(void) {
-    // from PSY-Q 4.2
-    NOT_IMPLEMENTED;
+    // Pads are sampled on every emulated vertical blank (Psyz_PollInterrupts).
+}
+
+/* Raw 34-byte controller frames the "BIOS" refreshes on each blank. */
+void PadInitDirect(u_char* pad1, u_char* pad2) {
+    InitPAD((char*)pad1, PSYZ_PAD_BUF_LEN, (char*)pad2, PSYZ_PAD_BUF_LEN);
+    StartPAD();
 }

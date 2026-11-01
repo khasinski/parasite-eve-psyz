@@ -34,11 +34,16 @@ static ControllerPort ports[2] = {
 static int pads_sampled = 0; // avoid more than one input polling per frame
 static char* pad_buffers[2];
 static int pad_buffer_lens[2];
+/* Optional hook for hosts that script input (automated runs): may rewrite a freshly read frame. */
+__attribute__((weak)) void Psyz_PadsOverride(int port, char* frame, int len);
 static void ReadPadsOnVsync(void) {
     pads_sampled = 0;
     for (int p = 0; p < LEN(ports); p++) {
         if (pad_buffers[p]) {
             Psyz_PadsGet(p, pad_buffers[p], pad_buffer_lens[p]);
+            if (Psyz_PadsOverride) {
+                Psyz_PadsOverride(p, pad_buffers[p], pad_buffer_lens[p]);
+            }
         }
     }
 }
