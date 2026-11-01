@@ -1055,8 +1055,19 @@ int CD_ready(int mode, u_char* result) {
                 (unsigned int)data_sector_number, SECTOR_SIZE, data_sector};
             if (disk_read_cb(&read) < 0)
                 return CdlDiskError;
-        } else if (read_raw_sector(data_sector_number, data_sector) < 0) {
-            return CdlDiskError;
+        } else {
+            int guard = 0;
+            for (;;) {
+                if (read_raw_sector(data_sector_number, data_sector) < 0)
+                    return CdlDiskError;
+                /* With ADPCM on, audio sectors (submode bit 2) go to the XA decoder, not to the host. */
+                if ((CD_mode & CdlModeRT) && (CD_mode & (CdlModeSize0 | CdlModeSize1)) &&
+                    (data_sector[18] & 0x04) && guard++ < 64) {
+                    data_sector_number++;
+                    continue;
+                }
+                break;
+            }
         }
         data_sector_valid = 1;
         data_getsector_count = 0;
@@ -1117,6 +1128,15 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
     case CdlReadS:
         if (CD_mode & CdlModeRT) {
             psyz_xa_read();
+            if (CD_mode & (CdlModeSize0 | CdlModeSize1)) {
+                /* Movie read: ADPCM sectors feed the audio decoder above while the video
+                 * sectors go to the game's ready callback (see CD_ready). */
+                data_sector_number = CdPosToInt(&CD_pos);
+                data_sector_valid = 0;
+                data_getsector_count = 0;
+                data_read_active = 1;
+                CD_status |= CdlStatRead;
+            }
         } else {
             Psyz_AudioLock();
             is_playing = 0;
@@ -1351,4 +1371,73 @@ int CdReadSync(int mode, u_char* result) {
     return 0;
 }
 
-void StCdInterrupt(void) { NOT_IMPLEMENTED; }
+/* Streaming ring (CdRead2 / StSetRing): the ring is StRingSize 32-byte StHEADER entries followed by
+ * StRingSize payload slots of 2016 bytes. Each video sector's 32-byte STR header lands in its entry and its
+ * payload in the matching slot, so a frame's sectors form one contiguous run. Entry id: 0 free, 1 wrap
+ * marker, 2 frame ready, 4 taken by StGetNext. Called per data-ready interrupt. When the ring has no room
+ * the sector is left unread, which holds the drive until StFreeRing makes space. */
+extern StHEADER* StRingAddr;
+extern volatile s32 StRingSize;
+extern s32 StRingIdx1, StRingIdx2, StCdIntrFlag;
+void data_ready_callback(void);
+
+#define ST_PAYLOAD_BYTES 2016
+void StCdInterrupt(void) {
+    u32 sub[3];
+    u8 sector[2048];
+    StHEADER* entry;
+    u8* data_base;
+    s32 first;
+
+    if (!StRingAddr || StRingSize <= 0 || !data_sector_valid) {
+        return;
+    }
+    /* Peek the STR header (second halfword group) without consuming the sector. */
+    {
+        const u8* raw = data_sector + 24;
+        u16 magic = (u16)(raw[0] | raw[1] << 8);
+        u16 sec = (u16)(raw[4] | raw[5] << 8);
+        u16 nsec = (u16)(raw[6] | raw[7] << 8);
+        if (magic != 0x0160 || nsec == 0 || nsec > StRingSize) {
+            CD_getsector(sub, 3);
+            CD_getsector(sector, 512);
+            return; /* not a video sector of this ring */
+        }
+        first = StRingIdx1;
+        if (sec == 0) {
+            if (first + nsec > StRingSize) {
+                if (StRingAddr[first].id == 0) {
+                    StRingAddr[first].id = 1; /* wrap marker */
+                }
+                StRingIdx1 = first = 0;
+                StRingIdx2 = 0;
+            }
+            for (int i = 0; i < nsec; i++) {
+                if (StRingAddr[first + i].id != 0) {
+                    return; /* ring full: retry when the consumer frees a frame */
+                }
+            }
+        }
+        if (first >= StRingSize || StRingAddr[first].id != 0) {
+            return;
+        }
+        CD_getsector(sub, 3);
+        CD_getsector(sector, 512);
+        entry = &StRingAddr[first];
+        memcpy(entry, sector, 32);
+        entry->id = 3; /* occupied; the frame-complete callback marks the first entry ready */
+        entry->loc.minute = (u8)(sub[0] & 0xFF);
+        entry->loc.second = (u8)(sub[0] >> 8 & 0xFF);
+        entry->loc.sector = (u8)(sub[0] >> 16 & 0xFF);
+        entry->loc.track = 0;
+        data_base = (u8*)&StRingAddr[StRingSize];
+        memcpy(data_base + (size_t)first * ST_PAYLOAD_BYTES, sector + 32, ST_PAYLOAD_BYTES);
+        StRingIdx1 = first + 1;
+        if (sec + 1 == nsec) {
+            /* The frame's first entry carries the frame header; mark it ready. */
+            StHEADER* head = &StRingAddr[StRingIdx2];
+            head->loc = entry->loc;
+            data_ready_callback();
+        }
+    }
+}
