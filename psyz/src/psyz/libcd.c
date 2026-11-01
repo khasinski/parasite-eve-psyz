@@ -91,6 +91,8 @@ static CdContext ctx;
 
 int CD_cw(u8 com, u8* param, u_char* result, s32 arg3);
 int CD_sync(int mode, u_char* result);
+int CD_ready(int mode, u_char* result);
+static int sync_irq_pending = 0;
 
 static void ADPMUTE(int mute) {
     // 0x1F801800 = 3
@@ -996,6 +998,41 @@ int CD_initvol(void) {
     return 0;
 }
 
+/* Interrupt delivery for games that drive libcd through CdSyncCallback/CdReadyCallback.
+ * The emulation completes commands and sector reads immediately; real hardware raises an
+ * interrupt afterwards. Called from VSync: first the command-complete callback, then one
+ * data-ready callback per pending sector (the callback consumes it with CdGetSector, which
+ * makes the next one pending). */
+void Psyz_CdPump(void) {
+    static int in_pump = 0;
+    int budget = 4;
+    if (in_pump) {
+        return; /* interrupt handlers do not nest */
+    }
+    in_pump = 1;
+    if (sync_irq_pending && CD_cbsync) {
+        CdlCB cb = CD_cbsync;
+        u_char res[8];
+        sync_irq_pending = 0;
+        memcpy(res, last_result, sizeof(res));
+        cb(last_intr, res);
+    }
+    while (budget-- > 0 && data_read_active && CD_cbready && !sync_irq_pending) {
+        u_char res[8] = {0};
+        CdlCB cb = CD_cbready;
+        int before = data_sector_number;
+        int state = CD_ready(1, res);
+        if (state != CdlDataReady) {
+            break;
+        }
+        cb(CdlDataReady, res);
+        if (data_sector_number == before && data_sector_valid) {
+            break; /* callback did not consume the sector; deliver again next frame */
+        }
+    }
+    in_pump = 0;
+}
+
 int CD_sync(int mode, u_char* result) {
     if (result) {
         // Hand back only what the last command produced; the caller sized its
@@ -1029,6 +1066,9 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3);
 
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     int ret = CD_command(com, param, result, arg3);
+    if (ret == 0) {
+        sync_irq_pending = 1;
+    }
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
     return ret;
 }

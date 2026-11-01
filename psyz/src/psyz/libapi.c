@@ -53,6 +53,36 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
 /* SDK VSync(n) waits for the interval since the previous blocking call,
  * then at least the next blank. Queries do not reset that interval. */
 static unsigned int last_vsync_count;
+void Psyz_CdPump(void);
+
+/* Delivers the interrupts a PlayStation would have raised since the last call: each elapsed
+ * vertical blank (pads, VSync callback, kernel events) and pending CD callbacks. Code that
+ * busy-waits without calling VSync polls this so the waited-for state can change. */
+void Psyz_PollInterrupts(void) {
+    static unsigned int seen;
+    static int in_irq;
+    unsigned int now;
+    unsigned int pending;
+    if (in_irq) {
+        return;
+    }
+    in_irq = 1;
+    now = (unsigned int)Psyz_VideoVSync(-1);
+    pending = now - seen;
+    seen = now;
+    if (pending > 3) {
+        pending = 3; /* a long stall replays a few blanks, not all of them */
+    }
+    while (pending--) {
+        ReadPadsOnVsync();
+        if (g_PsyzVsyncCb)
+            g_PsyzVsyncCb();
+        Psyz_KernelVBlank();
+    }
+    Psyz_CdPump();
+    in_irq = 0;
+}
+
 int VSync(int mode) {
     Psyz_KernelPoll();
     if (mode < 0)
@@ -67,16 +97,9 @@ int VSync(int mode) {
     if ((int32_t)(target - now) < 1)
         target = now + 1;
     do {
-        unsigned int before = now;
         Psyz_VideoVSync(0);
         now = (unsigned int)Psyz_VideoVSync(-1);
-        unsigned int advanced = now - before;
-        while (advanced--) {
-            ReadPadsOnVsync();
-            if (g_PsyzVsyncCb)
-                g_PsyzVsyncCb();
-            Psyz_KernelVBlank();
-        }
+        Psyz_PollInterrupts();
     } while ((int32_t)(now - target) < 0);
     /* Keep periodic waits on their scheduled blank. Native presentation can
      * return just after it; using that late return as the next origin adds a
