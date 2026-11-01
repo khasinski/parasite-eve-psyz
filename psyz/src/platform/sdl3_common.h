@@ -465,11 +465,7 @@ static void WaitForNextFrame(void) {
      * not shown), so the limiter does, at the faster rate. Also fall back to
      * software pacing when no swapchain image was presented (e.g. minimized). */
     const double frame_time_us = target_frame_time_us / game_speed;
-    bool native_missing_present=false;
-#if defined(PE_PS5) && defined(PE_PS5_GPU_NATIVE)
-    native_missing_present=!frame_presented;
-#endif
-    if ((!use_driver_vsync || native_missing_present || game_speed > 1) &&
+    if ((!use_driver_vsync || !frame_presented || game_speed > 1) &&
         vsync_mode != PSYZ_VSYNC_LIMITLESS) {
         double time_to_wait_us =
             frame_time_us - elapsed_us + drift_compensation;

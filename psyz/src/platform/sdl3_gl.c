@@ -1593,6 +1593,24 @@ void Draw_FlushBuffer(void) {
     Draw_ResetBuffer();
 }
 
+int Psyz_GpuSetFrameInterpolation(int enabled){(void)enabled;return -1;}
+int Psyz_GpuGetFrameInterpolation(void){return 0;}
+int Psyz_GpuGetFrameInterpolationRequested(void){return 0;}
+float Psyz_GpuGetPresentedFps(void){return 0.0f;}
+unsigned long long Psyz_GpuGetInterpolatedPresentCount(void){return 0;}
+void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b){(void)a;(void)b;}
+void Psyz_GpuCopyInterpolationPacket(const void *a,const void *b){(void)a;(void)b;}
+void Psyz_GpuResetInterpolation(void){}
+void Psyz_GpuBeginInterpolationFrame(void){}
+void Psyz_GpuPrepareInterpolatedPresent(int y){(void)y;}
+
+void Psyz_GpuClearInterpolationPackets(void){}
+
+void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b){(void)a;(void)b;}
+void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b){(void)a;(void)b;}
+
+void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b){(void)a;(void)b;}
+void Psyz_GpuSetInterpolationCamera(int x,int y){(void)x;(void)y;}
 int Psyz_VideoSetDynamicLighting(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetDynamicLighting(void){return 0;}
 int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}

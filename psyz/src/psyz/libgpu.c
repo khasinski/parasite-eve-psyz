@@ -5,6 +5,7 @@
 #endif
 #include <libgpu.h>
 #include <psyz/gte.h>
+#include <psyz/gpu.h>
 #include "../../../decomp/src/libgpu/libgpu_private.h"
 #include <psyz/log.h>
 #include "../draw.h"

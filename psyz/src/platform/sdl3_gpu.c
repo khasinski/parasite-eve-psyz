@@ -77,6 +77,17 @@ typedef struct {
 
 static SDL_GPUDevice* device = NULL;
 static bool swapchain_ok = false;
+static SDL_GPUPresentMode swapchain_present_mode = SDL_GPU_PRESENTMODE_VSYNC;
+static int swapchain_window_w, swapchain_window_h;
+static SDL_WindowFlags swapchain_window_fullscreen;
+static SDL_AtomicInt swapchain_resize_pending;
+static bool SDLCALL WatchSwapchainResize(void *userdata, SDL_Event *event) {
+    (void)userdata;
+    if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && sdl3_window &&
+        event->window.windowID == SDL_GetWindowID(sdl3_window))
+        SDL_SetAtomicInt(&swapchain_resize_pending, 1);
+    return true;
+}
 /* Sticky until process restart. A failed SDL submission is consumed even when
  * Vulkan fails before queue admission, or after admission during presentation.
  * Never cancel/retry that pointer or destroy its dependency graph. */
@@ -88,8 +99,12 @@ int Psyz_GpuFailed(void) { return gpu_failed; }
 const char *Psyz_GpuFirstError(void) { return gpu_first_error; }
 int Psyz_GpuRetirementUncertain(void) { return gpu_retirement_uncertain; }
 
+#ifdef PE_PS5
 extern void CPE_GPUTrace(const char *, long long, unsigned long long, unsigned long long) __attribute__((weak));
 #define GPU_TRACE(s,r,a,b) do { if (CPE_GPUTrace) CPE_GPUTrace(s,r,a,b); } while (0)
+#else
+#define GPU_TRACE(s,r,a,b) ((void)0)
+#endif
 static bool GpuFail(const char *stage, bool uncertain) {
     gpu_retirement_uncertain |= uncertain;
     if (!gpu_failed) {
@@ -216,9 +231,9 @@ static void RecordPresentedCommit(void){
     if(!present_commit_pending)return;
     present_commit_pending=false;
     Uint64 now=SDL_GetTicks();
-    if(!present_window_start){present_window_start=now;if(present_commit_mid)++interpolated_present_count;return;}
+    if(!present_window_start){present_window_start=now;return;}
     ++present_window_frames;
-    if(present_commit_mid){++interpolated_present_count;++present_window_mid;}
+    if(present_commit_mid)++present_window_mid;
     Uint64 elapsed=now-present_window_start;
     if(elapsed>=1000){
         actual_present_fps=1000.0f*present_window_frames/(float)elapsed;
@@ -331,7 +346,7 @@ static bool InterpEnsureTarget(void) {
 void Psyz_GpuBeginInterpolationFrame(void) {
     interp_matches=0;
     ++interp_frame;if(!interp_frame){Psyz_GpuResetInterpolation();interp_frame=1;}
-    if(!interpolation_enabled)return;
+    if(!interpolation_enabled||!device||UseSoftwareBackend())return;
     if(!InterpEnsureTarget()){
         WARNF("60 Hz interpolation target unavailable; original 30 Hz presentation retained: %s",SDL_GetError());
         interpolation_enabled=false;Psyz_GpuResetInterpolation();
@@ -567,7 +582,7 @@ static void WidescreenFieldStep(int picture, float n, float* qx, float* qy) {
 /* The squeeze's fixed point. It moves 3 pixels against each pixel of view
  * shift, so the buffer holds the shifted view around its own centre: game x
  * centre + shift lands on the buffer's centre. */
-static float WidescreenPivot(int shift) {
+static float WidescreenPivot(float shift) {
     return (float)display_size.x * 0.5f -
            (float)shift * WS_SQUEEZE / (1.0f - WS_SQUEEZE);
 }
@@ -1382,14 +1397,21 @@ bool InitPlatform() {
     // useful for offscreen rendering with SDL_VIDEODRIVER=offscreen
     swapchain_ok = !hidden_gpu_renderer &&
                    SDL_ClaimWindowForGPUDevice(device, sdl3_window);
-    if (!swapchain_ok && !hidden_gpu_renderer) {
- #ifdef PE_PS5_GPU_NATIVE
+    if (swapchain_ok) {
+        swapchain_present_mode = SDL_GPU_PRESENTMODE_VSYNC;
+    } else if (!hidden_gpu_renderer) {
+#ifdef PE_PS5_GPU_NATIVE
         SDL_strlcpy(ps5_platform_init_error, SDL_GetError(), sizeof(ps5_platform_init_error));
         ERRORF("Native GPU swapchain unavailable: %s", ps5_platform_init_error);
         return false;
- #endif
+#endif
         WARNF("no swapchain, presentation disabled: %s", SDL_GetError());
     }
+
+    SDL_SetAtomicInt(&swapchain_resize_pending, 0);
+    SDL_AddEventWatch(WatchSwapchainResize, NULL);
+    SDL_GetWindowSizeInPixels(sdl3_window, &swapchain_window_w, &swapchain_window_h);
+    swapchain_window_fullscreen = SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN;
 
     if (!CreateGpuResources()) {
         return false;
@@ -1452,9 +1474,17 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
             mode = SDL_GPU_PRESENTMODE_MAILBOX;
         }
     }
-    return SDL_SetGPUSwapchainParameters(
-               device, sdl3_window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode) &&
-           enable;
+    if (mode != swapchain_present_mode) {
+        if (!SDL_SetGPUSwapchainParameters(
+                device, sdl3_window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
+            ERRORF("could not set swapchain present mode: %s", SDL_GetError());
+            SDL_ReleaseWindowFromGPUDevice(device, sdl3_window);
+            swapchain_ok = false;
+            return false;
+        }
+        swapchain_present_mode = mode;
+    }
+    return enable && mode == SDL_GPU_PRESENTMODE_VSYNC;
 }
 
 static void UpdateScissor(void);
@@ -1676,7 +1706,6 @@ static void ApplyPendingInternalRes(void) {
         Psyz_PgxpTraceReasonsEnable(1);
         pgxp_valid_polygons=pgxp_fallback_polygons=pgxp_nonfinite_polygons=0;
     }
-
     effect_geometry_correction = set_effect_geometry_correction;
     antialiasing = set_antialiasing;
     model_filtering = set_model_filtering;
@@ -2013,7 +2042,6 @@ static SDL_GPUBlitRegion PrescaleWidescreen(
             SDL_clamp((Uint32)SDL_lroundf((y1 - y0) * (float)ky), 1u, ph - py)};
 }
 
-
 #ifdef PE_PS5
 /* Unsqueezed CPU equivalent of WidescreenFieldStep. Quantize at the actual
  * destination grid; retain the fractional remainder for presentation. */
@@ -2068,6 +2096,34 @@ static void CpuWideSummary(int ready,int reason) {
 #include "movie_blur.h"
 #include "movie_cleanup/present_movie_cleanup.h"
 #endif
+
+/* SDL's D3D12 ResizeBuffers failure path frees the old views before it knows
+ * whether resizing succeeded. Recreate the claimed swapchain at a frame
+ * boundary instead, while its old views are still valid. Keep VRAM intact. */
+static bool RefreshWindowSwapchain(void) {
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(sdl3_window, &w, &h);
+    SDL_WindowFlags fullscreen = SDL_GetWindowFlags(sdl3_window) & SDL_WINDOW_FULLSCREEN;
+    if (w <= 0 || h <= 0) return false;
+    if (swapchain_ok && !SDL_GetAtomicInt(&swapchain_resize_pending) &&
+        w == swapchain_window_w && h == swapchain_window_h &&
+        fullscreen == swapchain_window_fullscreen) return true;
+    Draw_FlushBuffer();
+    if (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device)) return false;
+    if (swapchain_ok) SDL_ReleaseWindowFromGPUDevice(device, sdl3_window);
+    SDL_SetAtomicInt(&swapchain_resize_pending, 0);
+    swapchain_ok = SDL_ClaimWindowForGPUDevice(device, sdl3_window);
+    if (!swapchain_ok) {
+        ERRORF("could not recreate window swapchain: %s", SDL_GetError());
+        return false;
+    }
+    swapchain_present_mode = SDL_GPU_PRESENTMODE_VSYNC;
+    swapchain_window_w = w;
+    swapchain_window_h = h;
+    swapchain_window_fullscreen = fullscreen;
+    PlatformBackend_SetDriverVsync(use_driver_vsync);
+    return swapchain_ok;
+}
 
 static void PlatformBackend_Present(void) {
     frame_presented=false;present_commit_pending=false;
@@ -2170,6 +2226,7 @@ static void PlatformBackend_Present(void) {
         return;
     }
     if (!sdl3_window && !InitPlatform()) {
+        finish_time = SDL_GetPerformanceCounter();
         return;
     }
     if (!ws_capture_active && Sdl3Common_IsInBackground()) {
@@ -2177,26 +2234,42 @@ static void PlatformBackend_Present(void) {
         return;
     }
 
+    Draw_FlushBuffer();
     ApplyPendingInternalRes();
+    bool can_present = swapchain_ok && !present_skip;
+    if (!ws_capture_active && !hidden_gpu_renderer &&
+        !SDL_strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") &&
+        !RefreshWindowSwapchain()) {
+        can_present = false;
+    }
     if(ws_capture_active)interp_present_mid=false;
     else {
         interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
             interpolated_scale==internal_res&&interp_next_y>=0&&interp_next_y<=VRAM_H-display_size.y&&
-            !display_rgb24&&!native_movie_active&&!debug_show_vram&&game_speed==1&&interp_phase++==1;
-        /* Count only after successful swapchain submission, never a request. */
+            !display_rgb24&&
+#ifdef PE_PS5_GPU_NATIVE
+            !native_movie_active&&
+#endif
+            !debug_show_vram&&game_speed==1&&interp_phase++==1;
+        if(interp_present_mid)++interpolated_present_count;
     }
 
-    if(display_rgb24||native_movie_active||game_speed!=1)Psyz_GpuResetInterpolation();
+    if(display_rgb24||
+#ifdef PE_PS5_GPU_NATIVE
+       native_movie_active||
+#endif
+       game_speed!=1)Psyz_GpuResetInterpolation();
     SDL_GPUTexture* rgb24 =
-        disp_on && display_rgb24 && !debug_show_vram && !present_skip
+        disp_on && display_rgb24 && !debug_show_vram && (ws_capture_active || can_present)
             ? PrepareRgb24Display()
             : NULL;
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
+        finish_time = SDL_GetPerformanceCounter();
         return;
     }
     // a skipped frame still submits its drawing, without a swapchain image
-    if (ws_capture_active || (swapchain_ok && !present_skip)) {
+    if (ws_capture_active || can_present) {
         SDL_GPUTexture* swapchain = NULL;
         Uint32 sc_w = 0, sc_h = 0;
         if (ws_capture_active) {
@@ -2205,8 +2278,12 @@ static void PlatformBackend_Present(void) {
             sc_h = ws_capture_height;
         } else if (!SDL_WaitAndAcquireGPUSwapchainTexture(
                        cmd, sdl3_window, &swapchain, &sc_w, &sc_h)) {
+#ifdef PE_PS5_GPU_NATIVE
             GpuFail("SDL_WaitAndAcquireGPUSwapchainTexture", true);
             return; /* retain the acquired graph; no silent unseen advance */
+#else
+            WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
+#endif
         }
         if (swapchain) {
             if (!ws_capture_active){frame_presented=true;present_commit_pending=!host_clock_pause_depth;present_commit_mid=interp_present_mid;}
@@ -2459,6 +2536,7 @@ static void QuitPlatform(void) {
 #ifdef PE_PS5_GPU_NATIVE
     SDL_Log("[Native quit] stage=retire-begin device=%d",device!=NULL);
 #endif
+    SDL_RemoveEventWatch(WatchSwapchainResize, NULL);
     SoftwareRasterizer_SetMaterialSampler(NULL);
     CpuMaterialReset();
     if (device) {
@@ -2982,6 +3060,18 @@ int Psyz_VideoSetWidescreen(int enabled) {
 #endif
         ws_picture[0].y = ws_picture[1].y = -1;
         ws_centred = false;
+        if (!widescreen && device) {
+            if (prescale_display) {
+                SDL_ReleaseGPUTexture(device, prescale_display);
+                prescale_display = NULL;
+                prescale_width = prescale_height = 0;
+            }
+            if (ws_capture) {
+                SDL_ReleaseGPUTexture(device, ws_capture);
+                ws_capture = NULL;
+                ws_capture_width = ws_capture_height = 0;
+            }
+        }
     }
     return 0;
 }
@@ -3298,7 +3388,7 @@ void Psyz_CpuMaterialEndPrimitive(void) { (void)CpuMaterialTake(); }
 int Draw_PushPrim(u_long* packets, int max_len) {
     int dialogue_glyph=dialogue_next_glyph,font_context=dialogue_next_context;unsigned font_crop=dialogue_next_crop,font_width=dialogue_next_width;dialogue_next_glyph=dialogue_next_context=-1;
     if (UseSoftwareBackend()) {
-        #ifdef PE_PS5
+#ifdef PE_PS5
         CpuWideContext();
         if(next_sprite_extension && (max_len<3 || (((unsigned)packets[0]>>24)&~3u)!=0x7cu))SoftwareRasterizer_WideReject();
         SoftwareRasterizer_SetExtensionSampler(next_sprite_extension && max_len>=3 && (((unsigned)packets[0]>>24)&~3u)==0x7cu?CpuExtensionSample:NULL);
@@ -3312,6 +3402,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
 #endif
         return consumed;
     }
+    interpolation_packet_current=packets;
     int len = max_len;
     int code = (int)(*packets >> 24) & 0xFF;
     if(font_context<0||font_context>1||dialogue_glyph<0||dialogue_glyph>=78||!native_fonts[font_context].valid||!native_fonts[font_context].enabled||!native_fonts[font_context].texture||!native_fonts[font_context].sampler||!scaled_vram_render||internal_res<2||font_crop>11||!font_width||font_width>12-font_crop||!((font_context==0&&code==0x64&&max_len>=4&&(packets[3]&65535u)==12u&&((packets[3]>>16)&65535u)==12u)||(font_context==1&&code==0x2c&&max_len>=9)))dialogue_glyph=-1;
