@@ -3583,6 +3583,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             if (nVertices == 4) {
                 Vertex second[3] = {vertex_cur[1], vertex_cur[3],
                                     vertex_cur[2]};
+                if (code & SEMITRANSP) {
+                    second[0].a = 0x81;
+                }
                 memcpy(vertex_cur + 3, second, sizeof(second));
                 index_cur[3] = n_vertices + 3;
                 index_cur[4] = n_vertices + 4;
@@ -3685,7 +3688,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 q[3].r = cr[s];
                 q[3].g = cg[s];
                 q[3].b = cb[s];
-                q[3].a = ca[s];
+                q[3].a = (code & SEMITRANSP) ? 0x81 : ca[s];
                 q[1].r = cr[s + 1];
                 q[1].g = cg[s + 1];
                 q[1].b = cb[s + 1];
@@ -3708,9 +3711,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 index_cur[0] = base + 0;
                 index_cur[1] = base + 1;
                 index_cur[2] = base + 2;
-                index_cur[3] = base + 0;
-                index_cur[4] = base + 2;
-                index_cur[5] = base + 3;
+                index_cur[3] = base + 3;
+                index_cur[4] = base + 0;
+                index_cur[5] = base + 2;
                 Draw_EnqueueBuffer(4, 6);
             }
         }
@@ -3789,15 +3792,18 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         }
         VRGBA(vertex_cur[1]) = VRGBA(vertex_cur[2]) = VRGBA(vertex_cur[3]) =
             VRGBA(vertex_cur[0]);
+        if (code & SEMITRANSP) {
+            vertex_cur[3].a = 0x81;
+        }
         if (!isTextured) {
             WidenFullWidthFill(vertex_cur, 4);
         }
         index_cur[0] = n_vertices + 0;
         index_cur[1] = n_vertices + 1;
         index_cur[2] = n_vertices + 2;
-        index_cur[3] = n_vertices + 1;
-        index_cur[4] = n_vertices + 3;
-        index_cur[5] = n_vertices + 2;
+        index_cur[3] = n_vertices + 3;
+        index_cur[4] = n_vertices + 2;
+        index_cur[5] = n_vertices + 1;
         if (atlas) {
             float width=(float)HD_ATLAS_WIDTH,height=(float)HD_ATLAS_HEIGHT;
             atlas_cell+=atlas->first_cell;
@@ -3976,7 +3982,15 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     SDL_EndGPUCopyPass(copy);
     MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
     DuckUpload((SDL_Rect){rect->x,rect->y,rect->w,rect->h},(const unsigned short *)p);
-    SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    int max_x = SDL_max(640, SDL_max(display_area.x + display_size.x,
+                                     scissor_rect.x + scissor_rect.w));
+    int max_y = SDL_max(480, SDL_max(display_area.y + display_size.y,
+                                     scissor_rect.y + scissor_rect.h));
+    if (rect->x < max_x && rect->y < max_y) {
+        SyncNativeVramToScaled(
+            rect->x, rect->y, SDL_min(rect->w, max_x - rect->x),
+            SDL_min(rect->h, max_y - rect->y));
+    }
 }
 
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
@@ -3994,6 +4008,33 @@ void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
         return;
     }
     if (!device || !vram_render) {
+        return;
+    }
+    bool overlap_pending =
+        n_vertices > 0 && rect->x < scissor_rect.x + scissor_rect.w &&
+        scissor_rect.x < rect->x + rect->w &&
+        rect->y < scissor_rect.y + scissor_rect.h &&
+        scissor_rect.y < rect->y + rect->h;
+    if (overlap_pending) {
+        Draw_FlushBuffer();
+    }
+    bool all_known = true;
+    for (int y = 0; y < rect->h && all_known; ++y) {
+        size_t o = (size_t)(rect->y + y) * VRAM_W + rect->x;
+        for (int x = 0; x < rect->w; ++x) {
+            if (!duck_known[o + x]) {
+                all_known = false;
+                break;
+            }
+        }
+    }
+    if (all_known) {
+        u16* dst = (u16*)p;
+        for (int y = 0; y < rect->h; ++y) {
+            memcpy(dst + (size_t)y * rect->w,
+                   duck_words + (size_t)(rect->y + y) * VRAM_W + rect->x,
+                   (size_t)rect->w * sizeof(u16));
+        }
         return;
     }
     Draw_FlushBuffer(); // flush primitives before operating with the VRAM
@@ -4102,6 +4143,133 @@ void Draw_ResetBuffer(void) {
     batch_has_texture = false;
 }
 
+typedef struct {
+    int rx0, ry0, rx1, ry1;
+    float x[3], y[3];
+} SemiTri;
+
+static SemiTri ComputeSemiTri(
+    int tri_start, bool midpoint, unsigned target_index, unsigned target_scale,
+    float sub_x, float sub_y, float grid_scale_x, float target_centre,
+    float ws_squeeze) {
+    SemiTri t;
+    for (int k = 0; k < 3; ++k) {
+        const Vertex* v = midpoint
+                              ? &interpolated_vertices[index_buf[tri_start + k]]
+                              : &vertex_buf[index_buf[tri_start + k]];
+        float bias =
+            ((v->t & TPAGE_POLYGON) && target_scale == 1) ? 0.5f : 0.0f;
+        bool use_pgxp =
+            (midpoint ||
+             (target_index &&
+              (geometry_correction || effect_geometry_correction) &&
+              (v->t & TPAGE_POLYGON))) &&
+            v->pgxp_pos[2] > 0.0f;
+        float vx = (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
+        float vy = (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
+        float x = draw_offset.x + (vx + bias) * grid_scale_x;
+        x = (target_centre + (x - target_centre) * ws_squeeze) * target_scale;
+        float y = (draw_offset.y + vy + bias) * target_scale;
+        t.x[k] = x;
+        t.y[k] = y;
+    }
+    float min_x = SDL_min(t.x[0], SDL_min(t.x[1], t.x[2]));
+    float max_x = SDL_max(t.x[0], SDL_max(t.x[1], t.x[2]));
+    float min_y = SDL_min(t.y[0], SDL_min(t.y[1], t.y[2]));
+    float max_y = SDL_max(t.y[0], SDL_max(t.y[1], t.y[2]));
+    t.rx0 = (int)SDL_floorf(min_x);
+    t.ry0 = (int)SDL_floorf(min_y);
+    t.rx1 = (int)SDL_ceilf(max_x);
+    t.ry1 = (int)SDL_ceilf(max_y);
+    return t;
+}
+
+static bool SemiTrisDisjoint(const SemiTri* a, const SemiTri* b) {
+    if (a->rx1 <= b->rx0 || b->rx1 <= a->rx0 ||
+        a->ry1 <= b->ry0 || b->ry1 <= a->ry0) {
+        return true;
+    }
+    int shared_a[2], shared_b[2], n_shared = 0;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            if (a->x[i] == b->x[j] && a->y[i] == b->y[j]) {
+                if (n_shared < 2) {
+                    shared_a[n_shared] = i;
+                    shared_b[n_shared] = j;
+                }
+                n_shared++;
+                break;
+            }
+        }
+    }
+    if (n_shared == 2) {
+        int oa = 3 - shared_a[0] - shared_a[1];
+        int ob = 3 - shared_b[0] - shared_b[1];
+        float px = a->x[shared_a[0]], py = a->y[shared_a[0]];
+        float dx = a->x[shared_a[1]] - px, dy = a->y[shared_a[1]] - py;
+        float ca = dx * (a->y[oa] - py) - dy * (a->x[oa] - px);
+        float cb = dx * (b->y[ob] - py) - dy * (b->x[ob] - px);
+        if ((ca > 0.0f && cb < 0.0f) || (ca < 0.0f && cb > 0.0f)) {
+            return true;
+        }
+    }
+    const SemiTri* pairs[2][2] = {{a, b}, {b, a}};
+    for (int p = 0; p < 2; ++p) {
+        const SemiTri* t1 = pairs[p][0];
+        const SemiTri* t2 = pairs[p][1];
+        for (int i = 0; i < 3; ++i) {
+            int j = (i + 1) % 3;
+            int k = (i + 2) % 3;
+            float px = t1->x[i], py = t1->y[i];
+            float dx = t1->x[j] - px, dy = t1->y[j] - py;
+            float c_in = dx * (t1->y[k] - py) - dy * (t1->x[k] - px);
+            if (c_in == 0.0f)
+                continue;
+            if (c_in < 0.0f) {
+                dx = -dx;
+                dy = -dy;
+            }
+            float margin = -(SDL_fabsf(dx) + SDL_fabsf(dy));
+            if (dx * (t2->y[0] - py) - dy * (t2->x[0] - px) <= margin &&
+                dx * (t2->y[1] - py) - dy * (t2->x[1] - px) <= margin &&
+                dx * (t2->y[2] - py) - dy * (t2->x[2] - px) <= margin) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void MergeSemiCopyRect(
+    SDL_Rect* copy_rects, int* num_rects, SDL_Rect r, unsigned target_scale) {
+    bool merged = true;
+    int64_t pad_area = (int64_t)1024 * target_scale * target_scale;
+    while (merged) {
+        merged = false;
+        for (int i = 0; i < *num_rects; ++i) {
+            int ux0 = SDL_min(r.x, copy_rects[i].x);
+            int uy0 = SDL_min(r.y, copy_rects[i].y);
+            int ux1 = SDL_max(r.x + r.w, copy_rects[i].x + copy_rects[i].w);
+            int uy1 = SDL_max(r.y + r.h, copy_rects[i].y + copy_rects[i].h);
+            bool overlaps = r.x < copy_rects[i].x + copy_rects[i].w &&
+                            copy_rects[i].x < r.x + r.w &&
+                            r.y < copy_rects[i].y + copy_rects[i].h &&
+                            copy_rects[i].y < r.y + r.h;
+            int64_t union_area = (int64_t)(ux1 - ux0) * (uy1 - uy0);
+            int64_t sum_area = (int64_t)r.w * r.h +
+                               (int64_t)copy_rects[i].w * copy_rects[i].h +
+                               pad_area;
+            if (overlaps || union_area <= sum_area) {
+                r = (SDL_Rect){ux0, uy0, ux1 - ux0, uy1 - uy0};
+                copy_rects[i] = copy_rects[--(*num_rects)];
+                merged = true;
+                break;
+            }
+        }
+    }
+    copy_rects[(*num_rects)++] = r;
+}
+
 void Draw_FlushBuffer(void) {
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
@@ -4203,16 +4371,87 @@ void Draw_FlushBuffer(void) {
         if(midpoint&&field_picture>=0){sub_x=ws_mid_qx[field_picture];sub_y=ws_mid_qy[field_picture];}
         SDL_GPUTexture* destination_sample =
             target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
+        enum { MAX_SEMI_BATCH_TRIS = 256 };
+        SemiTri batch_tris[MAX_SEMI_BATCH_TRIS];
+        SDL_Rect copy_rects[MAX_SEMI_BATCH_TRIS];
+        const int clip_x0 = SDL_max(0, clip.x) * (int)target_scale;
+        const int clip_y0 = SDL_max(0, clip.y) * (int)target_scale;
+        const int clip_x1 = SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale;
+        const int clip_y1 = SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale;
+        const float grid_scale_x = GetDrawGridXScale();
         int start = 0;
         while (start < n_indices) {
             bool semi = vertex_buf[index_buf[start]].a != 0xFF;
             int end = start + 3;
+            int num_batch_tris = 0;
+            int num_copy_rects = 0;
             if (!semi) {
                 while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF)
                     end += 3;
             } else {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81)
-                    end += 3;
+                int p_start = start;
+                while (p_start < n_indices &&
+                       vertex_buf[index_buf[p_start]].a != 0xFF) {
+                    int p_end = p_start + 3;
+                    while (p_end < n_indices &&
+                           vertex_buf[index_buf[p_end]].a == 0x81)
+                        p_end += 3;
+                    int prim_tris = (p_end - p_start) / 3;
+                    if (p_start > start &&
+                        (prim_tris > 2 ||
+                         num_batch_tris + prim_tris > MAX_SEMI_BATCH_TRIS)) {
+                        break;
+                    }
+                    SemiTri cand[2];
+                    int px0 = clip_x1, py0 = clip_y1, px1 = clip_x0,
+                        py1 = clip_y0;
+                    bool overlap = false;
+                    for (int t = 0; t < prim_tris; ++t) {
+                        SemiTri st = ComputeSemiTri(
+                            p_start + t * 3, midpoint, target_index,
+                            target_scale, sub_x, sub_y, grid_scale_x,
+                            target_centre, ws_squeeze);
+                        px0 = SDL_min(px0, st.rx0 - 1);
+                        py0 = SDL_min(py0, st.ry0 - 1);
+                        px1 = SDL_max(px1, st.rx1 + 1);
+                        py1 = SDL_max(py1, st.ry1 + 1);
+                        if (p_start > start && prim_tris <= 2) {
+                            for (int b = 0; b < num_batch_tris; ++b) {
+                                if (!SemiTrisDisjoint(&st, &batch_tris[b])) {
+                                    overlap = true;
+                                    break;
+                                }
+                            }
+                            if (overlap)
+                                break;
+                        }
+                        if (t < 2)
+                            cand[t] = st;
+                    }
+                    if (overlap)
+                        break;
+                    px0 = SDL_max(px0, clip_x0);
+                    py0 = SDL_max(py0, clip_y0);
+                    px1 = SDL_min(px1, clip_x1);
+                    py1 = SDL_min(py1, clip_y1);
+                    if (px1 > px0 && py1 > py0) {
+                        for (int t = 0; t < prim_tris && t < 2 &&
+                                        num_batch_tris < MAX_SEMI_BATCH_TRIS;
+                             ++t) {
+                            batch_tris[num_batch_tris++] = cand[t];
+                        }
+                        MergeSemiCopyRect(
+                            copy_rects, &num_copy_rects,
+                            (SDL_Rect){px0, py0, px1 - px0, py1 - py0},
+                            target_scale);
+                    }
+                    end = p_end;
+                    p_start = p_end;
+                }
+                if (num_copy_rects == 0) {
+                    start = end;
+                    continue;
+                }
             }
             /* Three sampled textures, up to two draws (color and mask). Reserve
              * both heaps' worst-case sampler use before any destination copy.
@@ -4223,54 +4462,18 @@ void Draw_FlushBuffer(void) {
                 return;
             }
             if (semi) {
-                int x0 = (clip.x + clip.w) * (int)target_scale;
-                int y0 = (clip.y + clip.h) * (int)target_scale;
-                int x1 = clip.x * (int)target_scale;
-                int y1 = clip.y * (int)target_scale;
-                for (int i = start; i < end; ++i) {
-                    const Vertex* v = midpoint ? &interpolated_vertices[index_buf[i]] : &vertex_buf[index_buf[i]];
-                    float bias = ((v->t & TPAGE_POLYGON) && target_scale == 1)
-                                     ? 0.5f
-                                     : 0.0f;
-                    bool use_pgxp =
-                        (midpoint ||
-                         (target_index &&
-                          (geometry_correction || effect_geometry_correction) &&
-                          (v->t & TPAGE_POLYGON))) &&
-                        v->pgxp_pos[2] > 0.0f;
-                    float vx =
-                        (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
-                    float vy =
-                        (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
-                    float x = draw_offset.x + (vx + bias) * GetDrawGridXScale();
-                    x = (target_centre + (x - target_centre) * ws_squeeze) *
-                        target_scale;
-                    float y = (draw_offset.y + vy + bias) * target_scale;
-                    x0 = SDL_min(x0, (int)SDL_floorf(x) - 1);
-                    x1 = SDL_max(x1, (int)SDL_ceilf(x) + 1);
-                    y0 = SDL_min(y0, (int)SDL_floorf(y) - 1);
-                    y1 = SDL_max(y1, (int)SDL_ceilf(y) + 1);
-                }
-                x0 = SDL_max(x0, SDL_max(0, clip.x) * (int)target_scale);
-                y0 = SDL_max(y0, SDL_max(0, clip.y) * (int)target_scale);
-                x1 = SDL_min(
-                    x1, SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale);
-                y1 = SDL_min(
-                    y1, SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale);
-                if (x1 <= x0 || y1 <= y0) {
-                    start = end;
-                    continue;
-                }
                 SDL_GPUCopyPass* blend_copy = SDL_BeginGPUCopyPass(cmd);
-                SDL_GPUTextureLocation from = {
-                    .texture = render_target,
-                    .x = (Uint32)x0,
-                    .y = (Uint32)y0};
-                SDL_GPUTextureLocation to = from;
-                to.texture = destination_sample;
-                SDL_CopyGPUTextureToTexture(
-                    blend_copy, &from, &to, (Uint32)(x1 - x0),
-                    (Uint32)(y1 - y0), 1, false);
+                for (int i = 0; i < num_copy_rects; ++i) {
+                    SDL_GPUTextureLocation from = {
+                        .texture = render_target,
+                        .x = (Uint32)copy_rects[i].x,
+                        .y = (Uint32)copy_rects[i].y};
+                    SDL_GPUTextureLocation to = from;
+                    to.texture = destination_sample;
+                    SDL_CopyGPUTextureToTexture(
+                        blend_copy, &from, &to, (Uint32)copy_rects[i].w,
+                        (Uint32)copy_rects[i].h, 1, false);
+                }
                 SDL_EndGPUCopyPass(blend_copy);
             }
             const SDL_GPUColorTargetInfo target = {
