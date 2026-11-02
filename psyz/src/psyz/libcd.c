@@ -347,6 +347,7 @@ static int data_read_active = 0;
 static int data_sector_valid = 0;
 static int data_sector_number = 0;
 static int data_getsector_count = 0;
+static size_t data_getsector_offset;
 
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
 // param = 0x00. Equals the absolute sector where the last track's file ends.
@@ -967,14 +968,18 @@ int CD_vol(CdlATV* vol) {
 }
 
 int CD_getsector(void* madr, int size) {
-    size_t bytes = (size_t)size * 4;
-    if (!data_sector_valid || !madr)
+    if (!data_sector_valid || !madr || size < 0)
         return -1;
-    size_t offset = data_getsector_count++ == 0 ? 12u : 24u;
-    if (offset + bytes > sizeof(data_sector))
+    size_t bytes = (size_t)size * 4;
+    size_t offset = data_getsector_count == 0 ? 12u : data_getsector_offset;
+    if (bytes > sizeof(data_sector) - offset)
         return -1;
     memcpy(madr, data_sector + offset, bytes);
-    if (offset == 24u) {
+    data_getsector_offset = offset + bytes;
+    ++data_getsector_count;
+    /* Reads consume the FIFO, not a fixed header/payload call pair. Scene
+     * sectors split the user data into a 60-byte header and its remainder. */
+    if (data_getsector_offset >= 24u + 2048u) {
         data_sector_valid = 0;
         data_sector_number++;
         data_getsector_count = 0;
@@ -1024,14 +1029,22 @@ void Psyz_CdPump(void) {
     while (budget-- > 0 && data_read_active && CD_cbready && !sync_irq_pending) {
         u_char res[8] = {0};
         CdlCB cb = CD_cbready;
-        int before = data_sector_number;
         int state = CD_ready(1, res);
         if (state != CdlDataReady) {
             break;
         }
+        int before = data_sector_number; /* CD_ready may have skipped XA audio */
         cb(CdlDataReady, res);
         if (data_sector_number == before && data_sector_valid) {
-            break; /* callback did not consume the sector; deliver again next frame */
+            if (data_getsector_count == 0) {
+                break; /* no read: a full STR ring retains this sector for retry */
+            }
+            /* A filesystem callback may inspect only the header to skip a
+             * chunk. Hardware still advances at the next sector interrupt;
+             * discard the unread payload rather than replaying it as a header. */
+            data_sector_valid = 0;
+            data_sector_number++;
+            data_getsector_count = 0;
         }
     }
     in_pump = 0;

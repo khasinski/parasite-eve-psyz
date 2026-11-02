@@ -64,14 +64,11 @@ void GsInitVcount() { NOT_IMPLEMENTED; }
 void GsClearOt(unsigned short offset, unsigned short point, GsOT* otp) {
     otp->offset = offset;
     otp->point = point;
-#if 1
-    otp->tag = otp->org;
-    ClearOTag((OT_TYPE*)otp->tag, 1 << otp->length);
-#else
-    // TODO
-// otp->tag = &otp->org[4 << otp->length - 1];
-//  ClearOTagR(otp->org, 1 << otp->length);
-#endif
+    /* Gs OTs run from the farthest bucket down to bucket zero. Callers
+     * terminate org[0] and insert into higher buckets after clearing. */
+    unsigned int count = 1u << otp->length;
+    ClearOTagR((OT_TYPE*)otp->org, count);
+    otp->tag = otp->org + count - 1;
 }
 
 void GsInitGraph(unsigned short x, unsigned short y, unsigned short intmode,

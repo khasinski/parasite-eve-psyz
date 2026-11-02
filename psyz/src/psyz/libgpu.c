@@ -244,6 +244,22 @@ static void DispatchPackets(u_long* buf, int len) {
             break;
         default:
             if (code >= 0x20 && code < 0x80) {
+                /* A textured polygon also writes draw-mode bits 0..8. Later
+                 * sprites inherit this page (e.g. UI corners after FT4 edges).
+                 * Dither/display-area bits 9..10 remain from GP0(E1h).
+                 * https://psx-spx.consoledev.net/graphicsprocessingunitgpu/#tpage-attribute-parameter-for-textured-polygon-commands */
+                if (code < 0x40 && (code & 4)) {
+                    int gouraud = !!(code & 0x10);
+                    int vertices = (code & 8) ? 4 : 3;
+                    int required = 1 + vertices * (2 + gouraud) - gouraud;
+                    if (len - i >= required) {
+                        int pageWord = gouraud ? 5 : 4;
+                        GPU_STATUS = (GPU_STATUS & ~0x1FFu) |
+                                     ((u32)(buf[i + pageWord] >> 16) & 0x1FFu);
+                        u_long mode = GPU_STATUS & 0x7FFu;
+                        Draw_SetTexpageMode((ParamDrawTexpageMode*)&mode);
+                    }
+                }
                 VramCopyDrawn();
                 i += Draw_PushPrim(&buf[i], len - i) - 1;
                 break;
