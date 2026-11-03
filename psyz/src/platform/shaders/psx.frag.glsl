@@ -164,6 +164,28 @@ void main() {
             enhancedPixel=true;
         }
     }
+    // Feather only matched opaque HD room pixels on the presentation target.
+    // Filter coverage, never RGB/STP: black+STP is covered, transparent zero
+    // is not. Clamp to the sprite's native UV bounds to avoid neighbouring
+    // VRAM tiles. Keeping this band inside native coverage preserves cutouts
+    // and avoids introducing foreground color over actors outside the mask.
+    if (enhancedPixel && hdUV.z<1.5 && polygon==0u &&
+        !isSemiTrans && passMode.x==0u) {
+        vec2 pos=rawUV-vec2(0.5);
+        ivec2 origin=ivec2(floor(pos));
+        // Each 16x16 tile occupies 64 HD texels plus a two-texel gutter.
+        // Derive its native bounds even when widescreen UV clamping is off.
+        vec2 local=(mod(hdUV.xy*vec2(textureSize(texHD,0)),68.0)-2.0)/4.0;
+        ivec2 lo=ivec2(round(rawUV-local)),hi=lo+ivec2(15);
+        vec2 weight=fract(pos);
+        float a=fetchModelTexel(clamp(origin,lo,hi))!=vec4(0)?1.0:0.0;
+        float b=fetchModelTexel(clamp(origin+ivec2(1,0),lo,hi))!=vec4(0)?1.0:0.0;
+        float c=fetchModelTexel(clamp(origin+ivec2(0,1),lo,hi))!=vec4(0)?1.0:0.0;
+        float d=fetchModelTexel(clamp(origin+ivec2(1,1),lo,hi))!=vec4(0)?1.0:0.0;
+        float coverage=mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
+        FragColor=vec4(modColor*coverage,coverage);
+        return;
+    }
     // Exact source-page/CLUT matching owns identity; native texel still owns
     // transparent cutouts, STP, mask writes and blend classification.
     if (passMode.y>1u && hdUV.z>4.5 && polygon!=0u && textureMode!=0u) {
