@@ -741,7 +741,7 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
         for(int y=0;y<136;++y)for(int x=0;x<68;++x){
             u8 *p=(u8 *)atlas->pixels+y*atlas->pitch+x*4;
             p[0]=y<68?240:0;p[1]=y<68?40:(x<34?255:0);p[2]=y<68?20:0;
-            p[3]=(kind && y<68)?128:255;
+            p[3]=(kind && y<68)?(x<14?0:128):255;
         }
         zassert_s32_eq(1,SDL_SavePNG(atlas,path));
         zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+kind,path));
@@ -749,7 +749,7 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     char webp_path[512],ref_path[512];
     snprintf(webp_path,sizeof(webp_path),"%spsyz-matte-%llu.webp",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
     snprintf(ref_path,sizeof(ref_path),"%.*s.ref.png",(int)strlen(webp_path)-5,webp_path);
-    static const u8 encoded[]={82,73,70,70,36,0,0,0,87,69,66,80,86,80,56,76,23,0,0,0,47,67,192,16,16,7,80,148,194,151,162,128,1,32,33,252,159,47,69,244,63,21,3,0};
+    static const u8 encoded[]={82,73,70,70,44,0,0,0,87,69,66,80,86,80,56,76,31,0,0,0,47,67,192,16,16,15,48,40,3,63,20,3,24,135,32,11,6,201,32,127,155,204,230,208,21,209,255,200,128,94,11,0};
     SDL_Surface *ref=SDL_CreateSurface(68,68,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,ref);
     SDL_Rect rect={0,68,68,68};SDL_SetSurfaceBlendMode(atlas,SDL_BLENDMODE_NONE);
     zassert_s32_eq(1,SDL_BlitSurface(atlas,&rect,ref,NULL));zassert_s32_eq(1,SDL_SavePNG(ref,ref_path));
@@ -786,6 +786,7 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     zassert_s32_eq(0,memcmp(images[2],images[3],(size_t)w*h*3));
     zassert_s32_eq(0,memcmp(images[4],images[5],(size_t)w*h*3));
     /* A half-covered red material must blend with the dark background. */
+    zassert_s32_eq(1,images[1][(80*w+68)*3]<32 && images[0][(80*w+68)*3]>32);
     const u8 *opaque=images[0]+(80*w+80)*3,*partial=images[1]+(80*w+80)*3;
     zassert_s32_eq(1,partial[0]<opaque[0] && partial[0]>32);
     /* The native-zero side can receive reviewed fractional HD coverage,
