@@ -367,8 +367,8 @@ void Psyz_CdShellOpen(int is_open) {
         CD_status |= CdlStatShellOpen;
         CD_status &= ~CdlStatStandby;
     } else {
-        CD_status &= ~CdlStatShellOpen;
-        CD_status |= CdlStatStandby;
+        /* Closing the lid spins the drive up from rest: no read, seek or play activity survives a disc change. */
+        CD_status = CdlStatStandby;
     }
 }
 
