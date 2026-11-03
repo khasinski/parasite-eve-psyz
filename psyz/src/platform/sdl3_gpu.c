@@ -402,6 +402,7 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
 typedef struct SpriteAtlas {
     uint64_t key;
     unsigned columns, rows, first_cell;
+    bool authored_coverage;
 } SpriteAtlas;
 static SpriteAtlas sprite_atlases[512];
 static unsigned sprite_atlas_count;
@@ -777,6 +778,7 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
         SDL_DestroySurface(rgba); return -1;
     }
     unsigned columns=(unsigned)w/68,rows=(unsigned)h/136,cells=columns*rows;
+    bool authored_coverage=false;
     /* This SDL revision's Metal uploader uses destination width for row
      * pitch. Pack every cell contiguously instead of relying on row strides. */
     for (unsigned cell=0;cell<cells;++cell) for (unsigned reference=0;reference<2;++reference) {
@@ -788,7 +790,10 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
             u8 solid[68][68];
             for (unsigned row=0;row<68;++row) {
                 u8 *line=target+(size_t)row*68*4;
-                for (unsigned col=0;col<68;++col) solid[row][col]=line[col*4+3]>=128;
+                for (unsigned col=0;col<68;++col) {
+                    solid[row][col]=line[col*4+3]>=128;
+                    authored_coverage |= line[col*4+3]!=255;
+                }
                 for (unsigned col=1;col<68;++col) {
                     if (!solid[row][col] && solid[row][col-1]) {
                         memcpy(line+col*4,line+(col-1)*4,3);
@@ -833,7 +838,7 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     SDL_EndGPUCopyPass(copy);
     SDL_ReleaseGPUTransferBuffer(device,upload);
-    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells};
+    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage};
     sprite_atlas_cells+=cells;
     sprite_atlas_bytes+=bytes;
     INFOF("HD sprite atlas %016llx: %dx%d (%zu MiB cached)",(unsigned long long)key,w,h,sprite_atlas_bytes/(1024*1024));
@@ -3811,7 +3816,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
-                vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen&&sprite_atlases_enabled?2:3):(sprite_atlases_enabled?1:0);
+                vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen&&sprite_atlases_enabled?2:3):
+                    (sprite_atlases_enabled?(atlas->authored_coverage?6:1):0);
             }
         }
         for (int i = 0; i < 4; ++i) {

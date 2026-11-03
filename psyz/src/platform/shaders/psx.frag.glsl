@@ -120,6 +120,23 @@ void main() {
             a.a==b.a && a.a==c.a && a.a==d.a)
             texColor=mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
     }
+    // An explicitly alpha-authored room atlas may refine an opaque cutout in
+    // the scaled presentation. Native VRAM, mask writes, palette fallback and
+    // all PS1 semi-transparent primitives keep their original texel rules.
+    // Opaque draws use ONE / ONE_MINUS_SRC_ALPHA, so output premultiplied RGB.
+    if (passMode.y>1u && passMode.x==0u && hdUV.z>5.5 && hdUV.z<6.5 &&
+        textureMode!=0u && vertexColor.a>=0.75) {
+        ivec2 size=textureSize(texHD,0);
+        ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
+        vec3 basis=texelFetch(texHD,reference,0).rgb;
+        if (all(equal(floor(basis*31.0+0.5),floor(texColor.rgb*31.0+0.5)))) {
+            vec4 material=texture(texHD,hdUV.xy);
+            if (material.a<=0.0) discard;
+            vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+            FragColor=vec4(clamp(material.rgb*tint,0.0,1.0)*material.a,material.a);
+            return;
+        }
+    }
     // check for full transparency
     if (texColor == vec4(0, 0, 0, 0)) {
         if (passMode.x != 0u) discard;
@@ -153,7 +170,8 @@ void main() {
     bool enhancedPixel=false;
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
-    if (passMode.y>1u && hdUV.z>0.5 && hdUV.z<1.5 && textureMode!=0u) {
+    if (passMode.y>1u && ((hdUV.z>0.5 && hdUV.z<1.5) ||
+                         (hdUV.z>5.5 && hdUV.z<6.5)) && textureMode!=0u) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
@@ -166,7 +184,7 @@ void main() {
     }
     // Exact source-page/CLUT matching owns identity; native texel still owns
     // transparent cutouts, STP, mask writes and blend classification.
-    if (passMode.y>1u && hdUV.z>4.5 && polygon!=0u && textureMode!=0u) {
+    if (passMode.y>1u && hdUV.z>4.5 && hdUV.z<5.5 && polygon!=0u && textureMode!=0u) {
         vec3 enhanced=texture(texHD,hdUV.xy).rgb;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
         modColor=clamp(enhanced*tint,0.0,1.0);enhancedPixel=true;
