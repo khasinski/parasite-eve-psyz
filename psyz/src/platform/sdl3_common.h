@@ -532,6 +532,20 @@ static bool SkipPresent(void) {
     return false;
 }
 
+/* Offline replay has no emulated CPU cycle count. Charge one virtual line
+ * per raster query instead of measuring host work. This keeps frame-budget
+ * branches deterministic and lets scanline deadline polling make progress.
+ * Explicit opt-in: this is a replay timing model, not PS1 cycle emulation. */
+static Uint32 replay_scanlines;
+static bool UsesReplayRasterClock(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* clock = SDL_getenv("PSYZ_RASTER_CLOCK");
+        enabled = clock && SDL_strcmp(clock, "virtual") == 0;
+    }
+    return enabled != 0;
+}
+
 int Psyz_VideoVSync(int mode) {
     Uint32 now_us;
     unsigned short ret;
@@ -549,7 +563,9 @@ int Psyz_VideoVSync(int mode) {
     }
     // a line is approximated as 64 us
     now_us = (Uint32)(SDL_GetTicksNS() / 1000);
-    ret = (unsigned short)((now_us - last_vsync_us) >> 6);
+    ret = UsesReplayRasterClock()
+              ? (unsigned short)replay_scanlines++
+              : (unsigned short)((now_us - last_vsync_us) >> 6);
     if (mode == 0) {
         present_skip = SkipPresent();
         PlatformBackend_Present();
@@ -558,6 +574,7 @@ int Psyz_VideoVSync(int mode) {
         WaitForNextFrame();
         Sdl3Audio_VBlank(is_pal);
         last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
+        replay_scanlines = 0;
     }
     return ret;
 }
