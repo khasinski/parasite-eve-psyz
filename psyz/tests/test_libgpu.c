@@ -711,6 +711,16 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
             zassert_s32_eq(0,memcmp(a,b,3));
     }
     zassert_s32_eq(1,changed>500);
+    // The opaque texels next to the native transparent hole feather into the
+    // clear background; the hole itself and the interior remain authoritative.
+    // Compare with the same HD material away from the hole (constant R/G).
+    const u8 *edge=images[1]+(48*w+47)*3;
+    const u8 *inside=images[1]+(44*w+50)*3;
+    zassert_s32_eq(1,edge[0]>16 && edge[0]<inside[0]);
+    zassert_s32_eq(1,edge[1]>24 && edge[1]<inside[1]);
+    // Empty neighbouring VRAM must not feather the rectangular tile border.
+    zassert_s32_eq(0,memcmp(images[1]+(32*w+32)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(63*w+63)*3,inside,2));
     /* A different room must be able to reuse the bounded cache. Resetting it
      * must drop a cached identity even when its original BMP is now absent,
      * while leaving the native VRAM untouched. */
