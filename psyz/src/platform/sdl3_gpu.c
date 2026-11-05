@@ -2255,7 +2255,14 @@ static void PlatformBackend_Present(void) {
 #ifdef PE_PS5_GPU_NATIVE
             !native_movie_active&&
 #endif
-            !debug_show_vram&&game_speed==1&&interp_phase++==1;
+            !debug_show_vram&&game_speed==1;
+        if(interp_present_mid){
+            /* Keep the midpoint on extra display refreshes (e.g. 60 Hz
+             * presentation against the original 59.94 Hz game clock).
+             * Returning to the old display buffer would reverse motion. */
+            interp_present_mid=interp_phase!=0;
+            interp_phase=1;
+        }
         if(interp_present_mid)++interpolated_present_count;
     }
 
