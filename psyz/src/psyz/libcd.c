@@ -1418,17 +1418,23 @@ void StCdInterrupt(void) {
         }
         first = StRingIdx1;
         if (sec == 0) {
-            if (first + nsec > StRingSize) {
-                if (StRingAddr[first].id == 0) {
+            s32 frame_start = first + nsec > StRingSize ? 0 : first;
+            for (int i = 0; i < nsec; i++) {
+                if (StRingAddr[frame_start + i].id != 0) {
+                    return; /* ring full: retry when the consumer frees a frame */
+                }
+            }
+            if (frame_start != first) {
+                /* Publish the wrap only once its frame can actually be queued.
+                 * Otherwise the consumer can clear the previous lap's marker
+                 * while this blocked producer already thinks it has wrapped. */
+                /* At exact capacity there is no header left for a wrap marker.
+                 * The consumer wraps when freeing that final frame. */
+                if (first < StRingSize && StRingAddr[first].id == 0) {
                     StRingAddr[first].id = 1; /* wrap marker */
                 }
                 StRingIdx1 = first = 0;
                 StRingIdx2 = 0;
-            }
-            for (int i = 0; i < nsec; i++) {
-                if (StRingAddr[first + i].id != 0) {
-                    return; /* ring full: retry when the consumer frees a frame */
-                }
             }
         }
         if (first >= StRingSize || StRingAddr[first].id != 0) {

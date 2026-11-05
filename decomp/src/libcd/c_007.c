@@ -17,6 +17,10 @@ u_long StFreeRing(u_long* base) {
     for (i = 0; i < nSectors; i++) {
         *((s16*)((u_char*)StRingAddr + ((i + temp_a1) << 5))) = 0;
     }
+    /* An exact-capacity frame ends at the payload boundary, not another header. */
     StRingIdx3 = i + temp_a1;
+    if (StRingIdx3 == StRingSize) {
+        StRingIdx3 = 0;
+    }
     return 0;
 }
