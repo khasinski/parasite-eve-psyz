@@ -318,7 +318,11 @@ static void ConfigureVSync(double target_fps) {
         return;
     }
 
-    SDL_DisplayID display_id = SDL_GetPrimaryDisplay();
+    /* The game may run on a secondary display with a different refresh rate.
+     * Window placement, not the desktop's primary display, governs pacing. */
+    SDL_DisplayID display_id = sdl3_window
+        ? SDL_GetDisplayForWindow(sdl3_window) : 0;
+    if (!display_id) display_id = SDL_GetPrimaryDisplay();
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
     double detected_framerate = 60.0;
     if (mode && mode->refresh_rate > 0.0f) {
@@ -1041,6 +1045,14 @@ static void PollEvents(void) {
 #else
             SetWindowSizeInPixels(wnd_size_in_pixels.w, wnd_size_in_pixels.h);
 #endif
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            if (sdl3_window && event.window.windowID == SDL_GetWindowID(sdl3_window))
+                SDL_SetAtomicInt(&timing_reset_requested, 1);
+            break;
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            if (sdl3_window && event.display.displayID == SDL_GetDisplayForWindow(sdl3_window))
+                SDL_SetAtomicInt(&timing_reset_requested, 1);
             break;
 #ifndef PLATFORM_IOS
         case SDL_EVENT_KEY_DOWN:
