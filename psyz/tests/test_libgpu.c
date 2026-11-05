@@ -806,11 +806,12 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     zassert_s32_eq(1,images[1][(80*w+68)*3]<32 && images[0][(80*w+68)*3]>32);
     const u8 *opaque=images[0]+(80*w+80)*3,*partial=images[1]+(80*w+80)*3;
     zassert_s32_eq(1,partial[0]<opaque[0] && partial[0]>32);
-    /* The native-zero side can receive reviewed fractional HD coverage,
-     * while its native pixel remains transparent for game logic/readback. */
+    /* RGB alone cannot distinguish opaque black from native transparent zero.
+     * Reviewed HD alpha must never resurrect that transparent packet area. */
     zassert_s32_eq(0,memcmp(images[0]+(116*w+116)*3,images[1]+(116*w+116)*3,3));
     const u8 *hole=images[0]+(80*w+112)*3,*refined=images[1]+(80*w+112)*3;
-    zassert_s32_eq(1,hole[0]<32 && refined[0]>32);
+    zassert_s32_eq(1,hole[0]<32 && refined[0]<32);
+    zassert_s32_eq(0,memcmp(hole,refined,3));
     for(int i=0;i<7;++i)free(images[i]);
     Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
     Psyz_VideoSetInternalResolution(1);
