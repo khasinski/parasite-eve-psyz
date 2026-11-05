@@ -514,6 +514,10 @@ static int xa_sector_matches(unsigned char file, unsigned char channel) {
 
 static int s4(int n) { return (n & 0x8) ? (n - 0x10) : n; }
 
+/* XA and movie data have independent logical cursors but share the image
+ * handle. Video ready callbacks seek that handle between audio refills. */
+static int read_raw_sector(int sector, u_char* out);
+
 static const int xa_pos[4] = {0, 60, 115, 98};
 static const int xa_neg[4] = {0, 0, -52, -55};
 // Decode 28 samples for one (block, nibble) pair into `dst` (stride=2 stereo
@@ -593,11 +597,11 @@ static int xa_read_and_decode_sector(void) {
         goto silence;
     }
     while (!xa.stream_ended || silent_sectors-- > 0) {
-        const size_t n =
-            disk_read_cb ? (size_t)disk_read_cb(&(struct PsyzCdRead){
-                               (unsigned int)(xa.cur_abs_sector + 1),
-                               SECTOR_SIZE, sector})
-                         : fread(sector, 1, SECTOR_SIZE, track_file);
+        const int next_sector = xa.cur_abs_sector + 1;
+        const size_t n = disk_read_cb
+            ? (size_t)disk_read_cb(&(struct PsyzCdRead){
+                  (unsigned int)next_sector, SECTOR_SIZE, sector})
+            : (read_raw_sector(next_sector, sector) == 0 ? SECTOR_SIZE : 0);
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
         }
