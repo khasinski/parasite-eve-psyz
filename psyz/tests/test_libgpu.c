@@ -163,6 +163,13 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
     VSync(0);images[0]=Psyz_VideoAllocRenderedFrame(&widths[0],&heights[0]);
     VSync(0);images[1]=Psyz_VideoAllocRenderedFrame(&widths[1],&heights[1]);
     zexpect_s32_eq(1,(int)(Psyz_GpuGetInterpolatedPresentCount()-count));
+    /* A 60 Hz display occasionally needs a third present while the original
+     * 59.94 Hz clock catches up. Never go backwards to the previous pose. */
+    for(unsigned repeat=0;repeat<2;++repeat){
+        VSync(0);int rw,rh;unsigned char *held=Psyz_VideoAllocRenderedFrame(&rw,&rh);
+        zassert_ptr_ne(NULL,held);zexpect_s32_eq(widths[1],rw);zexpect_s32_eq(heights[1],rh);
+        zexpect_s32_eq(0,memcmp(images[1],held,(size_t)rw*rh*3));free(held);
+    }
     unsigned char *after=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,after);
     zexpect_s32_eq(0,memcmp(native,after,(size_t)nw*nh*3));free(native);free(after);
     SetDefDispEnv(&display,0,240,320,240);PutDispEnv(&display);Psyz_GpuPrepareInterpolatedPresent(-1);
