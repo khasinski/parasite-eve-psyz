@@ -87,6 +87,8 @@ int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command
  * when selecting inside an OT. Missing keys select ordinary rendering. */
 /* Cell bit 23 marks display-only widescreen extension material. */
+/* cell bits22..23: 0 native replacement, 1 presentation-only underlay in
+ * either aspect, 2 widescreen-only extension. Neither extension writes VRAM. */
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell);
 
 /**

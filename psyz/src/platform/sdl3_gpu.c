@@ -415,7 +415,8 @@ static unsigned sprite_atlas_cells;
 #define HD_ATLAS_WIDTH (HD_ATLAS_COLUMNS*68u)
 #define HD_ATLAS_HEIGHT (HD_ATLAS_ROWS*136u)
 static unsigned next_sprite_cell;
-static bool next_sprite_extension;
+/* 1: HD underlay in any aspect; 2: widescreen-only side art. */
+static unsigned next_sprite_extension;
 static bool sprite_atlases_enabled=true;
 static SDL_GPUSampler *sprite_atlas_sampler;
 typedef struct{SDL_GPUTexture *texture,*quarantine_texture;SDL_GPUSampler *sampler;SDL_GPUTransferBuffer *quarantine_transfer;int enabled,valid;} NativeFontGpu;
@@ -849,9 +850,9 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
 
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned cell) {
     next_sprite_atlas=NULL;
-    next_sprite_extension=(cell&0x800000u)!=0;
+    next_sprite_extension=(cell>>22)&3u;
     if (UseSoftwareBackend()) { CpuMaterialSelect(key,cell); return; }
-    cell&=0x7fffffu;
+    cell&=0x3fffffu;
     for (unsigned i=0;i<sprite_atlas_count;++i) {
         SpriteAtlas *atlas=&sprite_atlases[i];
         if (atlas->key==key && cell<atlas->columns*atlas->rows) {
@@ -3400,6 +3401,12 @@ void Psyz_CpuMaterialEndPrimitive(void) { (void)CpuMaterialTake(); }
 int Draw_PushPrim(u_long* packets, int max_len) {
     int dialogue_glyph=dialogue_next_glyph,font_context=dialogue_next_context;unsigned font_crop=dialogue_next_crop,font_width=dialogue_next_width;dialogue_next_glyph=dialogue_next_context=-1;
     if (UseSoftwareBackend()) {
+        /* Underlays are scaled GPU presentation only. Never feed their
+         * placeholder PS1 texture into the native software framebuffer. */
+        if(next_sprite_extension==1){
+            next_sprite_extension=0;Psyz_CpuMaterialEndPrimitive();
+            return max_len>=3 && (((unsigned)packets[0]>>24)&~3u)==0x7cu ? 3 : 0;
+        }
 #ifdef PE_PS5
         CpuWideContext();
         if(next_sprite_extension && (max_len<3 || (((unsigned)packets[0]>>24)&~3u)!=0x7cu))SoftwareRasterizer_WideReject();
@@ -3428,7 +3435,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool isGouraud = (code & GOURAUD) != 0;
     SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C) ? next_sprite_atlas : NULL;
     unsigned atlas_cell=next_sprite_cell;
-    bool atlas_extension=next_sprite_extension;
+    unsigned atlas_extension=next_sprite_extension;
     next_sprite_atlas=NULL;next_sprite_extension=false;
     /* One shared atlas: selecting a replacement must not split PS1 batches. */
 
@@ -3823,7 +3830,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
-                vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen&&sprite_atlases_enabled?2:3):
+                vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
                     (sprite_atlases_enabled?(atlas->authored_coverage?6:1):0);
             }
         }
