@@ -1,7 +1,11 @@
 #ifndef MALLOC_H
 #define MALLOC_H
 #ifdef __psyz
-#if defined(__has_include_next)
+#if defined(PE_PS5)
+/* The public PS5 SDK's FreeBSD compatibility malloc.h intentionally errors.
+ * Native allocation declarations are provided by the standard C header. */
+#include <stdlib.h>
+#elif defined(__has_include_next)
 #if __has_include_next(<malloc.h>)
 #include_next <malloc.h>
 #endif
