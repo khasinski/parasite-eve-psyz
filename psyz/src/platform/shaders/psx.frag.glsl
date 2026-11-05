@@ -120,15 +120,19 @@ void main() {
             a.a==b.a && a.a==c.a && a.a==d.a)
             texColor=mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
     }
-    // An explicitly alpha-authored room atlas may refine an opaque cutout in
+    // An unmarked alpha-authored room atlas may refine an opaque cutout in
     // the scaled presentation, inside the native silhouette. Reference RGB
     // cannot distinguish transparent zero from opaque black (0x8000). Never
     // let a matching black reference resurrect a transparent palette texel:
     // doing so can expose rectangular foreground packet bounds. Native VRAM,
     // mask writes and all PS1 semi-transparent primitives stay unchanged.
     // Opaque draws use ONE / ONE_MINUS_SRC_ALPHA, so output premultiplied RGB.
-    if (passMode.y>1u && passMode.x==0u && hdUV.z>5.5 && hdUV.z<6.5 &&
-        textureMode!=0u && texColor!=vec4(0) && vertexColor.a>=0.75) {
+    // Mode7 is an explicit, static-only authored silhouette paired with a
+    // coherent underlay. Its alpha can cross the native staircase. Mode6
+    // and all unmarked packs retain the strict native-transparent guard.
+    bool staticHdCoverage=hdUV.z>6.5 && hdUV.z<7.5;
+    if (passMode.y>1u && passMode.x==0u && hdUV.z>5.5 && hdUV.z<7.5 &&
+        textureMode!=0u && (staticHdCoverage || texColor!=vec4(0)) && vertexColor.a>=0.75) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
@@ -174,7 +178,7 @@ void main() {
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
     if (passMode.y>1u && ((hdUV.z>0.5 && hdUV.z<1.5) ||
-                         (hdUV.z>5.5 && hdUV.z<6.5)) && textureMode!=0u) {
+                         (hdUV.z>5.5 && hdUV.z<7.5)) && textureMode!=0u) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;

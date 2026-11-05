@@ -402,7 +402,7 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
 typedef struct SpriteAtlas {
     uint64_t key;
     unsigned columns, rows, first_cell;
-    bool authored_coverage;
+    bool authored_coverage,static_hd_coverage;
 } SpriteAtlas;
 static SpriteAtlas sprite_atlases[512];
 static unsigned sprite_atlas_count;
@@ -839,7 +839,19 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     SDL_EndGPUCopyPass(copy);
     SDL_ReleaseGPUTransferBuffer(device,upload);
-    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage};
+    /* Explicit opt-in for a reviewed STATIC foreground mask and its coherent
+     * backdrop. Unmarked/invalid metadata retains strict native coverage. */
+    bool static_hd_coverage=false;
+    if(authored_coverage && extension){
+        char marker[4096];size_t prefix=(size_t)(extension-filename);
+        if(prefix+sizeof("-matte.bin")<=sizeof(marker)){
+            memcpy(marker,filename,prefix);memcpy(marker+prefix,"-matte.bin",sizeof("-matte.bin"));
+            SDL_IOStream *file=SDL_IOFromFile(marker,"rb");
+            if(file){char magic[5];size_t size=SDL_ReadIO(file,magic,sizeof(magic));
+                static_hd_coverage=size==4 && !memcmp(magic,"PEM1",4);SDL_CloseIO(file);}
+        }
+    }
+    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage,static_hd_coverage};
     sprite_atlas_cells+=cells;
     sprite_atlas_bytes+=bytes;
     INFOF("HD sprite atlas %016llx: %dx%d (%zu MiB cached)",(unsigned long long)key,w,h,sprite_atlas_bytes/(1024*1024));
@@ -3831,7 +3843,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
                 vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
-                    (sprite_atlases_enabled?(atlas->authored_coverage?6:1):0);
+                    (sprite_atlases_enabled?(atlas->static_hd_coverage?7:atlas->authored_coverage?6:1):0);
             }
         }
         for (int i = 0; i < 4; ++i) {
@@ -4641,7 +4653,10 @@ void Psyz_StateGpuEnd(void){if(pe_state_gpu_owned&&pe_state_gpu_thread==SDL_GetC
 /* Project-authored typed GPU environment. No device handles, raw structs or preference mutation. */
 static uint32_t StateGpuGet32(const unsigned char *p){return(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 static void StateGpuPut32(unsigned char *p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(v>>(i*8));}
-static uint64_t StateGpuAtlasIdentity(void){uint64_t h=1469598103934665603ull;for(unsigned i=0;i<sprite_atlas_count;i++){const SpriteAtlas *a=&sprite_atlases[i];uint64_t values[4]={a->key,a->columns,a->rows,a->first_cell};for(unsigned j=0;j<4;j++)for(unsigned k=0;k<8;k++){h^=(values[j]>>(k*8))&255;h*=1099511628211ull;}}return h;}
+static uint64_t StateGpuAtlasIdentity(void){uint64_t h=1469598103934665603ull;for(unsigned i=0;i<sprite_atlas_count;i++){const SpriteAtlas *a=&sprite_atlases[i];uint64_t values[4]={a->key,a->columns,a->rows,a->first_cell};for(unsigned j=0;j<4;j++)for(unsigned k=0;k<8;k++){h^=(values[j]>>(k*8))&255;h*=1099511628211ull;}
+    /* Preserve legacy identities; queued mode7 vertices require the same
+     * explicitly marked atlas when a typed GPU environment is restored. */
+    if(a->static_hd_coverage){h^=0x50454d3100000007ull;h*=1099511628211ull;}}return h;}
 static uint32_t StateGpuPreferences(void){return (widescreen?1u:0u)|((unsigned)aspect_mode<<1)|(is_pal?16u:0u)|(antialiasing?32u:0u)|(model_filtering?64u:0u)|(geometry_correction?128u:0u)|(effect_geometry_correction?256u:0u)|(dynamic_lighting?512u:0u)|(sprite_atlases_enabled?1024u:0u)|(internal_res<<16);}
 uint32_t Psyz_StateGpuControlBlockers(void){uint32_t bits=0;
     if(host_clock_pause_depth)bits|=1u;if(SDL_GetAtomicInt(&quit_requested))bits|=2u;if(SDL_GetAtomicInt(&app_in_background))bits|=4u;

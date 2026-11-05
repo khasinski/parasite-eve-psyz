@@ -781,6 +781,13 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
         zassert_s32_eq(1,SDL_SavePNG(atlas,path));
         zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+kind,path));
     }
+    char marker[512];snprintf(marker,sizeof(marker),"%.*s-matte.bin",(int)strlen(path)-4,path);
+    zassert_s32_eq(1,SDL_SaveFile(marker,"bad!",4));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+4,path));
+    zassert_s32_eq(1,SDL_SaveFile(marker,"PEM1extra",9));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+5,path));
+    zassert_s32_eq(1,SDL_SaveFile(marker,"PEM1",4));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+3,path));SDL_RemovePath(marker);
     char webp_path[512],ref_path[512];
     snprintf(webp_path,sizeof(webp_path),"%spsyz-matte-%llu.webp",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
     snprintf(ref_path,sizeof(ref_path),"%.*s.ref.png",(int)strlen(webp_path)-5,webp_path);
@@ -790,21 +797,25 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     zassert_s32_eq(1,SDL_BlitSurface(atlas,&rect,ref,NULL));zassert_s32_eq(1,SDL_SavePNG(ref,ref_path));
     zassert_s32_eq(1,SDL_SaveFile(webp_path,encoded,sizeof(encoded)));
     zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+2,webp_path));
+    snprintf(marker,sizeof(marker),"%.*s-matte.bin",(int)strlen(webp_path)-5,webp_path);
+    zassert_s32_eq(1,SDL_SaveFile(marker,"PEM1",4));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+6,webp_path));SDL_RemovePath(marker);
     SDL_DestroySurface(ref);SDL_DestroySurface(atlas);SDL_RemovePath(path);SDL_RemovePath(webp_path);SDL_RemovePath(ref_path);
     zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
     DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
     DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
     Psyz_VideoSetInternalResolution(4);
-    u8 *images[7];u16 native[7][64*64];int w=0,h=0;
-    for(int mode=0;mode<7;++mode){
-        u16 pixels[256];for(int i=0;i<256;++i)pixels[i]=(mode==4||mode==5)?0x7c00:(i%16<8?((mode==2||mode==3)?0x83e0:0x03e0):0);
+    u8 *images[15];u16 native[15][64*64];int w=0,h=0;
+    for(int mode=0;mode<15;++mode){
+        Psyz_GpuSetSpriteAtlasesEnabled(mode!=11);
+        u16 pixels[256];for(int i=0;i<256;++i)pixels[i]=(mode==4||mode==5||mode==10)?0x7c00:(i%16<8?((mode==2||mode==3||mode==9)?0x83e0:0x03e0):0);
         RECT texture={512,0,16,16};LoadImage(&texture,(u_long *)pixels);
         RECT clear={0,0,64,64};ClearImage(&clear,16,24,32);
         DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
         struct {u_long address,length;u32 words[7];} packet={0};
-        uint64_t selected=mode==6?key+2:key+(mode!=0 && mode!=2 && mode!=4);
+        uint64_t selected=mode==14?key+5:mode==13?key+6:mode==12?key+99:mode>=9?key+3:mode==8?key+4:mode==7?key+3:mode==6?key+2:key+(mode!=0 && mode!=2 && mode!=4);
         packet.length=7;packet.words[0]=0xF7000000;packet.words[1]=(u32)selected;packet.words[2]=(u32)(selected>>32);
-        packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=(mode==2||mode==3)?0x7e808080:0x7c808080;
+        packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=(mode==2||mode==3||mode==9)?0x7e808080:0x7c808080;
         packet.words[5]=16u|(16u<<16);packet.words[6]=0;
         termPrim(&packet);DrawOTag((OT_TYPE *)&packet);
         extern void Psyz_PgxpNextFrame(void);Psyz_PgxpNextFrame();DrawSync(0);
@@ -830,7 +841,21 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     const u8 *hole=images[0]+(80*w+112)*3,*refined=images[1]+(80*w+112)*3;
     zassert_s32_eq(1,hole[0]<32 && refined[0]<32);
     zassert_s32_eq(0,memcmp(hole,refined,3));
-    for(int i=0;i<7;++i)free(images[i]);
+    /* Only a correctly marked static atlas may refine native-transparent
+     * coverage. Invalid markers, palette changes and semitransparency retain
+     * the existing rules; turning HD off matches an absent atlas exactly. */
+    zassert_s32_eq(0,memcmp(native[1],native[7],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[1],images[8],(size_t)w*h*3));
+    zassert_s32_eq(1,images[7][(80*w+112)*3]>32);
+    zassert_s32_eq(0,memcmp(native[3],native[9],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[3],images[9],(size_t)w*h*3));
+    zassert_s32_eq(0,memcmp(native[5],native[10],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[5],images[10],(size_t)w*h*3));
+    zassert_s32_eq(0,memcmp(images[11],images[12],(size_t)w*h*3));
+    zassert_s32_eq(0,memcmp(native[7],native[13],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[7],images[13],(size_t)w*h*3));
+    zassert_s32_eq(0,memcmp(images[1],images[14],(size_t)w*h*3));
+    for(int i=0;i<15;++i)free(images[i]);
     Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
     Psyz_VideoSetInternalResolution(1);
 #endif
