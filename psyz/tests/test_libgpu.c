@@ -605,13 +605,14 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
     RECT area={0,0,320,224};u16 *baseline=calloc(320*224,sizeof(u16)),*native=calloc(320*224,sizeof(u16));
     zassert_ptr_ne(NULL,baseline);zassert_ptr_ne(NULL,native);
     zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
-    for(int enabled=0;enabled<2;++enabled)for(int wide=0;wide<2;++wide) {
+    for(int scale=1;scale<=2;++scale)for(int underlay=0;underlay<2;++underlay)for(int enabled=0;enabled<2;++enabled)for(int wide=0;wide<2;++wide) {
+        Psyz_VideoSetInternalResolution(scale);
         Psyz_GpuSetSpriteAtlasesEnabled(enabled);
         Psyz_VideoSetWidescreen(wide);Psyz_VideoSetWidescreenPicture(0,-112,432);
         ClearImage(&area,16,24,32);DrawSync(0);StoreImage(&area,(u_long *)baseline);DrawSync(0);
         int w,h;u8 *before=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,before);
         struct {u_long address,length;u32 words[7];} packet={0};
-        packet.length=7;packet.words[0]=0xF7800000;packet.words[1]=(u32)key;packet.words[2]=(u32)(key>>32);
+        packet.length=7;packet.words[0]=underlay?0xF7400000:0xF7800000;packet.words[1]=(u32)key;packet.words[2]=(u32)(key>>32);
         packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;packet.words[5]=16u|(16u<<16);packet.words[6]=0;
         termPrim(&packet);DrawOTag((OT_TYPE *)&packet);
         packet.words[5]=(u16)-32|(16u<<16);DrawOTag((OT_TYPE *)&packet);DrawSync(0);
@@ -619,9 +620,11 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
         StoreImage(&area,(u_long *)native);DrawSync(0);
         zassert_s32_eq(0,memcmp(baseline,native,320*224*sizeof(u16)));
         unsigned changed=0;for(int n=0;n<w*h*3;++n)if(before[n]!=after[n])++changed;
-        zassert_s32_eq(wide&&enabled,changed>0);
-        if(wide&&enabled) {
-            zassert_s32_eq(1,memcmp(before+(40*w+20)*3,after+(40*w+20)*3,3)!=0);
+        zassert_s32_eq(scale>1&&(wide||underlay)&&enabled,changed>0);
+        if(scale>1&&(wide||underlay)&&enabled) {
+            unsigned sample_x=wide?20:40;
+            zassert_s32_eq(1,memcmp(before+(40*w+sample_x)*3,after+(40*w+sample_x)*3,3)!=0);
+            if(!wide)packet.words[5]=16u|(16u<<16);
             packet.words[1]=(u32)(key+1);DrawOTag((OT_TYPE *)&packet);DrawSync(0);
             int mw,mh;u8 *missing=Psyz_VideoAllocRenderedFrame(&mw,&mh);zassert_ptr_ne(NULL,missing);
             zassert_s32_eq(0,memcmp(after,missing,(size_t)mw*mh*3));free(missing);
@@ -629,7 +632,22 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
             packet.words[1]=(u32)key;
             packet.words[4]=0x7c404040;DrawOTag((OT_TYPE *)&packet);DrawSync(0);
             int tw,th;u8 *tinted=Psyz_VideoAllocRenderedFrame(&tw,&th);zassert_ptr_ne(NULL,tinted);
-            const u8 half[3]={120,40,20};zassert_s32_eq(0,memcmp(tinted+(40*tw+20)*3,half,3));free(tinted);
+            const u8 half[3]={120,40,20};zassert_s32_eq(0,memcmp(tinted+(40*tw+sample_x)*3,half,3));free(tinted);
+            if(underlay){
+                /* Original actors and UI drawn later must occlude the new
+                 * backdrop normally; only this original primitive writes VRAM. */
+                TILE actor={0};setTile(&actor);setXY0(&actor,16,16);setWH(&actor,8,8);setRGB0(&actor,0,248,0);
+                DrawPrim(&actor);DrawSync(0);
+                u8 *front=Psyz_VideoAllocRenderedFrame(&tw,&th);zassert_ptr_ne(NULL,front);
+                unsigned green=0;for(int n=0;n<tw*th;++n)if(front[n*3]<10&&front[n*3+1]>230&&front[n*3+2]<10)++green;
+                zassert_s32_eq(1,green>=64);free(front);
+                StoreImage(&area,(u_long *)native);DrawSync(0);
+                /* Compare against the same original primitive without any HD
+                 * commands, including the backend's native edge ownership. */
+                ClearImage(&area,16,24,32);DrawSync(0);DrawPrim(&actor);DrawSync(0);
+                StoreImage(&area,(u_long *)baseline);DrawSync(0);
+                zassert_s32_eq(0,memcmp(baseline,native,320*224*sizeof(u16)));
+            }
         }
         free(before);free(after);
     }
