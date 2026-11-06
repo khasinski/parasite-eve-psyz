@@ -33,6 +33,8 @@ int Psyz_VideoSetRgb24Backdrop(const char *p,const unsigned char *r,int w,int h,
 #endif
 
 #include "sdl3_common.h"
+
+static bool hidden_gl_renderer;
 #include "sdl3_draw.h"
 
 // selected at runtime based on the active GL profile; the shader bodies are
@@ -338,6 +340,8 @@ bool InitPlatform() {
     }
     // avoid re-initializing it continuously on failures
     is_platform_initialized = true;
+    const char* headless = SDL_getenv("PSYZ_HEADLESS");
+    hidden_gl_renderer = headless && strcmp(headless, "gpu") == 0;
 
 #if defined(__EMSCRIPTEN__)
     // avoid yielding twice per frame
@@ -456,6 +460,8 @@ bool InitPlatform() {
     glViewport(0, 0, VRAM_W, VRAM_H);
 
     cur_tpage = 0;
+    if (hidden_gl_renderer)
+        vsync_mode = PSYZ_VSYNC_LIMITLESS;
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
@@ -932,7 +938,8 @@ static void ApplyDisplayPendingChanges() {
         BindDrawFbo();
     }
     if (!is_window_visible) {
-        SDL_ShowWindow(sdl3_window);
+        if (!hidden_gl_renderer)
+            SDL_ShowWindow(sdl3_window);
         is_window_visible = true;
 #ifdef __APPLE__
         SDL_Event event;
