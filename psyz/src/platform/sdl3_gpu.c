@@ -402,7 +402,7 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
 typedef struct SpriteAtlas {
     uint64_t key;
     unsigned columns, rows, first_cell;
-    bool authored_coverage,static_hd_coverage;
+    bool authored_coverage,static_hd_coverage,selective_hd_coverage;
 } SpriteAtlas;
 static SpriteAtlas sprite_atlases[512];
 static unsigned sprite_atlas_count;
@@ -414,8 +414,7 @@ static unsigned sprite_atlas_cells;
 #define HD_ATLAS_ROWS 60u
 #define HD_ATLAS_WIDTH (HD_ATLAS_COLUMNS*68u)
 #define HD_ATLAS_HEIGHT (HD_ATLAS_ROWS*136u)
-/* An alpha edit in one material cell must not change legacy coverage in
- * neighbouring cells. Room atlases commonly mix both kinds of material. */
+/* Bit0: authored alpha; bit1: explicitly selected static coverage. */
 static u8 sprite_atlas_cell_alpha[HD_ATLAS_COLUMNS*HD_ATLAS_ROWS];
 static unsigned next_sprite_cell;
 /* 1: HD underlay in any aspect; 2: widescreen-only side art. */
@@ -808,13 +807,27 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     /* Explicit opt-in for a reviewed STATIC foreground mask and its coherent
      * backdrop. Unmarked/invalid metadata retains strict native coverage. */
     bool static_hd_coverage=false;
+    bool selective_hd_coverage=false;
+    u8 selected_cells[(HD_ATLAS_COLUMNS*HD_ATLAS_ROWS+7)/8]={0};
     if(extension){
         char marker[4096];size_t prefix=(size_t)(extension-filename);
         if(prefix+sizeof("-matte.bin")<=sizeof(marker)){
             memcpy(marker,filename,prefix);memcpy(marker+prefix,"-matte.bin",sizeof("-matte.bin"));
             SDL_IOStream *file=SDL_IOFromFile(marker,"rb");
-            if(file){char magic[5];size_t size=SDL_ReadIO(file,magic,sizeof(magic));
-                static_hd_coverage=size==4 && !memcmp(magic,"PEM1",4);SDL_CloseIO(file);}
+            if(file){
+                char magic[4],extra;size_t size=SDL_ReadIO(file,magic,sizeof(magic));
+                if(size==4 && !memcmp(magic,"PEM1",4))
+                    static_hd_coverage=SDL_ReadIO(file,&extra,1)==0 && SDL_GetIOStatus(file)==SDL_IO_STATUS_EOF;
+                else if(size==4 && !memcmp(magic,"PEM2",4)){
+                    size_t bytes=(cells+7)/8;
+                    if(SDL_ReadIO(file,selected_cells,bytes)==bytes && SDL_ReadIO(file,&extra,1)==0 && SDL_GetIOStatus(file)==SDL_IO_STATUS_EOF){
+                        unsigned any=0;for(size_t i=0;i<bytes;++i)any|=selected_cells[i];
+                        unsigned valid_last=cells%8 ? (1u<<(cells%8))-1u : 255u;
+                        selective_hd_coverage=any && !(selected_cells[bytes-1]&~valid_last);
+                    }
+                }
+                SDL_CloseIO(file);
+            }
         }
     }
     /* This SDL revision's Metal uploader uses destination width for row
@@ -860,13 +873,15 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
                     }
                 }
             }
-            sprite_atlas_cell_alpha[sprite_atlas_cells+cell]=cell_authored_coverage;
+            sprite_atlas_cell_alpha[sprite_atlas_cells+cell]=cell_authored_coverage |
+                ((selective_hd_coverage && (selected_cells[cell/8]&(1u<<(cell%8))))?2:0);
             authored_coverage |= cell_authored_coverage;
-        } else if(static_hd_coverage) {
+        } else if(static_hd_coverage || (selective_hd_coverage && (selected_cells[cell/8]&(1u<<(cell%8))))) {
             SpriteCoverageWitnesses(target);
         }
     }
     static_hd_coverage &= authored_coverage;
+    selective_hd_coverage &= authored_coverage;
     SDL_UnmapGPUTransferBuffer(device,upload);SDL_DestroySurface(rgba);
     SDL_GPUCommandBuffer *cmd=AcquireCmd();
     if (!cmd) { SDL_ReleaseGPUTransferBuffer(device,upload);return -1; }
@@ -882,7 +897,7 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     SDL_EndGPUCopyPass(copy);
     SDL_ReleaseGPUTransferBuffer(device,upload);
-    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage,static_hd_coverage};
+    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage,static_hd_coverage,selective_hd_coverage};
     sprite_atlas_cells+=cells;
     sprite_atlas_bytes+=bytes;
     INFOF("HD sprite atlas %016llx: %dx%d (%zu MiB cached)",(unsigned long long)key,w,h,sprite_atlas_bytes/(1024*1024));
@@ -3876,11 +3891,13 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             float width=(float)HD_ATLAS_WIDTH,height=(float)HD_ATLAS_HEIGHT;
             atlas_cell+=atlas->first_cell;
             float left=(float)((atlas_cell%HD_ATLAS_COLUMNS)*68+2),top=(float)((atlas_cell/HD_ATLAS_COLUMNS)*68+2);
+            unsigned alpha=sprite_atlas_cell_alpha[atlas_cell];
+            unsigned coverage=(atlas->static_hd_coverage || (atlas->selective_hd_coverage && (alpha&2)))?7:(alpha&1)?6:1;
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
                 vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
-                    (sprite_atlases_enabled?(atlas->static_hd_coverage?7:sprite_atlas_cell_alpha[atlas_cell]?6:1):0);
+                    (sprite_atlases_enabled?coverage:0);
             }
         }
         for (int i = 0; i < 4; ++i) {
@@ -4693,7 +4710,9 @@ static void StateGpuPut32(unsigned char *p,uint32_t v){for(unsigned i=0;i<4;i++)
 static uint64_t StateGpuAtlasIdentity(void){uint64_t h=1469598103934665603ull;for(unsigned i=0;i<sprite_atlas_count;i++){const SpriteAtlas *a=&sprite_atlases[i];uint64_t values[4]={a->key,a->columns,a->rows,a->first_cell};for(unsigned j=0;j<4;j++)for(unsigned k=0;k<8;k++){h^=(values[j]>>(k*8))&255;h*=1099511628211ull;}
     /* Preserve legacy identities; queued mode7 vertices require the same
      * explicitly marked atlas when a typed GPU environment is restored. */
-    if(a->static_hd_coverage){h^=0x50454d3100000007ull;h*=1099511628211ull;}}return h;}
+    if(a->static_hd_coverage){h^=0x50454d3100000007ull;h*=1099511628211ull;}
+    if(a->selective_hd_coverage){h^=0x50454d3200000007ull;h*=1099511628211ull;
+        for(unsigned cell=0;cell<a->columns*a->rows;++cell){h^=(sprite_atlas_cell_alpha[a->first_cell+cell]&2)!=0;h*=1099511628211ull;}}}return h;}
 static uint32_t StateGpuPreferences(void){return (widescreen?1u:0u)|((unsigned)aspect_mode<<1)|(is_pal?16u:0u)|(antialiasing?32u:0u)|(model_filtering?64u:0u)|(geometry_correction?128u:0u)|(effect_geometry_correction?256u:0u)|(dynamic_lighting?512u:0u)|(sprite_atlases_enabled?1024u:0u)|(internal_res<<16);}
 uint32_t Psyz_StateGpuControlBlockers(void){uint32_t bits=0;
     if(host_clock_pause_depth)bits|=1u;if(SDL_GetAtomicInt(&quit_requested))bits|=2u;if(SDL_GetAtomicInt(&app_in_background))bits|=4u;
