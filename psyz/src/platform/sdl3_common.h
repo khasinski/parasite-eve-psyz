@@ -714,6 +714,21 @@ static void AddGamepad(SDL_JoystickID id) {
     gamepads[i].id = id;
     gamepads[i].dev = dev;
     gamepads[i].name = SDL_GetGamepadName(dev);
+#ifdef __ANDROID__
+    /* A screen controller is a fallback when hardware is absent. Keep real
+     * pads ahead of virtual ones even when plugged in after the game starts. */
+    if (!SDL_IsJoystickVirtual(id)) {
+        for (int first = 0; first < i; ++first) {
+            if (SDL_IsJoystickVirtual(gamepads[first].id)) {
+                struct Gamepad added = gamepads[i];
+                memmove(&gamepads[first + 1], &gamepads[first], (i - first) * sizeof(gamepads[0]));
+                gamepads[first] = added;
+                i = first;
+                break;
+            }
+        }
+    }
+#endif
     INFOF("connected %s", gamepads[i].name);
     UpdatePlatformTouchControls();
 }
