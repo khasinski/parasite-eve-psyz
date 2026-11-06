@@ -309,7 +309,14 @@ static int parse_cue_file(const char* cue_path) {
             WARNF("CUE line not recognized: %s", line);
         }
     }
-    fclose(fp);
+    /* A readable prefix is not a complete CUE. Always close the FILE, but
+     * propagate either IO failure so the mount owner clears partial tracks. */
+    int read_failed = ferror(fp);
+    int close_failed = fclose(fp);
+    if (read_failed || close_failed) {
+        ERRORF("Failed to finish reading CUE file");
+        return -1;
+    }
 
     if (g_track_count == 0) {
         ERRORF("No valid tracks found in CUE file");
