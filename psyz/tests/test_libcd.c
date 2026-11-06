@@ -578,6 +578,43 @@ ZTEST(libcd, data_read_returns_header_then_payload) {
     CdControlB(CdlStop, NULL, NULL);
 }
 
+/* Replacing media must retire both a latched sector and the active reader.
+ * Mounting the same CUE is intentional: no changed pathname can hide stale
+ * controller state or make the old bytes coincidentally unobservable. */
+static void check_media_retires_data(int replacement) {
+    u_char payload[2048], untouched[2048];
+    load_cue_data(4);
+    start_read_at(0);
+    zassert_s32_eq(CdlDataReady, CdReady(1, NULL));
+    if (replacement == 0)
+        zassert_s32_eq(0, Psyz_CdSetDiskPath(cue));
+    else if (replacement == 1)
+        zassert_s32_eq(0, Psyz_CdSetDiskPath(NULL));
+    else
+        zassert_s32_eq(-1, Psyz_CdSetDiskPath("missing-retirement-disc.cue"));
+    memset(payload, 0xCC, sizeof(payload));
+    memset(untouched, 0xCC, sizeof(untouched));
+    zexpect_s32_eq(0, CdGetSector(payload, sizeof(payload) / 4));
+    zexpect_s32_eq(0, memcmp(untouched, payload, sizeof(payload)));
+    zexpect_s32_eq(CdlNoIntr, CdReady(1, NULL));
+    if (replacement == 0) {
+        /* A subsequent explicit read still works on the replacement. */
+        start_read_at(1);
+        zexpect_s32_eq(CdlDataReady, CdReady(1, NULL));
+    }
+    CdControlB(CdlStop, NULL, NULL);
+}
+
+ZTEST(libcd, media_replacement_retires_latched_sector) {
+    check_media_retires_data(0);
+}
+ZTEST(libcd, media_unmount_retires_latched_sector) {
+    check_media_retires_data(1);
+}
+ZTEST(libcd, media_failure_retires_latched_sector) {
+    check_media_retires_data(2);
+}
+
 ZTEST(libcd, data_read_advances_through_sectors) {
     int sector;
     load_cue_data(4);
@@ -1197,4 +1234,43 @@ ZTEST(libcd_playback, xa_resampler_rounding) {
     zexpect_u32_eq(0xc1a616c2u, (unsigned)(hash >> 32));
     zexpect_u32_eq(0xd17dd80au, (unsigned)hash);
     CdControlB(CdlStop, NULL, NULL);
+}
+
+/* Synchronous reads reopen the replacement track. They must not resurrect
+ * either the retired CDDA buffer or XA decoder history from the old media. */
+static void check_media_retires_audio(int is_xa) {
+    unsigned short* raw = test_calloc(8 * SECTOR_SIZE / 2, 2);
+    short out[256 * 2];
+    u_long data[2048 / 4];
+    for (int i = 0; i < 8; ++i) {
+        if (is_xa)
+            build_xa_sector((unsigned char*)raw + i * SECTOR_SIZE, i);
+        else
+            for (int j = 0; j < SECTOR_SIZE / 2; ++j)
+                raw[i * SECTOR_SIZE / 2 + j] = 0x6000;
+    }
+    mount_bin_cue_pair(raw, 8 * SECTOR_SIZE / 2,
+                       is_xa ? "MODE2/2352" : "AUDIO");
+    CdReset(1);
+    u_char mode = is_xa ? CdlModeRT | CdlModeSF : CdlModeDA;
+    u_char filter[2] = {1, 0};
+    CdlLOC loc;
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdControlB(CdlSetfilter, filter, NULL);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    CdControlB(is_xa ? CdlReadN : CdlPlay, NULL, NULL);
+    zassert_s32_eq(256, Psyz_CdPullSamples(out, 256));
+    zassert_s32_ne(0, out[128]);
+    zassert_s32_eq(0, Psyz_CdSetDiskPath(cue));
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    zassert_s32_ne(0, CdRead(1, data, 0));
+    zexpect_s32_eq(0, Psyz_CdPullSamples(out, 256));
+}
+
+ZTEST(libcd_playback, media_replacement_retires_cdda_buffer) {
+    check_media_retires_audio(0);
+}
+ZTEST(libcd_playback, media_replacement_retires_xa_decoder) {
+    check_media_retires_audio(1);
 }
