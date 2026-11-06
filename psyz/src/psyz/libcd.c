@@ -370,25 +370,34 @@ void Psyz_CdShellOpen(int is_open) {
 }
 
 static void close_track_file(void);
+static void retire_disc_media_locked(void);
 
 int Psyz_CdSetDiskPath(const char* diskPath) {
 #if PE_NATIVE_STATE_CPU_COMPONENTS
     extern void Psyz_StateCdChanged(void);Psyz_StateCdChanged();
 #endif
-    close_track_file();
+    /* Same owner/lock order as CDDA/XA pull: audio first, then file IO.
+     * No old decoder or queued sample may observe the replacement table. */
+    Psyz_AudioLock();
+    retire_disc_media_locked();
     is_disk_loaded = 0;
     g_track_count = 0;
     memset(g_tracks, 0, sizeof(g_tracks));
+    int result = 0;
     if (!diskPath) {
         DEBUGF("Disk path unset");
-        return 0;
+    } else if (parse_cue_file(diskPath) < 0) {
+        /* Parsing may have visited tracks before failing: do not expose a
+         * partial replacement, and never resurrect the retired old media. */
+        g_track_count = 0;
+        memset(g_tracks, 0, sizeof(g_tracks));
+        result = -1;
+    } else {
+        is_disk_loaded = 1;
+        DEBUGF("Disk path set: %s", diskPath);
     }
-    if (parse_cue_file(diskPath) < 0) {
-        return -1;
-    }
-    is_disk_loaded = 1;
-    DEBUGF("Disk path set: %s", diskPath);
-    return 0;
+    Psyz_AudioUnlock();
+    return result;
 }
 
 static PsyzCdReadCB disk_read_cb = NULL;
@@ -839,6 +848,23 @@ static int read_raw_sector(int sector, u_char* out) {
 }
 
 static int need_cdda_rewind = 1;
+/* Called only while holding Psyz_AudioLock, before any track FILE/table change.
+ * This is media retirement, not pause/resume or an audio-clock adjustment. */
+static void retire_disc_media_locked(void) {
+    is_playing = 0;
+    xa.active = 0;
+    xa_reset_stream();
+    xa.cur_abs_sector = -1;
+    Psyz_SpuFlushCdSamples();
+    data_read_active = 0;
+    data_sector_valid = 0;
+    data_getsector_count = 0;
+    close_track_file();
+    cd_buf_pos = cd_buf_count = 0;
+    need_cdda_rewind = 1;
+    CD_status &= ~(CdlStatPlay | CdlStatSeek | CdlStatRead);
+}
+
 // play on CDDA mode only (not XA)
 static void psyz_play() {
     if (!(CD_mode & CdlModeDA)) {
