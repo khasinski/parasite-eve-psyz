@@ -728,6 +728,28 @@ static SDL_Surface *LoadHdImage(const char *filename) {
 
 #include "cpu-material-adapter.h"
 
+/* Reference alpha is unused by RGB555 matching. For a reviewed matte,
+ * store a nearby colored reference texel there so black RGB cannot by itself
+ * authorize a fringe after the original palette disappears. */
+static void SpriteCoverageWitnesses(u8 *reference) {
+    u16 nearest[256],queue[256];unsigned head=0,tail=0;
+    for(unsigned i=0;i<256;++i){
+        const u8 *pixel=reference+((size_t)(4+(i/16)*4)*68+4+(i%16)*4)*4;
+        nearest[i]=0xffff;
+        if(pixel[0]>=5 || pixel[1]>=5 || pixel[2]>=5){nearest[i]=(u16)i;queue[tail++]=(u16)i;}
+    }
+    while(head<tail){
+        int i=queue[head++],next[4]={i-16,i+16,i%16?i-1:-1,i%16<15?i+1:-1};
+        for(unsigned n=0;n<4;++n)if(next[n]>=0 && next[n]<256 && nearest[next[n]]==0xffff){
+            nearest[next[n]]=nearest[i];queue[tail++]=(u16)next[n];
+        }
+    }
+    for(int y=0;y<68;++y)for(int x=0;x<68;++x){
+        unsigned i=(unsigned)(SDL_clamp((y-2)/4,0,15)*16+SDL_clamp((x-2)/4,0,15));
+        reference[((size_t)y*68+x)*4+3]=nearest[i]==0xffff?0:(u8)nearest[i];
+    }
+}
+
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     if (UseSoftwareBackend()) return CpuMaterialLoad(key,filename);
     if (gpu_failed || !key || !filename || !device || UseSoftwareBackend()) return 0;
@@ -780,6 +802,18 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     unsigned columns=(unsigned)w/68,rows=(unsigned)h/136,cells=columns*rows;
     bool authored_coverage=false;
+    /* Explicit opt-in for a reviewed STATIC foreground mask and its coherent
+     * backdrop. Unmarked/invalid metadata retains strict native coverage. */
+    bool static_hd_coverage=false;
+    if(extension){
+        char marker[4096];size_t prefix=(size_t)(extension-filename);
+        if(prefix+sizeof("-matte.bin")<=sizeof(marker)){
+            memcpy(marker,filename,prefix);memcpy(marker+prefix,"-matte.bin",sizeof("-matte.bin"));
+            SDL_IOStream *file=SDL_IOFromFile(marker,"rb");
+            if(file){char magic[5];size_t size=SDL_ReadIO(file,magic,sizeof(magic));
+                static_hd_coverage=size==4 && !memcmp(magic,"PEM1",4);SDL_CloseIO(file);}
+        }
+    }
     /* This SDL revision's Metal uploader uses destination width for row
      * pitch. Pack every cell contiguously instead of relying on row strides. */
     for (unsigned cell=0;cell<cells;++cell) for (unsigned reference=0;reference<2;++reference) {
@@ -822,8 +856,11 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
                     }
                 }
             }
+        } else if(static_hd_coverage) {
+            SpriteCoverageWitnesses(target);
         }
     }
+    static_hd_coverage &= authored_coverage;
     SDL_UnmapGPUTransferBuffer(device,upload);SDL_DestroySurface(rgba);
     SDL_GPUCommandBuffer *cmd=AcquireCmd();
     if (!cmd) { SDL_ReleaseGPUTransferBuffer(device,upload);return -1; }
@@ -839,18 +876,6 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     SDL_EndGPUCopyPass(copy);
     SDL_ReleaseGPUTransferBuffer(device,upload);
-    /* Explicit opt-in for a reviewed STATIC foreground mask and its coherent
-     * backdrop. Unmarked/invalid metadata retains strict native coverage. */
-    bool static_hd_coverage=false;
-    if(authored_coverage && extension){
-        char marker[4096];size_t prefix=(size_t)(extension-filename);
-        if(prefix+sizeof("-matte.bin")<=sizeof(marker)){
-            memcpy(marker,filename,prefix);memcpy(marker+prefix,"-matte.bin",sizeof("-matte.bin"));
-            SDL_IOStream *file=SDL_IOFromFile(marker,"rb");
-            if(file){char magic[5];size_t size=SDL_ReadIO(file,magic,sizeof(magic));
-                static_hd_coverage=size==4 && !memcmp(magic,"PEM1",4);SDL_CloseIO(file);}
-        }
-    }
     sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage,static_hd_coverage};
     sprite_atlas_cells+=cells;
     sprite_atlas_bytes+=bytes;
