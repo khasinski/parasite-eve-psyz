@@ -37,6 +37,7 @@ typedef struct {
     float pgxp_pos[3];
     float uv_bounds[4];
     float hd_uv[3];
+    unsigned int polygon_gradient[10]; /* Q12 dx/dy pairs for UV and RGB */
 } Vertex;
 
 #ifdef PSYZ_CAPTURE_INTERPOLATION

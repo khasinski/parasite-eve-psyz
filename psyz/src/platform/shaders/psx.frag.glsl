@@ -16,8 +16,11 @@ layout(location = 12) flat in uint polygon;
 layout(location = 13) flat in uint model;
 layout(location = 14) flat in vec4 uvBounds;
 layout(location = 15) in vec3 hdUV;
-layout(location = 16) noperspective in vec2 nativeUV;
-layout(location = 17) noperspective in vec4 nativeColor;
+layout(location = 16) flat in ivec4 nativeOriginUV;
+layout(location = 17) flat in ivec4 nativeOriginRGB;
+layout(location = 18) flat in uvec4 nativeGradientUV;
+layout(location = 19) flat in uvec4 nativeGradientRG;
+layout(location = 20) flat in uvec2 nativeGradientB;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 layout(set = 2, binding = 1) uniform sampler2D texBlend;
@@ -25,7 +28,21 @@ layout(set = 2, binding = 2) uniform sampler2D texHD;
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
 
 bool nativeAffineAttributes() {
-    return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeColor.a > 0.5;
+    return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeOriginRGB.w != 0;
+}
+
+uint nativeQ12(int origin, uvec2 gradient, ivec2 delta) {
+    // Modular integer arithmetic retains the low Q12 word, including negative
+    // slopes, without relying on floating-point plane setup or fused rounding.
+    return uint(origin) + gradient.x * uint(delta.x) + gradient.y * uint(delta.y);
+}
+
+vec3 nativeColorValue() {
+    ivec2 delta = ivec2(gl_FragCoord.xy) - nativeOriginUV.xy;
+    uvec3 fixedColor = uvec3(nativeQ12(nativeOriginRGB.x, nativeGradientRG.xy, delta),
+                            nativeQ12(nativeOriginRGB.y, nativeGradientRG.zw, delta),
+                            nativeQ12(nativeOriginRGB.z, nativeGradientB, delta));
+    return vec3(ivec3(fixedColor)) / 4096.0;
 }
 
 float attributeRoundingBias() {
@@ -38,9 +55,15 @@ float attributeRoundingBias() {
 
 uvec2 resolveTexel() {
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
-    vec2 uv = polygon != 0u ? (nativeAffineAttributes() ? nativeUV : rawUV) + attributeRoundingBias() :
+    vec2 uv = polygon != 0u ? rawUV + attributeRoundingBias() :
         rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
     ivec2 position = ivec2(floor(uv));
+    if (nativeAffineAttributes()) {
+        ivec2 delta = ivec2(gl_FragCoord.xy) - nativeOriginUV.xy;
+        uvec2 fixedUV = uvec2(nativeQ12(nativeOriginUV.z, nativeGradientUV.xy, delta),
+                             nativeQ12(nativeOriginUV.w, nativeGradientUV.zw, delta));
+        position = ivec2(fixedUV) >> 12;
+    }
     // A sprite reads only its own texels: a squeezed sprite's edge can cut
     // a pixel whose left side lies outside it.
     if (polygon == 0u) position = clamp(position, ivec2(uvBounds.xy), ivec2(uvBounds.zw));
@@ -168,11 +191,11 @@ void main() {
     vec3 modColor;
     if (textureMode == 0u) {
         // untextured: PS1 uses color directly, no modulation
-        vec3 color = nativeAffineAttributes() ? nativeColor.rgb / 255.0 : vertexColor.rgb;
+        vec3 color = nativeAffineAttributes() ? nativeColorValue() / 255.0 : vertexColor.rgb;
         modColor = texColor.rgb * (color + attributeRoundingBias() / 255.0);
     } else {
         vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);
-        vec3 color8 = nativeAffineAttributes() ? nativeColor.rgb : vertexColor.rgb * 127.5;
+        vec3 color8 = nativeAffineAttributes() ? nativeColorValue() : vertexColor.rgb * 127.5;
         vec3 col8 = min(floor(color8 +
                              (polygon != 0u ? attributeRoundingBias() : 0.5)), vec3(255.0));
         vec3 prod8 = min(tex5 * col8 / 16.0, vec3(255.0));

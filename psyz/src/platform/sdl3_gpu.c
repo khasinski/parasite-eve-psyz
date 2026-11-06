@@ -1021,6 +1021,9 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
          .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
          .offset = offsetof(Vertex, uv_bounds)},
         {.location=8,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,.offset=offsetof(Vertex,hd_uv)},
+        {.location=9,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT4,.offset=offsetof(Vertex,polygon_gradient)},
+        {.location=10,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT4,.offset=offsetof(Vertex,polygon_gradient)+4*sizeof(unsigned int)},
+        {.location=11,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT2,.offset=offsetof(Vertex,polygon_gradient)+8*sizeof(unsigned int)},
     };
     // the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
     static const SDL_GPUColorTargetBlendState blend[BLEND_COUNT] = {
@@ -3392,6 +3395,8 @@ static void SetPolygonAttributes(Vertex* vertices) {
                  4096 / area;
         }
         for (int vertex = 0; vertex < 3; ++vertex) {
+            vertices[vertex].polygon_gradient[attribute * 2] = (uint32_t)dx;
+            vertices[vertex].polygon_gradient[attribute * 2 + 1] = (uint32_t)dy;
             float value = (float)(origin[attribute] * 4096 + 2048 +
                                   (vertices[vertex].x - anchor->x) * dx +
                                   (vertices[vertex].y - anchor->y) * dy) /
@@ -3460,6 +3465,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
     for (int i=0;i<6;++i) {
+        memset(v[i].polygon_gradient, 0, sizeof(v[i].polygon_gradient));
         v[i].hd_uv[0]=v[i].hd_uv[1]=0;
         v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;
         v[i].pgxp_pos[0] = 0.0f;
