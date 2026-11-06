@@ -2311,8 +2311,9 @@ static void PlatformBackend_Present(void) {
         !RefreshWindowSwapchain()) {
         can_present = false;
     }
-    if(ws_capture_active)interp_present_mid=false;
-    else {
+    /* A widescreen readback redraws the already selected display image.
+     * Preserve its midpoint without advancing presentation phase or counts. */
+    if(!ws_capture_active) {
         interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
             interpolated_scale==internal_res&&interp_next_y>=0&&interp_next_y<=VRAM_H-display_size.y&&
             !display_rgb24&&

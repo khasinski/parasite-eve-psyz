@@ -194,6 +194,43 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 #endif
 }
 
+ZTEST(gpu, interpolated_widescreen_capture_keeps_midpoint) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU");
+    Psyz_VideoSetInternalResolution(2);Psyz_VideoSetWidescreen(1);
+    Psyz_GpuSetFrameInterpolation(1);Psyz_GpuResetInterpolation();
+    TILE tiles[2]={{0}};
+    for(unsigned i=0;i<2;++i){setTile(tiles+i);setXY0(tiles+i,40+20*i,30);setWH(tiles+i,16,16);setRGB0(tiles+i,255,0,0);}
+    Psyz_GpuRegisterInterpolationPair(&tiles[0].r0,&tiles[1].r0);
+    RECT clear={0,0,320,480};ClearImage(&clear,0,0,0);DrawSync(0);
+    for(unsigned i=0;i<2;++i){
+        Psyz_GpuBeginInterpolationFrame();
+        DRAWENV draw;SetDefDrawEnv(&draw,0,240*i,320,240);draw.isbg=0;draw.dtd=0;PutDrawEnv(&draw);
+        DrawPrim(tiles+i);DrawSync(0);
+    }
+    DISPENV display;SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);SetDispMask(1);
+    int nw,nh;unsigned char *native=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,native);
+    Psyz_GpuPrepareInterpolatedPresent(240);
+    unsigned char *images[2];int widths[2],heights[2];
+    for(unsigned i=0;i<2;++i){
+        VSync(0);unsigned long long count=Psyz_GpuGetInterpolatedPresentCount();
+        images[i]=Psyz_VideoAllocRenderedFrame(&widths[i],&heights[i]);zassert_ptr_ne(NULL,images[i]);
+        int rw,rh;unsigned char *again=Psyz_VideoAllocRenderedFrame(&rw,&rh);zassert_ptr_ne(NULL,again);
+        zassert_s32_eq(widths[i],rw);zassert_s32_eq(heights[i],rh);
+        zassert_s32_eq(0,memcmp(images[i],again,(size_t)rw*rh*3));free(again);
+        zassert_s32_eq(1,Psyz_GpuGetInterpolatedPresentCount()==count);
+    }
+    zassert_s32_eq(widths[0],widths[1]);zassert_s32_eq(heights[0],heights[1]);
+    zassert_s32_eq(1,memcmp(images[0],images[1],(size_t)widths[0]*heights[0]*3)!=0);
+    unsigned char *after=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,after);
+    zassert_s32_eq(0,memcmp(native,after,(size_t)nw*nh*3));free(native);free(after);
+    free(images[0]);free(images[1]);Psyz_GpuSetFrameInterpolation(0);
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, dithering_off_preserves_color_precision) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char* headless = getenv("PSYZ_HEADLESS");
