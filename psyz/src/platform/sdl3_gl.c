@@ -1346,7 +1346,9 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
-    glClearColor((float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, 0.0f);
+    /* PS1 clears truncate each input channel to five bits before storage. */
+    glClearColor((float)(r >> 3) / 31.0f, (float)(g >> 3) / 31.0f,
+                 (float)(b >> 3) / 31.0f, 0.0f);
     glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo);
     glScissor(rect->x, rect->y, rect->w, rect->h);
     glClear(GL_COLOR_BUFFER_BIT);
