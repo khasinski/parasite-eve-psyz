@@ -1274,3 +1274,30 @@ ZTEST(libcd_playback, media_replacement_retires_cdda_buffer) {
 ZTEST(libcd_playback, media_replacement_retires_xa_decoder) {
     check_media_retires_audio(1);
 }
+
+ZTEST(libcd_playback, xa_image_refill_ignores_movie_file_cursor) {
+    unsigned short* raw = test_calloc(8 * SECTOR_SIZE / 2, 2);
+    short out[4096 * 2];
+    u_long movie[2048 / 4];
+    for (int i = 0; i < 8; ++i)
+        build_xa_sector((unsigned char*)raw + i * SECTOR_SIZE, i);
+    mount_bin_cue_pair(raw, 8 * SECTOR_SIZE / 2, "MODE2/2352");
+    CdReset(1);
+    u_char mode = CdlModeRT | CdlModeSF, filter[2] = {1, 0};
+    CdlLOC loc;
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdControlB(CdlSetfilter, filter, NULL);
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    CdControlB(CdlReadN, NULL, NULL);
+    zassert_s32_eq(256, Psyz_CdPullSamples(out, 256));
+    /* Movie reads share track_file but must not move XA's logical cursor.
+     * Reading the final sector leaves the FILE at EOF, making a sequential
+     * audio refill fail even though seven XA sectors remain unconsumed. */
+    CdIntToPos(7, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    zassert_s32_ne(0, CdRead(1, movie, 0));
+    zassert_s32_eq(4096, Psyz_CdPullSamples(out, 4096));
+    for (int i = 0; i < 4096 * 2; ++i)
+        zexpect_s16_eq(0x1000, out[i]);
+}
