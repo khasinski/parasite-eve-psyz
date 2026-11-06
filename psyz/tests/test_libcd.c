@@ -35,6 +35,48 @@ static int bin_count;
 static void* allocs[MAX_ALLOCS];
 static int alloc_count;
 
+#ifdef PSYZ_TEST_CD_IO
+/* Compile the original module with test-local stdio faults. Its symbols
+ * satisfy the static library references; no fault hooks enter the SDK API. */
+static FILE* cue_fault_file;
+static int cue_fault_mode, cue_fault_lines, cue_fault_read_error, cue_fault_closes;
+static FILE* cue_fault_open(const char* path, const char* mode) {
+    FILE* file = fopen(path, mode);
+    if (cue_fault_mode && !strcmp(path, cue) && !strcmp(mode, "r"))
+        cue_fault_file = file;
+    return file;
+}
+static char* cue_fault_gets(char* text, int size, FILE* file) {
+    if (file == cue_fault_file && (cue_fault_mode & 1) && cue_fault_lines >= 3) {
+        cue_fault_read_error = 1;
+        errno = EIO;
+        return NULL;
+    }
+    char* result = fgets(text, size, file);
+    if (file == cue_fault_file && result) cue_fault_lines++;
+    return result;
+}
+static int cue_fault_error(FILE* file) {
+    return file == cue_fault_file && cue_fault_read_error ? 1 : ferror(file);
+}
+static int cue_fault_close(FILE* file) {
+    int fault = file == cue_fault_file;
+    if (fault) { cue_fault_closes++; cue_fault_file = NULL; }
+    int result = fclose(file);
+    if (fault && (cue_fault_mode & 2)) { errno = EIO; return EOF; }
+    return result;
+}
+#define fopen cue_fault_open
+#define fgets cue_fault_gets
+#define ferror cue_fault_error
+#define fclose cue_fault_close
+#include "../src/psyz/libcd.c"
+#undef fopen
+#undef fgets
+#undef ferror
+#undef fclose
+#endif
+
 static void make_blob(const char* path, long bytes) {
     FILE* f = fopen(path, "wb");
     if (f == NULL) {
@@ -260,6 +302,10 @@ ZTEST_SETUP(libcd) {
 }
 
 ZTEST_TEARDOWN(libcd) {
+#ifdef PSYZ_TEST_CD_IO
+    cue_fault_mode = 0;
+    cue_fault_file = NULL;
+#endif
     Psyz_CdSetReadCB(NULL);
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
@@ -1301,3 +1347,27 @@ ZTEST(libcd_playback, xa_image_refill_ignores_movie_file_cursor) {
     for (int i = 0; i < 4096 * 2; ++i)
         zexpect_s16_eq(0x1000, out[i]);
 }
+
+#ifdef PSYZ_TEST_CD_IO
+static void check_cue_io_failure(int mode) {
+    u_char result[8];
+    load_cue_single(1, 8, true);
+    cue_fault_lines = cue_fault_read_error = cue_fault_closes = 0;
+    cue_fault_mode = mode;
+    zexpect_s32_eq(-1, Psyz_CdSetDiskPath(cue));
+    zexpect_s32_eq(1, cue_fault_closes);
+    zexpect_s32_eq(!!(mode & 1), cue_fault_read_error);
+    zexpect_s32_eq(CdlNoIntr, CdControlB(CdlGetTN, NULL, result));
+    zexpect_s32_ne(0, result[0] & CdlStatError);
+    cue_fault_mode = 0;
+    mount_cue();
+    zexpect_s32_eq(CdlDataReady, CdControlB(CdlGetTN, NULL, result));
+}
+ZTEST(libcd, cue_read_error_rejects_partial_track_table) {
+    check_cue_io_failure(1);
+}
+ZTEST(libcd, cue_close_error_rejects_track_table) {
+    check_cue_io_failure(2);
+    check_cue_io_failure(3);
+}
+#endif
