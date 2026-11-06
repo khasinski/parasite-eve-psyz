@@ -485,7 +485,8 @@ static void WaitForNextFrame(void) {
             frame_time_us - elapsed_us + correction;
 
         // only wait if we're ahead of schedule (not running slow)
-        if (time_to_wait_us > 100.0) { // more than 0.1ms to wait
+        /* Even a small early return can gradually refill the driver queue. */
+        if (time_to_wait_us > (driver_pacing ? 0.0 : 100.0)) {
             // High-precision mode: sleep + busy-wait
             if (time_to_wait_us > 1000.0) {
                 Uint64 sleep_us = (Uint64)(time_to_wait_us - 1000.0);
