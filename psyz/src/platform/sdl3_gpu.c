@@ -955,7 +955,7 @@ static void SubmitFrame(void) {
         return;
     }
     if (swapchain_ok && frame_presented) {
-        SubmitCmd();
+        if (!SubmitCmd()) frame_presented = false;
         return;
     }
     SDL_GPUFence** fence = &frame_fences[frame_fence_idx];
