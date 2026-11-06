@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <psyz.h>
 #include <kernel.h>
@@ -538,7 +539,7 @@ ZTEST(gpu, vram_copy_follows_uploads_fills_and_copies) {
 #endif
 }
 
-#if defined(__psyz) && !defined(__PSP__)
+#ifdef PSYZ_TEST_SDL_GPU
 static int TestSpriteAtlasCommand(const u_long *words,int count,void *unused) {
     (void)unused;if(count<3)return -1;
     Psyz_GpuSelectSpriteAtlas((uint64_t)(u32)words[1]|((uint64_t)(u32)words[2]<<32),(u32)words[0]&0xffffff);
@@ -547,8 +548,8 @@ static int TestSpriteAtlasCommand(const u_long *words,int count,void *unused) {
 #endif
 
 ZTEST(gpu, rgb24_hd_backdrop_preserves_native_ui_and_vram) {
-#if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires the SDL GPU renderer");
     unsigned char *reference=malloc(320*240*3),*native=malloc(320*240*3);
     zassert_ptr_ne(NULL,reference);zassert_ptr_ne(NULL,native);
     for(unsigned i=0;i<320*240;++i){reference[i*3]=10;reference[i*3+1]=20;reference[i*3+2]=30;}
@@ -578,12 +579,14 @@ ZTEST(gpu, rgb24_hd_backdrop_preserves_native_ui_and_vram) {
     unsigned char *restored=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,restored);
     zassert_s32_eq(320,w);zassert_s32_eq(240,h);zassert_s32_eq(0,memcmp(original,restored,320*240*3));
     free(restored);free(original);free(reference);free(native);
+#else
+    zskip("requires the SDL GPU renderer");
 #endif
 }
 
 ZTEST(gpu, widescreen_hd_extension_is_display_only) {
-#if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires the SDL GPU renderer");
     SDL_Surface *image=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
     SDL_FillSurfaceRect(image,NULL,SDL_MapSurfaceRGB(image,240,80,40));
     SDL_Rect reference_half={0,68,68,68};
@@ -629,11 +632,13 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
     Psyz_GpuSetSpriteAtlasesEnabled(1);
     free(baseline);free(native);Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
     Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires the SDL GPU renderer");
 #endif
 }
 
 ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback) {
-#if defined(__psyz) && !defined(__PSP__)
+#ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");
     if(!backend || strcmp(backend,"gpu"))return;
     SDL_Surface *bmp=SDL_CreateSurface(136,272,SDL_PIXELFORMAT_RGBA32);
@@ -724,6 +729,8 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
     }
     for(int i=0;i<8;++i)free(images[i]);
     Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);Psyz_GpuSelectSpriteAtlas(0,0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires the SDL GPU renderer");
 #endif
 }
 
@@ -3251,6 +3258,36 @@ ZTEST(gpu, ps1_polygon_attribute_gradients) {
                             hash = (hash ^ (pixels[i] & 255)) * 16777619u;
                             hash = (hash ^ (pixels[i] >> 8)) * 16777619u;
                         }
+#if defined(__psyz) && !defined(__PSP__)
+                        /* Preserve procedural fixture pixels on mismatch, so
+                         * backend rounding failures can be compared directly.
+                         * The opt-in also records passing reference renders. */
+                        if (hash != expected[test] || getenv("PSYZ_DUMP_POLYGON_PIXELS")) {
+                            char path[160];
+                            snprintf(path, sizeof(path), "expected/ps1-attributes-s%u-d%u-sh%u-k%u-p%u.actual.bin",
+                                     scale, dither, shape, kind, permutation);
+                            FILE *file = fopen(path, "wb");
+                            if (file) {
+                                if (fwrite(pixels, sizeof(pixels), 1, file) != 1)
+                                    fprintf(stderr, "Cannot write %s\n", path);
+                                fclose(file);
+                            }
+                            unsigned char rgb[64 * 48 * 3];
+                            for (unsigned i = 0; i < 64 * 48; ++i) {
+                                rgb[3 * i] = ((pixels[i] >> 0) & 31) * 255 / 31;
+                                rgb[3 * i + 1] = ((pixels[i] >> 5) & 31) * 255 / 31;
+                                rgb[3 * i + 2] = ((pixels[i] >> 10) & 31) * 255 / 31;
+                            }
+                            snprintf(path, sizeof(path), "expected/ps1-attributes-s%u-d%u-sh%u-k%u-p%u.actual.png",
+                                     scale, dither, shape, kind, permutation);
+                            SDL_Surface *surface = SDL_CreateSurfaceFrom(64, 48, SDL_PIXELFORMAT_RGB24, rgb, 64 * 3);
+                            if (surface) {
+                                if (!SDL_SavePNG(surface, path))
+                                    fprintf(stderr, "Cannot write %s: %s\n", path, SDL_GetError());
+                                SDL_DestroySurface(surface);
+                            }
+                        }
+#endif
                         zexpect_u32_eq(expected[test], hash);
                     }
         zexpect_u32_eq(144, test);
