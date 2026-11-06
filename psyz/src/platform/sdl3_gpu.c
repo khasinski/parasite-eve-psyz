@@ -414,6 +414,9 @@ static unsigned sprite_atlas_cells;
 #define HD_ATLAS_ROWS 60u
 #define HD_ATLAS_WIDTH (HD_ATLAS_COLUMNS*68u)
 #define HD_ATLAS_HEIGHT (HD_ATLAS_ROWS*136u)
+/* An alpha edit in one material cell must not change legacy coverage in
+ * neighbouring cells. Room atlases commonly mix both kinds of material. */
+static u8 sprite_atlas_cell_alpha[HD_ATLAS_COLUMNS*HD_ATLAS_ROWS];
 static unsigned next_sprite_cell;
 /* 1: HD underlay in any aspect; 2: widescreen-only side art. */
 static unsigned next_sprite_extension;
@@ -823,11 +826,12 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
             memcpy(target+(size_t)row*68*4,(u8 *)rgba->pixels+(size_t)(sy+row)*rgba->pitch+sx*4,68*4);
         if (reference==0) {
             u8 solid[68][68];
+            bool cell_authored_coverage=false;
             for (unsigned row=0;row<68;++row) {
                 u8 *line=target+(size_t)row*68*4;
                 for (unsigned col=0;col<68;++col) {
                     solid[row][col]=line[col*4+3]>=128;
-                    authored_coverage |= line[col*4+3]!=255;
+                    cell_authored_coverage |= line[col*4+3]!=255;
                 }
                 for (unsigned col=1;col<68;++col) {
                     if (!solid[row][col] && solid[row][col-1]) {
@@ -856,6 +860,8 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
                     }
                 }
             }
+            sprite_atlas_cell_alpha[sprite_atlas_cells+cell]=cell_authored_coverage;
+            authored_coverage |= cell_authored_coverage;
         } else if(static_hd_coverage) {
             SpriteCoverageWitnesses(target);
         }
@@ -3874,7 +3880,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
                 vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
-                    (sprite_atlases_enabled?(atlas->static_hd_coverage?7:atlas->authored_coverage?6:1):0);
+                    (sprite_atlases_enabled?(atlas->static_hd_coverage?7:sprite_atlas_cell_alpha[atlas_cell]?6:1):0);
             }
         }
         for (int i = 0; i < 4; ++i) {
