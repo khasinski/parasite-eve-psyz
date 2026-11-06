@@ -2053,3 +2053,74 @@ ZTEST(gte, average_nclip_preserves_clip_return) {
         }
     }
 }
+
+#ifdef __psyz
+/* Packet ownership is a native renderer concern; PS1 has no PGXP metadata. */
+void Psyz_PgxpSetActive(int active);
+int Psyz_PgxpLookupVertex(const void*, unsigned int, float*, float*, float*);
+void Psyz_GteStoreSxyTo(unsigned int reg, void* dst);
+void Psyz_GteCopyQueuedPgxpSxy(const void*, const void*, unsigned int);
+
+ZTEST_SETUP(gte_pgxp_store) {
+    InitGeom();
+    Psyz_PgxpSetActive(1);
+    Psyz_PgxpNextFrame();
+    SetupProjection();
+}
+ZTEST_TEARDOWN(gte_pgxp_store) {
+    Psyz_PgxpSetActive(0);
+    InitGeom();
+}
+
+ZTEST(gte_pgxp_store, queued_same_word_plain_store_clears_old_projection) {
+    SVECTOR vertex = {3, 7, 513, 0};
+    unsigned int source = 0, packet = 0;
+    float x, y, w;
+    gte_ldv0(&vertex);
+    gte_rtps();
+    Psyz_GteStoreSxyTo(14, &source);
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&source, source, &x, &y, &w));
+    packet = source;
+    Psyz_GteCopyQueuedPgxpSxy(&source, &packet, source);
+    Psyz_PgxpNextFrame();
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&packet, source, &x, &y, &w));
+    Psyz_GteDataWrite(14, source);
+    Psyz_GteStoreSxyTo(14, &packet);
+    zexpect_u32_eq(source, packet);
+    zexpect_s32_eq(0, Psyz_PgxpLookupVertex(&packet, source, &x, &y, &w));
+}
+
+ZTEST(gte_pgxp_store, unmatched_store_clears_ordinary_same_frame_owner) {
+    SVECTOR first = {3, 7, 513, 0}, other = {100, 200, 600, 0};
+    unsigned int packet, old;
+    float x, y, w;
+    gte_ldv0(&first);
+    gte_rtps();
+    Psyz_GteStoreSxyTo(14, &packet);
+    old = packet;
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&packet, old, &x, &y, &w));
+    gte_ldv0(&other);
+    gte_rtps();
+    Psyz_GteDataWrite(14, old);
+    Psyz_GteStoreSxyTo(14, &packet);
+    zexpect_u32_eq(old, packet);
+    zexpect_s32_eq(0, Psyz_PgxpLookupVertex(&packet, old, &x, &y, &w));
+}
+
+ZTEST(gte_pgxp_store, matched_projection_replaces_owner_without_losing_precision) {
+    SVECTOR first = {3, 7, 513, 0}, second = {100, 200, 600, 0};
+    unsigned int packet, reference;
+    float x, y, w, expected_x, expected_y, expected_w;
+    gte_ldv0(&first);
+    gte_rtps();
+    Psyz_GteStoreSxyTo(14, &packet);
+    gte_ldv0(&second);
+    gte_rtps();
+    Psyz_GteStoreSxyTo(14, &reference);
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&reference, reference, &expected_x, &expected_y, &expected_w));
+    Psyz_GteStoreSxyTo(14, &packet);
+    zexpect_u32_eq(reference, packet);
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&packet, packet, &x, &y, &w));
+    zexpect_s32_eq(1, x == expected_x && y == expected_y && w == expected_w);
+}
+#endif
