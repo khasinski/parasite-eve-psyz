@@ -32,6 +32,8 @@ layout(location = 13) flat out uint model;
 layout(location = 14) flat out vec4 uvBounds;
 
 layout(location = 15) out vec3 hdUV;
+layout(location = 16) noperspective out vec2 nativeUV;
+layout(location = 17) noperspective out vec4 nativeColor;
 
 void main() {
     hdUV=hdCoordinates;
@@ -72,6 +74,10 @@ void main() {
     rawUV = polygon != 0u
                 ? ((usePgxp || midpoint) ? vec2(tex.xy) : polyUV)
                 : vec2(tex.xy);
+    // The native PS1 grid uses affine Q12 attributes. Keep its color in
+    // original units rather than normalizing before hardware interpolation.
+    nativeUV = rawUV;
+    nativeColor = vec4(polygonRGB, uint(drawOffset.z) == 0u && !hiRes ? 1.0 : 0.0);
     // Determine texture mode and pre-compute parameters
     subPixelMask = 0u;
     texelShift = 0u;

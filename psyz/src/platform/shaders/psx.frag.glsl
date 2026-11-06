@@ -16,11 +16,17 @@ layout(location = 12) flat in uint polygon;
 layout(location = 13) flat in uint model;
 layout(location = 14) flat in vec4 uvBounds;
 layout(location = 15) in vec3 hdUV;
+layout(location = 16) noperspective in vec2 nativeUV;
+layout(location = 17) noperspective in vec4 nativeColor;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 layout(set = 2, binding = 1) uniform sampler2D texBlend;
 layout(set = 2, binding = 2) uniform sampler2D texHD;
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
+
+bool nativeAffineAttributes() {
+    return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeColor.a > 0.5;
+}
 
 float attributeRoundingBias() {
     // Native 1:1 polygon attributes occupy a 1/4096 lattice. Half an LSB
@@ -32,7 +38,7 @@ float attributeRoundingBias() {
 
 uvec2 resolveTexel() {
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
-    vec2 uv = polygon != 0u ? rawUV + attributeRoundingBias() :
+    vec2 uv = polygon != 0u ? (nativeAffineAttributes() ? nativeUV : rawUV) + attributeRoundingBias() :
         rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
     ivec2 position = ivec2(floor(uv));
     // A sprite reads only its own texels: a squeezed sprite's edge can cut
@@ -162,10 +168,12 @@ void main() {
     vec3 modColor;
     if (textureMode == 0u) {
         // untextured: PS1 uses color directly, no modulation
-        modColor = texColor.rgb * (vertexColor.rgb + attributeRoundingBias() / 255.0);
+        vec3 color = nativeAffineAttributes() ? nativeColor.rgb / 255.0 : vertexColor.rgb;
+        modColor = texColor.rgb * (color + attributeRoundingBias() / 255.0);
     } else {
         vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);
-        vec3 col8 = min(floor(vertexColor.rgb * 127.5 +
+        vec3 color8 = nativeAffineAttributes() ? nativeColor.rgb : vertexColor.rgb * 127.5;
+        vec3 col8 = min(floor(color8 +
                              (polygon != 0u ? attributeRoundingBias() : 0.5)), vec3(255.0));
         vec3 prod8 = min(tex5 * col8 / 16.0, vec3(255.0));
         modColor = dither != 0u ? prod8 / 255.0
