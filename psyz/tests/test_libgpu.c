@@ -979,6 +979,55 @@ ZTEST(gpu, selective_hd_coverage_validates_cell_mask_and_falls_back) {
 #endif
 }
 
+ZTEST(gpu, authored_partial_alpha_preserves_material_rgb) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    const uint64_t key=UINT64_C(0xabcdef0123456500);const u8 alpha[]={64,127,255,0};
+    SDL_Surface *atlas=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,atlas);
+    char path[512];snprintf(path,sizeof(path),"%spsyz-partial-rgb-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    for(unsigned variant=0;variant<LEN(alpha);++variant){
+        for(int y=0;y<136;++y)for(int x=0;x<68;++x){
+            u8 *p=(u8 *)atlas->pixels+y*atlas->pitch+x*4;
+            p[0]=y<68 && x<34?240:0;p[1]=y<68?0:255;p[2]=y<68 && x>=34?240:0;
+            p[3]=y<68 && x>=34?alpha[variant]:255;
+        }
+        zassert_s32_eq(1,SDL_SavePNG(atlas,path));zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+variant,path));
+    }
+    SDL_DestroySurface(atlas);SDL_RemovePath(path);
+    zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);
+    for(int scale=1;scale<=4;scale+=3){
+        Psyz_VideoSetInternalResolution(scale);
+        u8 *images[4];u16 native[4][64*64];int w=0,h=0;
+        for(unsigned mode=0;mode<LEN(images);++mode){
+            u16 pixels[256];for(int i=0;i<256;++i)pixels[i]=0x03e0;
+            RECT texture={512,0,16,16};LoadImage(&texture,(u_long *)pixels);RECT clear={0,0,64,64};ClearImage(&clear,16,16,16);
+            DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
+            struct {u_long address,length;u32 words[7];} packet={0};uint64_t selected=key+mode;
+            packet.length=7;packet.words[0]=0xF7000000u;packet.words[1]=(u32)selected;packet.words[2]=(u32)(selected>>32);
+            packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;packet.words[5]=16u|(16u<<16);packet.words[6]=0;
+            termPrim(&packet);DrawOTag((OT_TYPE *)&packet);extern void Psyz_PgxpNextFrame(void);Psyz_PgxpNextFrame();DrawSync(0);
+            images[mode]=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,images[mode]);StoreImage(&clear,(u_long *)native[mode]);DrawSync(0);
+        }
+        for(unsigned mode=1;mode<LEN(images);++mode)zassert_s32_eq(0,memcmp(native[0],native[mode],sizeof(native[0])));
+        if(scale==1){
+            for(unsigned mode=1;mode<LEN(images);++mode)zassert_s32_eq(0,memcmp(images[0],images[mode],(size_t)w*h*3));
+        }else{
+            for(unsigned mode=0;mode<3;++mode){
+                const u8 *blue=images[mode]+(96*w+112)*3,*red=images[mode]+(96*w+80)*3;
+                zassert_s32_eq(1,blue[2]>blue[0]+32);zassert_s32_eq(1,red[0]>red[2]+128);
+            }
+            const u8 *transparent=images[3]+(96*w+112)*3;
+            zassert_s32_eq(transparent[0],transparent[1]);zassert_s32_eq(transparent[1],transparent[2]);
+        }
+        for(unsigned mode=0;mode<LEN(images);++mode)free(images[mode]);
+    }
+    Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
 ZTEST(gpu, optional_model_filter_and_ssaa_preserve_native_vram_and_text) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char* headless = getenv("PSYZ_HEADLESS");

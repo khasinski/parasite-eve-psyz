@@ -843,7 +843,9 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
             for (unsigned row=0;row<68;++row) {
                 u8 *line=target+(size_t)row*68*4;
                 for (unsigned col=0;col<68;++col) {
-                    solid[row][col]=line[col*4+3]>=128;
+                    /* Fractional coverage still owns valid straight RGB.
+                     * Extrude only fully transparent material texels. */
+                    solid[row][col]=line[col*4+3]!=0;
                     cell_authored_coverage |= line[col*4+3]!=255;
                 }
                 for (unsigned col=1;col<68;++col) {
