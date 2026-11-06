@@ -9,6 +9,9 @@ layout(location = 5) in vec3 polygonRGB;
 layout(location = 6) in vec3 pgxpPos;
 layout(location = 7) in vec4 atlasBounds;
 layout(location = 8) in vec3 hdCoordinates;
+layout(location = 9) in uvec4 polygonGradientUV;
+layout(location = 10) in uvec4 polygonGradientRG;
+layout(location = 11) in uvec2 polygonGradientB;
 
 // widescreen: {x squeeze, centre x before the draw-grid viewport,
 //              sub-pixel shift x, y (game pixels)}
@@ -32,6 +35,11 @@ layout(location = 13) flat out uint model;
 layout(location = 14) flat out vec4 uvBounds;
 
 layout(location = 15) out vec3 hdUV;
+layout(location = 16) flat out ivec4 nativeOriginUV;
+layout(location = 17) flat out ivec4 nativeOriginRGB;
+layout(location = 18) flat out uvec4 nativeGradientUV;
+layout(location = 19) flat out uvec4 nativeGradientRG;
+layout(location = 20) flat out uvec2 nativeGradientB;
 
 void main() {
     hdUV=hdCoordinates;
@@ -72,6 +80,23 @@ void main() {
     rawUV = polygon != 0u
                 ? ((usePgxp || midpoint) ? vec2(tex.xy) : polyUV)
                 : vec2(tex.xy);
+    nativeOriginUV = ivec4(0);
+    nativeOriginRGB = ivec4(0);
+    nativeGradientUV = uvec4(0);
+    nativeGradientRG = uvec4(0);
+    nativeGradientB = uvec2(0);
+    if (polygon != 0u) {
+        // Integer planes avoid backend-dependent float interpolation at Q12
+        // boundaries. Keep enhanced geometry and fractional grids unchanged.
+        vec2 offset = drawOffset.xy + widescreen.zw;
+        bool nativeGrid = uint(drawOffset.z) == 0u && !hiRes && widescreen.x == 1.0 &&
+                          all(equal(floor(offset), offset));
+        nativeOriginUV = ivec4(ivec2(pos) + ivec2(offset), ivec2(polygonUV * 4096.0));
+        nativeOriginRGB = ivec4(ivec3(polygonRGB * 4096.0), nativeGrid ? 1 : 0);
+        nativeGradientUV = polygonGradientUV;
+        nativeGradientRG = polygonGradientRG;
+        nativeGradientB = polygonGradientB;
+    }
     // Determine texture mode and pre-compute parameters
     subPixelMask = 0u;
     texelShift = 0u;

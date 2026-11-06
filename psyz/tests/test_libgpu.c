@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <psyz.h>
 #include <kernel.h>
@@ -3385,6 +3386,36 @@ ZTEST(gpu, ps1_polygon_attribute_gradients) {
                             hash = (hash ^ (pixels[i] & 255)) * 16777619u;
                             hash = (hash ^ (pixels[i] >> 8)) * 16777619u;
                         }
+#if defined(__psyz) && !defined(__PSP__)
+                        /* Preserve procedural fixture pixels on mismatch, so
+                         * backend rounding failures can be compared directly.
+                         * The opt-in also records passing reference renders. */
+                        if (hash != expected[test] || getenv("PSYZ_DUMP_POLYGON_PIXELS")) {
+                            char path[160];
+                            snprintf(path, sizeof(path), "expected/ps1-attributes-s%u-d%u-sh%u-k%u-p%u.actual.bin",
+                                     scale, dither, shape, kind, permutation);
+                            FILE *file = fopen(path, "wb");
+                            if (file) {
+                                if (fwrite(pixels, sizeof(pixels), 1, file) != 1)
+                                    fprintf(stderr, "Cannot write %s\n", path);
+                                fclose(file);
+                            }
+                            unsigned char rgb[64 * 48 * 3];
+                            for (unsigned i = 0; i < 64 * 48; ++i) {
+                                rgb[3 * i] = ((pixels[i] >> 0) & 31) * 255 / 31;
+                                rgb[3 * i + 1] = ((pixels[i] >> 5) & 31) * 255 / 31;
+                                rgb[3 * i + 2] = ((pixels[i] >> 10) & 31) * 255 / 31;
+                            }
+                            snprintf(path, sizeof(path), "expected/ps1-attributes-s%u-d%u-sh%u-k%u-p%u.actual.png",
+                                     scale, dither, shape, kind, permutation);
+                            SDL_Surface *surface = SDL_CreateSurfaceFrom(64, 48, SDL_PIXELFORMAT_RGB24, rgb, 64 * 3);
+                            if (surface) {
+                                if (!SDL_SavePNG(surface, path))
+                                    fprintf(stderr, "Cannot write %s: %s\n", path, SDL_GetError());
+                                SDL_DestroySurface(surface);
+                            }
+                        }
+#endif
                         zexpect_u32_eq(expected[test], hash);
                     }
         zexpect_u32_eq(144, test);
