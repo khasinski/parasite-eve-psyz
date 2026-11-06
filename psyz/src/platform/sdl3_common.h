@@ -231,6 +231,8 @@ static PsyzVsyncMode vsync_mode = PSYZ_VSYNC_AUTO;
 static PsyzDitherMode dither_mode = PSYZ_DITHER_AUTO;
 static bool use_driver_vsync = false;
 static double driver_frame_time_us;
+static Uint64 last_driver_submit;
+static bool driver_submit_valid;
 static PsyzVideoStats gpu_stats = {0};
 
 // game speed (Psyz_VideoSetSpeed): the VSync mode is never changed for it
@@ -302,6 +304,7 @@ static double GetElapsedMicroseconds(Uint64 start, Uint64 end) {
 
 static void ConfigureVSync(double target_fps) {
     driver_frame_time_us = 0.0;
+    driver_submit_valid = false;
     if (vsync_mode == PSYZ_VSYNC_OFF) {
         PlatformBackend_SetDriverVsync(false);
         use_driver_vsync = false;
@@ -460,6 +463,28 @@ static void Sdl3Common_Shutdown(void) {
     SDL_SetAtomicInt(&app_in_background, 0);
     SDL_SetAtomicInt(&timing_reset_requested, 0);
     SDL_SetAtomicInt(&resume_audio_on_foreground, 0);
+}
+
+/* Limit actual window submissions, not just loop ends: variable CPU work
+ * after the previous wait must not refill an early-returning swapchain queue.
+ * This clock is independent of the original simulation and audio clocks. */
+static void PaceDriverPresent(void) {
+    if (!use_driver_vsync || game_speed != 1 ||
+        vsync_mode == PSYZ_VSYNC_LIMITLESS || driver_frame_time_us <= 0.0) {
+        driver_submit_valid = false;
+        return;
+    }
+    if (driver_submit_valid) {
+        double remaining = driver_frame_time_us - GetElapsedMicroseconds(
+            last_driver_submit, SDL_GetPerformanceCounter());
+        if (remaining > 1000.0)
+            SDL_DelayNS((Uint64)(remaining - 1000.0) * 1000);
+        while (GetElapsedMicroseconds(last_driver_submit,
+                   SDL_GetPerformanceCounter()) < driver_frame_time_us) {
+        }
+    }
+    last_driver_submit = SDL_GetPerformanceCounter();
+    driver_submit_valid = true;
 }
 
 static void WaitForNextFrame(void) {

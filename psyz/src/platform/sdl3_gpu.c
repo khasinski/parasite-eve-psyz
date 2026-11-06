@@ -223,6 +223,7 @@ static unsigned interpolated_scale;
 static Vertex interpolated_vertices[MAX_VERTEX_COUNT];
 static unsigned long long interpolated_present_count;
 static bool present_commit_pending,present_commit_mid;
+static bool driver_present_pending;
 static Uint64 present_window_start;
 static unsigned present_window_frames,present_window_mid;
 static float actual_present_fps;
@@ -660,6 +661,10 @@ static bool SubmitCmd(void) {
     if (pending_cmd) {
         SDL_GPUCommandBuffer *cmd = pending_cmd;
         pending_cmd = NULL; /* consumed by SDL on both results */
+        if (driver_present_pending) {
+            driver_present_pending=false;
+            PaceDriverPresent();
+        }
         if (!SDL_SubmitGPUCommandBuffer(cmd)) {
             quarantined_cmd = cmd; /* evidence only; never dereference */
             present_commit_pending=false;return GpuFail("SDL_SubmitGPUCommandBuffer", true);
@@ -967,6 +972,10 @@ static void SubmitFrame(void) {
     }
     SDL_GPUCommandBuffer *cmd = pending_cmd;
     pending_cmd = NULL;
+    if (driver_present_pending) {
+        driver_present_pending=false;
+        PaceDriverPresent();
+    }
     *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!*fence) { quarantined_cmd = cmd; GpuFail("frame submit/fence", true); return; }
     RecordPresentedCommit();
@@ -988,6 +997,10 @@ static bool SubmitCmdAndWait(void) {
     }
     SDL_GPUCommandBuffer *cmd = pending_cmd;
     pending_cmd = NULL;
+    if (driver_present_pending) {
+        driver_present_pending=false;
+        PaceDriverPresent();
+    }
     SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence) { quarantined_cmd = cmd; return GpuFail("submit/fence", true); }
     if (!SDL_WaitForGPUFences(device, true, &fence, 1)) {
@@ -2195,7 +2208,7 @@ static bool RefreshWindowSwapchain(void) {
 }
 
 static void PlatformBackend_Present(void) {
-    frame_presented=false;present_commit_pending=false;
+    frame_presented=false;present_commit_pending=false;driver_present_pending=false;
     if(host_clock_pause_depth||SDL_GetAtomicInt(&app_in_background)){present_window_start=0;present_window_frames=present_window_mid=0;actual_present_fps=0;Psyz_GpuResetInterpolation();}
     if (gpu_failed) return;
     if (UseSoftwareBackend()) {
@@ -2363,7 +2376,7 @@ static void PlatformBackend_Present(void) {
 #endif
         }
         if (swapchain) {
-            if (!ws_capture_active){frame_presented=true;present_commit_pending=!host_clock_pause_depth;present_commit_mid=interp_present_mid;}
+            if (!ws_capture_active){driver_present_pending=true;frame_presented=true;present_commit_pending=!host_clock_pause_depth;present_commit_mid=interp_present_mid;}
             if (!disp_on) {
                 const SDL_GPUColorTargetInfo blank_target = {
                     .texture = swapchain,
