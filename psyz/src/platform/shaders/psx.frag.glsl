@@ -160,17 +160,34 @@ void main() {
     // coherent underlay. Its alpha can cross the native staircase. Mode6
     // and all unmarked packs retain the strict native-transparent guard.
     bool staticHdCoverage=hdUV.z>6.5 && hdUV.z<7.5;
+    bool staticPaletteMatches=true;
     if (passMode.y>1u && passMode.x==0u && hdUV.z>5.5 && hdUV.z<7.5 &&
         textureMode!=0u && (staticHdCoverage || texColor!=vec4(0)) && vertexColor.a>=0.75) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
         if (all(equal(floor(basis*31.0+0.5),floor(texColor.rgb*31.0+0.5)))) {
-            vec4 material=texture(texHD,hdUV.xy);
-            if (material.a<=0.0) discard;
-            vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
-            FragColor=vec4(clamp(material.rgb*tint,0.0,1.0)*material.a,material.a);
-            return;
+            if (staticHdCoverage && all(equal(floor(basis*31.0+0.5),vec3(0)))) {
+                // Transparent black matches an unchanged hole as well as a
+                // cleared palette. Require a live colored reference texel.
+                int witness=int(floor(texelFetch(texHD,reference,0).a*255.0+0.5));
+                ivec2 at=ivec2(witness%16,witness/16);
+                vec2 pixel=hdUV.xy*vec2(size);
+                ivec2 cell=ivec2(floor(pixel/68.0))*68;
+                vec2 local=(pixel-vec2(cell)-vec2(2))/4.0;
+                vec4 nativeWitness=fetchModelTexel(ivec2(round(rawUV-local))+at);
+                vec3 originalWitness=texelFetch(texHD,cell+ivec2(4)+at*4+ivec2(0,size.y/2),0).rgb;
+                vec3 original5=floor(originalWitness*31.0+0.5);
+                staticPaletteMatches=nativeWitness!=vec4(0) && any(notEqual(original5,vec3(0))) &&
+                    all(equal(original5,floor(nativeWitness.rgb*31.0+0.5)));
+            }
+            if (staticPaletteMatches) {
+                vec4 material=texture(texHD,hdUV.xy);
+                if (material.a<=0.0) discard;
+                vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+                FragColor=vec4(clamp(material.rgb*tint,0.0,1.0)*material.a,material.a);
+                return;
+            }
         }
     }
     // check for full transparency
@@ -209,7 +226,7 @@ void main() {
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
     if (passMode.y>1u && ((hdUV.z>0.5 && hdUV.z<1.5) ||
-                         (hdUV.z>5.5 && hdUV.z<7.5)) && textureMode!=0u) {
+                         (hdUV.z>5.5 && hdUV.z<7.5)) && textureMode!=0u && staticPaletteMatches) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;

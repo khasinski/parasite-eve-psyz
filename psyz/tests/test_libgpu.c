@@ -806,15 +806,15 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
     DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
     Psyz_VideoSetInternalResolution(4);
-    u8 *images[15];u16 native[15][64*64];int w=0,h=0;
-    for(int mode=0;mode<15;++mode){
+    u8 *images[19];u16 native[19][64*64];int w=0,h=0;
+    for(int mode=0;mode<19;++mode){
         Psyz_GpuSetSpriteAtlasesEnabled(mode!=11);
-        u16 pixels[256];for(int i=0;i<256;++i)pixels[i]=(mode==4||mode==5||mode==10)?0x7c00:(i%16<8?((mode==2||mode==3||mode==9)?0x83e0:0x03e0):0);
+        u16 pixels[256];for(int i=0;i<256;++i)pixels[i]=mode>=17?0x8000:mode>=15?0:(mode==4||mode==5||mode==10)?0x7c00:(i%16<8?((mode==2||mode==3||mode==9)?0x83e0:0x03e0):0);
         RECT texture={512,0,16,16};LoadImage(&texture,(u_long *)pixels);
         RECT clear={0,0,64,64};ClearImage(&clear,16,24,32);
         DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
         struct {u_long address,length;u32 words[7];} packet={0};
-        uint64_t selected=mode==14?key+5:mode==13?key+6:mode==12?key+99:mode>=9?key+3:mode==8?key+4:mode==7?key+3:mode==6?key+2:key+(mode!=0 && mode!=2 && mode!=4);
+        uint64_t selected=(mode==15||mode==17)?key+99:mode==14?key+5:mode==13?key+6:mode==12?key+99:mode>=9?key+3:mode==8?key+4:mode==7?key+3:mode==6?key+2:key+(mode!=0 && mode!=2 && mode!=4);
         packet.length=7;packet.words[0]=0xF7000000;packet.words[1]=(u32)selected;packet.words[2]=(u32)(selected>>32);
         packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=(mode==2||mode==3||mode==9)?0x7e808080:0x7c808080;
         packet.words[5]=16u|(16u<<16);packet.words[6]=0;
@@ -856,7 +856,12 @@ ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
     zassert_s32_eq(0,memcmp(native[7],native[13],sizeof(native[0])));
     zassert_s32_eq(0,memcmp(images[7],images[13],(size_t)w*h*3));
     zassert_s32_eq(0,memcmp(images[1],images[14],(size_t)w*h*3));
-    for(int i=0;i<15;++i)free(images[i]);
+    /* A palette cleared to zero must hide the authored fringe as well. */
+    zassert_s32_eq(0,memcmp(native[15],native[16],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[15],images[16],(size_t)w*h*3));
+    zassert_s32_eq(0,memcmp(native[17],native[18],sizeof(native[0])));
+    zassert_s32_eq(0,memcmp(images[17],images[18],(size_t)w*h*3));
+    for(int i=0;i<19;++i)free(images[i]);
     Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
     Psyz_VideoSetInternalResolution(1);
 #endif
