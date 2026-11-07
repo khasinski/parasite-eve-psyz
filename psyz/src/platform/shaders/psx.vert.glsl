@@ -67,7 +67,9 @@ void main() {
         vec2 c = vec2(polygonCoverageC.xy);
         vec2 ab = abs(b-a), bc = abs(c-b), ca = abs(a-c);
         float edge = max(ab.x+ab.y, max(bc.x+bc.y, ca.x+ca.y));
-        float growth = 3.0 * edge / (128.0 * float(polygonCoverageC.w));
+        // Vulkan permits a 4-bit subpixel grid. One eighth of a pixel
+        // covers its quantization error; the integer mask removes overdraw.
+        float growth = 3.0 * edge / (8.0 * float(polygonCoverageC.w));
         position += (position - (a+b+c)/3.0) * growth;
     }
     float bias = (polygon != 0u && !hiRes) ? 0.5 : 0.0;
