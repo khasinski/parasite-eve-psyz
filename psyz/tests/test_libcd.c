@@ -36,8 +36,8 @@ static void* allocs[MAX_ALLOCS];
 static int alloc_count;
 
 #ifdef PSYZ_TEST_CD_IO
-/* Compile the original module with test-local stdio faults. Its symbols
- * satisfy the static library references; no fault hooks enter the SDK API. */
+/* Compile the original module once with test-local stdio faults. The test
+ * CMake target excludes its archive copy; no fault hooks enter the SDK API. */
 static FILE* cue_fault_file;
 static int cue_fault_mode, cue_fault_lines, cue_fault_read_error, cue_fault_closes;
 static FILE* cue_fault_open(const char* path, const char* mode) {
