@@ -3449,6 +3449,46 @@ ZTEST(gpu, vsync_callbacks_run_in_channel_order) {
     zexpect_s32_eq(7, vsync_order[2]);
 }
 
+/* A real NYPD model exposed a missing top-left-edge pixel after Vulkan
+ * clipped a triangle crossing VRAM x=0. Translation into VRAM is a control:
+ * winding and viewport clipping must not change the owned integer sample. */
+ZTEST(gpu, native_polygon_left_edge_coverage) {
+    static const short xy[3][2] = {{3, 200}, {-3, 198}, {5, 191}};
+    static const unsigned order[6][3] = {
+        {0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+        {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    static const short shift[] = {0, 1, 3};
+    DRAWENV env;
+    SetDefDrawEnv(&env, 0, 0, 320, 224);
+    env.dtd = 0;
+    env.dfe = 1;
+    PutDrawEnv(&env);
+    RECT area = {0, 0, 320, 224}, sample = {0, 198, 12, 3};
+    _Alignas(8) u16 pixels[12 * 3];
+    for (unsigned offset = 0; offset < LEN(shift); offset++) {
+        for (unsigned permutation = 0; permutation < LEN(order); permutation++) {
+            ClearImage(&area, 248, 0, 0);
+            POLY_F3 polygon = {0};
+            setPolyF3(&polygon);
+            setRGB0(&polygon, 0, 0, 248);
+            setXY3(&polygon,
+                   xy[order[permutation][0]][0] + shift[offset],
+                   xy[order[permutation][0]][1],
+                   xy[order[permutation][1]][0] + shift[offset],
+                   xy[order[permutation][1]][1],
+                   xy[order[permutation][2]][0] + shift[offset],
+                   xy[order[permutation][2]][1]);
+            DrawPrim(&polygon);
+            DrawSync(0);
+            StoreImage(&sample, (u_long*)pixels);
+            DrawSync(0);
+            zexpect_s32_eq(0x7c00, pixels[shift[offset]] & 0x7fff);
+            zexpect_s32_eq(0x7c00, pixels[12 + shift[offset]] & 0x7fff);
+            zexpect_s32_eq(0x001f, pixels[24 + shift[offset]] & 0x7fff);
+        }
+    }
+}
+
 /* Golden 16-bit GPU output from an isolated PS1 software reference. The
  * command producer advances GPU command ticks between writes; no game code
  * or CPU instruction is substituted. Covers UV/RGB sampling, signed 12-bit
