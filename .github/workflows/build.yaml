@@ -94,7 +94,22 @@ jobs:
           python ztest/zrunner.py native --exe ztest/build/win/Release/ztest_selftest.exe --workdir ztest/selftest --selftest ztest/selftest/selftest.expected.txt
       - name: Test PsyZ on Windows (${{ matrix.arch }}, ${{ matrix.compiler.name }})
         working-directory: psyz/
-        run: ./${{ matrix.compiler.script }} -A ${{ matrix.arch }}
+        shell: pwsh
+        run: |
+          if ('${{ matrix.arch }}' -eq 'Win32') { $env:PSYZ_TEST_ATTRIBUTE_SCALE = '1' }
+          & "./${{ matrix.compiler.script }}" -A ${{ matrix.arch }}
+          exit $LASTEXITCODE
+      - name: Qualify remaining Win32 attribute scales in fresh processes
+        if: matrix.arch == 'Win32'
+        working-directory: psyz/tests
+        shell: pwsh
+        run: |
+          $build = if ('${{ matrix.compiler.name }}' -eq 'MSVC') { 'msvc' } else { 'clang' }
+          foreach ($scale in 2..8) {
+            $env:PSYZ_TEST_ATTRIBUTE_SCALE = "$scale"
+            & "./build/$build/Debug/psyz_tests.exe" '--filter=gpu::ps1_polygon_attribute_gradients'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Compare polygon fixture with base shaders
         if: failure() && github.event_name == 'pull_request' && matrix.arch == 'x64'
         env:

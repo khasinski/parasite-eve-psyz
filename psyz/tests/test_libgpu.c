@@ -3617,10 +3617,18 @@ ZTEST(gpu, ps1_polygon_attribute_gradients) {
     if (!headless || strcmp(headless, "1"))
         scales = PSYZ_INTERNAL_RES_MAX;
 #endif
-    for (unsigned scale = 1; scale <= scales; ++scale) {
-        /* Qualify each scale without holding the preceding large target pair.
-         * Native VRAM remains authoritative; allocation-failure rollback has
-         * dedicated resource tests. This keeps 8x viable in Win32 CI. */
+    unsigned first_scale = 1;
+    const char* single_scale = getenv("PSYZ_TEST_ATTRIBUTE_SCALE");
+    if (single_scale) {
+        zassert_s32_eq(1, strlen(single_scale));
+        zassert_s32_eq(1, single_scale[0] >= '1' &&
+                           (unsigned)(single_scale[0] - '0') <= scales);
+        first_scale = scales = (unsigned)(single_scale[0] - '0');
+    }
+    for (unsigned scale = first_scale; scale <= scales; ++scale) {
+        /* Avoid overlapping large target pairs. Win32 CI additionally runs
+         * each scale in a fresh process, avoiding driver heap fragmentation.
+         * Native VRAM and every original pixel golden remain unchanged. */
         zassert_s32_eq(0, Psyz_VideoSetInternalResolution(1));
         zassert_s32_eq(1, Psyz_VideoGetInternalResolution());
         zassert_s32_eq(0, Psyz_VideoSetInternalResolution(scale));
