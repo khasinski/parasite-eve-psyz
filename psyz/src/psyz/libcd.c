@@ -4,6 +4,7 @@
 #include <psyz/log.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -225,7 +226,7 @@ static int parse_cue_file(const char* cue_path) {
         0; // Absolute sector where current file starts
 
     g_track_count = 0;
-    while (fgets(full_line, sizeof(full_line), fp)) {
+    while ((errno = 0, fgets(full_line, sizeof(full_line), fp))) {
         char* line = str_trim(full_line);
         if (strncmp(line, "FILE", 4) == 0) {
             // Before switching to new file, calculate size of previous file
@@ -311,10 +312,15 @@ static int parse_cue_file(const char* cue_path) {
     }
     /* A readable prefix is not a complete CUE. Always close the FILE, but
      * propagate either IO failure so the mount owner clears partial tracks. */
+    int read_errno = errno;
     int read_failed = ferror(fp);
+    int read_eof = feof(fp);
+    errno = 0;
     int close_failed = fclose(fp);
+    int close_errno = errno;
     if (read_failed || close_failed) {
-        ERRORF("Failed to finish reading CUE file");
+        ERRORF("Failed to finish reading CUE file %s: read_error=%d eof=%d read_errno=%d close_result=%d close_errno=%d",
+               cue_path, read_failed, read_eof, read_errno, close_failed, close_errno);
         return -1;
     }
 
