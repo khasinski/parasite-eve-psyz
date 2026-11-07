@@ -62,13 +62,17 @@ static const char vertex_shader_body[] = {
     "flat out uint texelShift;\n"   // Right shift for texel X
     "flat out uint indexShift;\n"   // Shift for index extraction
     "flat out uint indexMask;\n"    // Mask for color index
+    "flat out uint polygon;\n"
     "flat out uint dither;\n"       // 1 when this primitive dithers
     "flat out ivec2 pageBase;\n"    // texture page origin, in VRAM pixels
     "flat out uvec4 texWindow;\n"   // GP0(E2h) as {and.xy, or.zw}
     "\n"
     "void main() {\n"
-    "    float x = ((pos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
-    "    float y = ((pos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
+    /* GL samples pixel centers; PS1 polygons sample integer coordinates. */
+    "    polygon = (uint(tex.w) & 0x2000u) != 0u ? 1u : 0u;\n"
+    "    vec2 samplePos = pos + vec2(polygon != 0u ? 0.5 : 0.0);\n"
+    "    float x = ((samplePos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
+    "    float y = ((samplePos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
     "    gl_Position = vec4(x, y, 0.0, 1.0);\n"
     // gouraud colors
     "    vertexColor = color;\n"
@@ -119,6 +123,7 @@ static const char fragment_shader_body[] = {
     "flat in uint texelShift;\n"
     "flat in uint indexShift;\n"
     "flat in uint indexMask;\n"
+    "flat in uint polygon;\n"
     "flat in uint dither;\n"
     "flat in ivec2 pageBase;\n"
     "flat in uvec4 texWindow;\n"
@@ -126,7 +131,9 @@ static const char fragment_shader_body[] = {
     "uniform bool fullColor;\n"
     "\n"
     "uvec2 resolveTexel() {\n"
-    "    vec2 uv = rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;\n"
+    "    vec2 uv = rawUV + 1.0 / 512.0;\n"
+    /* Polygon positions already compensate for the half-pixel sample phase. */
+    "    if (polygon == 0u) uv -= 0.5 * (dFdx(rawUV) + dFdy(rawUV));\n"
     "    uvec2 texel = uvec2(clamp(floor(uv), vec2(0.0), vec2(255.0)));\n"
     "    return (texel & texWindow.xy) | texWindow.zw;\n"
     "}\n"
@@ -1118,7 +1125,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     VRGBA(vertex_cur[3]) = VRGBA(vertex_cur[0]);
             }
 
-            SET_TC_ALL(vertex_cur, tpage, clut);
+            SET_TC_ALL(vertex_cur, tpage | TPAGE_POLYGON, clut);
             Draw_EnqueueBuffer(nVertices, nIndices);
         } else {
             // shouldn't happen on a normal PSX application

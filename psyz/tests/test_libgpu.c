@@ -3449,6 +3449,96 @@ ZTEST(gpu, vsync_callbacks_run_in_channel_order) {
     zexpect_s32_eq(7, vsync_order[2]);
 }
 
+/* A real NYPD model exposed a missing top-left-edge pixel after Vulkan
+ * clipped a triangle crossing VRAM x=0. Translation into VRAM is a control:
+ * winding and viewport clipping must not change the owned integer sample. */
+ZTEST(gpu, native_polygon_left_edge_coverage) {
+    static const short xy[3][2] = {{3, 200}, {-3, 198}, {5, 191}};
+    static const unsigned order[6][3] = {
+        {0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+        {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    static const short shift[] = {0, 1, 3};
+    DRAWENV env;
+    SetDefDrawEnv(&env, 0, 0, 320, 224);
+    env.dtd = 0;
+    env.dfe = 1;
+    PutDrawEnv(&env);
+    RECT area = {0, 0, 320, 224}, sample = {0, 198, 12, 3};
+    _Alignas(8) u16 pixels[12 * 3];
+    for (unsigned offset = 0; offset < LEN(shift); offset++) {
+        for (unsigned permutation = 0; permutation < LEN(order); permutation++) {
+            ClearImage(&area, 248, 0, 0);
+            POLY_F3 polygon = {0};
+            setPolyF3(&polygon);
+            setRGB0(&polygon, 0, 0, 248);
+            setXY3(&polygon,
+                   xy[order[permutation][0]][0] + shift[offset],
+                   xy[order[permutation][0]][1],
+                   xy[order[permutation][1]][0] + shift[offset],
+                   xy[order[permutation][1]][1],
+                   xy[order[permutation][2]][0] + shift[offset],
+                   xy[order[permutation][2]][1]);
+            DrawPrim(&polygon);
+            DrawSync(0);
+            StoreImage(&sample, (u_long*)pixels);
+            DrawSync(0);
+            zexpect_s32_eq(0x7c00, pixels[shift[offset]] & 0x7fff);
+            zexpect_s32_eq(0x7c00, pixels[12 + shift[offset]] & 0x7fff);
+            zexpect_s32_eq(0x001f, pixels[24 + shift[offset]] & 0x7fff);
+        }
+    }
+}
+
+/* A conservative margin below the rasterizer's subpixel precision can
+ * move an owned corner inward. These interior samples caught that regression
+ * on a four-bit Vulkan rasterizer; they require no original texture assets. */
+ZTEST(gpu, native_polygon_quantized_corner_coverage) {
+    static const struct { short xy[6], x, y; } cases[] = {
+        {{167, 118, 164, 116, 165, 116}, 164, 116},
+        {{155, 126, 163, 122, 164, 124}, 161, 123},
+        {{165, 120, 162, 136, 164, 124}, 163, 130},
+        {{149, 140, 149, 133, 155, 142}, 152, 141},
+        {{166, 142, 169, 141, 171, 158}, 166, 142},
+        {{161, 143, 161, 145, 155, 142}, 159, 144},
+        {{8, 170, 5, 165, 5, 164}, 5, 165},
+        {{9, 172, 8, 187, 7, 174}, 7, 174},
+        {{160, 193, 165, 183, 165, 191}, 162, 189},
+        {{160, 193, 165, 183, 165, 191}, 161, 191},
+        {{17, 201, 11, 192, 10, 189}, 11, 192},
+    };
+    static const unsigned order[6][3] = {
+        {0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+        {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    DRAWENV env;
+    SetDefDrawEnv(&env, 0, 0, 320, 224);
+    env.dtd = 0;
+    env.dfe = 1;
+    PutDrawEnv(&env);
+    RECT area = {0, 0, 320, 224};
+    _Alignas(8) u16 pixels[2];
+    for (unsigned i = 0; i < LEN(cases); i++) {
+        for (unsigned permutation = 0; permutation < LEN(order); permutation++) {
+            ClearImage(&area, 248, 0, 0);
+            POLY_F3 polygon = {0};
+            setPolyF3(&polygon);
+            setRGB0(&polygon, 0, 0, 248);
+            setXY3(&polygon,
+                   cases[i].xy[order[permutation][0]*2],
+                   cases[i].xy[order[permutation][0]*2+1],
+                   cases[i].xy[order[permutation][1]*2],
+                   cases[i].xy[order[permutation][1]*2+1],
+                   cases[i].xy[order[permutation][2]*2],
+                   cases[i].xy[order[permutation][2]*2+1]);
+            DrawPrim(&polygon);
+            DrawSync(0);
+            RECT sample = {cases[i].x, cases[i].y, 2, 1};
+            StoreImage(&sample, (u_long*)pixels);
+            DrawSync(0);
+            zexpect_s32_eq(0x7c00, pixels[0] & 0x7fff);
+        }
+    }
+}
+
 /* Golden 16-bit GPU output from an isolated PS1 software reference. The
  * command producer advances GPU command ticks between writes; no game code
  * or CPU instruction is substituted. Covers UV/RGB sampling, signed 12-bit

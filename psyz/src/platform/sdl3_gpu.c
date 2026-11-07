@@ -1085,6 +1085,8 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
         {.location=9,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT4,.offset=offsetof(Vertex,polygon_gradient)},
         {.location=10,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT4,.offset=offsetof(Vertex,polygon_gradient)+4*sizeof(unsigned int)},
         {.location=11,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT2,.offset=offsetof(Vertex,polygon_gradient)+8*sizeof(unsigned int)},
+        {.location=12,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_SHORT4,.offset=offsetof(Vertex,polygon_coverage)},
+        {.location=13,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_SHORT4,.offset=offsetof(Vertex,polygon_coverage)+4*sizeof(short)},
     };
     // the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
     static const SDL_GPUColorTargetBlendState blend[BLEND_COUNT] = {
@@ -3435,6 +3437,14 @@ static void SetPolygonAttributes(Vertex* vertices) {
         b->x <= a->x ? (c->x <= b->x ? c : b) : (c->x < a->x ? c : a);
     int64_t area = (int64_t)(b->x - a->x) * (c->y - a->y) -
                    (int64_t)(b->y - a->y) * (c->x - a->x);
+    int64_t magnitude = area < 0 ? -area : area;
+    for (int i = 0; i < 3; ++i) {
+        const short coverage[8] = {
+            a->x, a->y, b->x, b->y, c->x, c->y,
+            (short)((area > 0) - (area < 0)),
+            (short)(magnitude > 32767 ? 32767 : magnitude)};
+        memcpy(vertices[i].polygon_coverage, coverage, sizeof(coverage));
+    }
     for (int i = 0; i < 3; ++i) {
         vertices[i].uv_bounds[0] = SDL_min(a->u, SDL_min(b->u, c->u));
         vertices[i].uv_bounds[1] = SDL_min(a->v, SDL_min(b->v, c->v));
@@ -3528,6 +3538,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     v = vertex_cur;
     for (int i=0;i<6;++i) {
         memset(v[i].polygon_gradient, 0, sizeof(v[i].polygon_gradient));
+        memset(v[i].polygon_coverage, 0, sizeof(v[i].polygon_coverage));
         v[i].hd_uv[0]=v[i].hd_uv[1]=0;
         v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;
         v[i].pgxp_pos[0] = 0.0f;
@@ -4624,7 +4635,8 @@ void Draw_FlushBuffer(void) {
                   (geometry_correction || effect_geometry_correction))
                      ? 1.0f
                      : 0.0f) +
-                    (midpoint ? 2.0f : 0.0f),
+                    (midpoint ? 2.0f : 0.0f) +
+                    (draw_grid_source_width != draw_grid_target_width ? 4.0f : 0.0f),
                 target_scale > 1 ? 1.0f : 0.0f,
                 ws_squeeze,
                 (target_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,

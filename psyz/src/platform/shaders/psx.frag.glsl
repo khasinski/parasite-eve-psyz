@@ -21,6 +21,8 @@ layout(location = 17) flat in ivec4 nativeOriginRGB;
 layout(location = 18) flat in uvec4 nativeGradientUV;
 layout(location = 19) flat in uvec4 nativeGradientRG;
 layout(location = 20) flat in uvec2 nativeGradientB;
+layout(location = 21) flat in ivec4 nativeCoverageAB;
+layout(location = 22) flat in ivec3 nativeCoverageC;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 layout(set = 2, binding = 1) uniform sampler2D texBlend;
@@ -29,6 +31,32 @@ layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
 
 bool nativeAffineAttributes() {
     return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeOriginRGB.w != 0;
+}
+
+uvec2 signedProduct(int x, int y) {
+    // Two-word multiplication uses ordinary 32-bit operations on every
+    // backend, including HLSL targets without imulExtended/shaderInt64.
+    uint a = x < 0 ? 0u-uint(x) : uint(x);
+    uint b = y < 0 ? 0u-uint(y) : uint(y);
+    uint p0 = (a&65535u)*(b&65535u);
+    uint p1 = (a&65535u)*(b>>16u), p2 = (a>>16u)*(b&65535u);
+    uint lo = p0+(p1<<16u);
+    uint hi = (a>>16u)*(b>>16u)+(p1>>16u)+uint(lo<p0);
+    uint next = lo+(p2<<16u);
+    hi += (p2>>16u)+uint(next<lo);
+    lo = next;
+    if ((x<0)!=(y<0)) { lo=0u-lo; hi=~hi+uint(lo==0u); }
+    return uvec2(lo,hi);
+}
+
+bool outsideNativeEdge(ivec2 a, ivec2 b, ivec2 p) {
+    uvec2 x = signedProduct(p.x-a.x, b.y-a.y);
+    uvec2 y = signedProduct(p.y-a.y, b.x-a.x);
+    uint low = x.x-y.x, high = x.y-y.y-uint(x.x<y.x);
+    bool positive = int(high)>0 || (high==0u && low!=0u);
+    bool zero = high==0u && low==0u;
+    bool topLeft = b.y<a.y || (b.y==a.y && b.x>a.x);
+    return positive || (zero && !topLeft);
 }
 
 uint nativeQ12(int origin, uvec2 gradient, ivec2 delta) {
@@ -111,6 +139,13 @@ vec4 fetchModelTexel(ivec2 position) {
 }
 
 void main() {
+    if (nativeAffineAttributes()) {
+        ivec2 a = nativeCoverageAB.xy, b = nativeCoverageAB.zw;
+        ivec2 c = nativeCoverageC.xy, p = ivec2(gl_FragCoord.xy);
+        if (nativeCoverageC.z < 0) { ivec2 swap = b; b = c; c = swap; }
+        if (nativeCoverageC.z == 0 || outsideNativeEdge(a,b,p) ||
+            outsideNativeEdge(b,c,p) || outsideNativeEdge(c,a,p)) discard;
+    }
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
     // Explicit queued dialogue glyph: new alpha is presentation-only.
