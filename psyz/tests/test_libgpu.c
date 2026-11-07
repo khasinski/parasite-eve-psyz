@@ -3618,6 +3618,11 @@ ZTEST(gpu, ps1_polygon_attribute_gradients) {
         scales = PSYZ_INTERNAL_RES_MAX;
 #endif
     for (unsigned scale = 1; scale <= scales; ++scale) {
+        /* Qualify each scale without holding the preceding large target pair.
+         * Native VRAM remains authoritative; allocation-failure rollback has
+         * dedicated resource tests. This keeps 8x viable in Win32 CI. */
+        zassert_s32_eq(0, Psyz_VideoSetInternalResolution(1));
+        zassert_s32_eq(1, Psyz_VideoGetInternalResolution());
         zassert_s32_eq(0, Psyz_VideoSetInternalResolution(scale));
         zassert_s32_eq(scale, Psyz_VideoGetInternalResolution());
         unsigned test = 0;
