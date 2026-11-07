@@ -20,6 +20,11 @@ add_executable(${PROJECT_NAME} ${PSYZ_TEST_SOURCES})
 set_target_properties(${PROJECT_NAME} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_link_libraries(${PROJECT_NAME} PRIVATE ztest psyz)
 if(NOT PSP)
+    # test_libcd.c compiles the original module with local stdio fault wrappers.
+    # Do not also archive it: COFF linkers can load both copies of the symbols.
+    get_target_property(psyz_test_sources psyz SOURCES)
+    list(REMOVE_ITEM psyz_test_sources src/psyz/libcd.c)
+    set_property(TARGET psyz PROPERTY SOURCES "${psyz_test_sources}")
     target_compile_definitions(${PROJECT_NAME} PRIVATE PSYZ_TEST_CD_IO=1 _FILE_OFFSET_BITS=64)
 endif()
 if(NOT PSP AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
