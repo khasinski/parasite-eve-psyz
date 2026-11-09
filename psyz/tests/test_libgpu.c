@@ -737,6 +737,54 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
 #endif
 }
 
+/* Every covered texel has an exact native reference. A squeezed high-resolution
+ * sprite must never reveal its green low-resolution checker between HD samples. */
+ZTEST(gpu, hd_reference_uses_sprite_sample_grid) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    SDL_Surface *image=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
+    for(int y=0;y<136;++y)for(int x=0;x<68;++x){
+        int lx=(x<2?0:x>65?63:x-2)/4,ly=(y%68<2?0:y%68>65?63:y%68-2)/4;
+        u8 *pixel=(u8 *)image->pixels+y*image->pitch+x*4;
+        pixel[0]=y<68?240:0;pixel[1]=y<68?40:((lx+ly)&1?255:123);pixel[2]=y<68?80:0;pixel[3]=255;
+    }
+    char path[512];snprintf(path,sizeof path,"%spsyz-phase-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    zassert_s32_eq(1,SDL_SavePNG(image,path));SDL_DestroySurface(image);
+    const uint64_t key=UINT64_C(0x5a6b7c8d12345678);Psyz_GpuResetSpriteAtlases();zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,path));SDL_RemovePath(path);
+    zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    const unsigned scales[]={2,3,4,5,6,7,8};
+    for(unsigned n=0;n<sizeof(scales)/sizeof(scales[0]);++n)for(int aa=0;aa<2;++aa){
+        Psyz_VideoSetInternalResolution(scales[n]);Psyz_VideoSetAntialiasing(aa);
+        Psyz_VideoSetWidescreen(1);Psyz_VideoSetWidescreenPicture(0,-112,432);
+        u8 *images[4]={0};u16 native[4][320*224];int w=0,h=0;
+        for(int mode=0;mode<4;++mode){
+            Psyz_GpuSetSpriteAtlasesEnabled(mode&1);
+            u16 pixels[256];for(int i=0;i<256;++i)pixels[i]=mode>=2?0x7c00:(((i%16+i/16)&1)?0x03e0:0x01e0);
+            RECT tex={512,0,16,16};LoadImage(&tex,(u_long *)pixels);
+            RECT clear={0,0,320,224};ClearImage(&clear,16,24,32);
+            DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
+            struct {u_long address,length;u32 words[7];} packet={0};packet.length=7;
+            packet.words[0]=0xF7000000;packet.words[1]=(u32)key;packet.words[2]=(u32)(key>>32);
+            packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;packet.words[5]=16u|(16u<<16);packet.words[6]=0;
+            termPrim(&packet);DrawOTag((OT_TYPE *)&packet);DrawSync(0);
+            images[mode]=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,images[mode]);
+            StoreImage(&clear,(u_long *)native[mode]);DrawSync(0);
+        }
+        unsigned green=0,red=0;for(int i=0;i<w*h;++i){const u8 *p=images[1]+i*3;green+=p[1]>70;red+=p[0]>150&&p[1]<70;}
+        printf("HD reference phase: scale=%u AA=%d green=%u red=%u\n",scales[n],aa,green,red);
+        zassert_s32_eq(1,red>100);zassert_s32_eq(0,green);
+        zassert_s32_eq(0,memcmp(native[0],native[1],sizeof native[0]));
+        zassert_s32_eq(0,memcmp(native[2],native[3],sizeof native[2]));
+        zassert_s32_eq(0,memcmp(images[2],images[3],(size_t)w*h*3));
+        for(int i=0;i<4;++i)free(images[i]);
+    }
+    Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);Psyz_GpuSetSpriteAtlasesEnabled(1);
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetAntialiasing(0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
 /* Authored HD mattes affect presentation only. Legacy RGB materials and PS1
  * semitransparent primitives retain their original coverage/blend rules. */
 ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {

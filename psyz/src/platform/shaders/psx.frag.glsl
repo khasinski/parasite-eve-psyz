@@ -81,6 +81,15 @@ vec4 fetchModelTexel(ivec2 position) {
     return texelFetch(texVram,base+ivec2(index,0),0);
 }
 
+// Reference identity must use the same sprite pixel corner as resolveTexel.
+// HD material sampling stays continuous; only the original-palette guard snaps.
+ivec2 hdReferenceTexel(ivec2 size) {
+    vec2 uv=hdUV.xy;
+    if (polygon==0u)
+        uv-=0.5*(dFdx(hdUV.xy)+dFdy(hdUV.xy))-vec2(4.0/512.0)/vec2(size);
+    return ivec2(uv*vec2(size))+ivec2(0,size.y/2);
+}
+
 void main() {
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
@@ -127,7 +136,7 @@ void main() {
     if (passMode.y>1u && passMode.x==0u && hdUV.z>5.5 && hdUV.z<6.5 &&
         textureMode!=0u && vertexColor.a>=0.75) {
         ivec2 size=textureSize(texHD,0);
-        ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
+        ivec2 reference=hdReferenceTexel(size);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
         if (all(equal(floor(basis*31.0+0.5),floor(texColor.rgb*31.0+0.5)))) {
             vec4 material=texture(texHD,hdUV.xy);
@@ -173,7 +182,7 @@ void main() {
     if (passMode.y>1u && ((hdUV.z>0.5 && hdUV.z<1.5) ||
                          (hdUV.z>5.5 && hdUV.z<6.5)) && textureMode!=0u) {
         ivec2 size=textureSize(texHD,0);
-        ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
+        ivec2 reference=hdReferenceTexel(size);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
         if (all(equal(floor(basis*31.0+0.5),floor(texColor.rgb*31.0+0.5)))) {
             vec3 enhanced=texture(texHD,hdUV.xy).rgb;
