@@ -322,6 +322,7 @@ static struct {
 static float ws_mid_shift[2],ws_mid_qx[2],ws_mid_qy[2],ws_mid_ex[2],ws_mid_ey[2],ws_mid_left[2],ws_mid_right[2];
 /* Psyz_VideoSetWidescreenCentred: drawing ignores the view's shift. */
 static bool ws_centred;
+static bool ws_display_only;
 /* Psyz_VideoSetWidescreenField: drawing is the room, it follows ex, ey. */
 static bool ws_field;
 
@@ -2267,6 +2268,9 @@ static void UpdateScissor() {
 }
 
 unsigned Psyz_VideoGetInternalResolution(void) {
+    /* Settings are applied before platform creation. Report that pending
+     * choice rather than the uninitialized 1x render-target placeholder. */
+    if(!is_platform_initialized)return set_internal_res;
     return internal_res / (antialiasing ? 2u : 1u);
 }
 
@@ -2349,6 +2353,7 @@ int Psyz_VideoGetEffectGeometryCorrection(void) {
 }
 
 int Psyz_VideoSetWidescreen(int enabled) {
+    if(enabled && UseSoftwareBackend())return -1;
     if ((enabled != 0) != widescreen) {
         Draw_FlushBuffer();
         widescreen = enabled != 0;
@@ -2370,6 +2375,14 @@ int Psyz_VideoSetWidescreen(int enabled) {
     return 0;
 }
 int Psyz_VideoGetWidescreen(void) { return widescreen; }
+void Psyz_VideoSetWidescreenDisplayOnly(int enabled) {
+    if(ws_display_only!=(enabled!=0)) {
+        /* A startup preference must not create the GPU/window before disc
+         * validation or consume the still-pending resolution settings. */
+        if(is_platform_initialized)Draw_FlushBuffer();
+        ws_display_only=enabled!=0;
+    }
+}
 void Psyz_VideoSetWidescreenCentred(int enabled) {
     if ((enabled != 0) != ws_centred) {
         Draw_FlushBuffer();
@@ -3335,16 +3348,7 @@ void Draw_FlushBuffer(void) {
      * narrower than the screen (a menu list) is squeezed with its contents;
      * the full-width one is kept, so what lies past the screen's edges stays.
      */
-    const float ws_squeeze = WidescreenDraw() ? WS_SQUEEZE : 1.0f;
     const float ws_centre = WidescreenCentre();
-    SDL_Rect clip = scissor_rect;
-    if (ws_squeeze < 1.0f && clip.w < display_size.x) {
-        float x0 = ws_centre + ((float)clip.x - ws_centre) * ws_squeeze;
-        float x1 =
-            ws_centre + ((float)(clip.x + clip.w) - ws_centre) * ws_squeeze;
-        clip.x = (int)SDL_floorf(x0);
-        clip.w = (int)SDL_ceilf(x1) - clip.x;
-    }
     /* Widescreen: the room moves by its whole-pixel step (WidescreenFieldStep)
      * in the shown picture; native VRAM under a high-resolution one keeps
      * the game's own picture for read-backs. */
@@ -3355,6 +3359,16 @@ void Draw_FlushBuffer(void) {
      * feedback must not depend on high-resolution sample positions. */
     for (unsigned target_index = 0;
          target_index < (scaled_vram_render ? 2u : 1u) + (interpolation_enabled && interpolated_vram && interpolated_scale==internal_res ? 1u : 0u); ++target_index) {
+        /* Native readback/feedback stays in original PS1 coordinates when
+         * requested. Scissor and blend-copy bounds must use that same space. */
+        const bool preserve_native=ws_display_only && scaled_vram_render && target_index==0;
+        const float ws_squeeze=WidescreenDraw() && !preserve_native ? WS_SQUEEZE : 1.0f;
+        SDL_Rect clip=scissor_rect;
+        if(ws_squeeze<1.0f && clip.w<display_size.x) {
+            float x0=ws_centre+((float)clip.x-ws_centre)*ws_squeeze;
+            float x1=ws_centre+((float)(clip.x+clip.w)-ws_centre)*ws_squeeze;
+            clip.x=(int)SDL_floorf(x0);clip.w=(int)SDL_ceilf(x1)-clip.x;
+        }
         bool midpoint=interpolation_enabled&&interpolated_vram&&target_index==(scaled_vram_render?2u:1u);
         SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
         if(midpoint){

@@ -853,6 +853,7 @@ int Psyz_VideoGetAntialiasing(void) { return 0; }
 int Psyz_VideoSetModelFiltering(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetModelFiltering(void) { return 0; }
 int Psyz_VideoSetWidescreen(int enabled) { return enabled ? -1 : 0; }
+void Psyz_VideoSetWidescreenDisplayOnly(int enabled) { (void)enabled; }
 int Psyz_VideoGetWidescreen(void) { return 0; }
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     (void)buffer_y;

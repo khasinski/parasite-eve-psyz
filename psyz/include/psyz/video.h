@@ -257,6 +257,9 @@ int Psyz_VideoGetEffectGeometryCorrection(void);
  */
 int Psyz_VideoSetWidescreen(int enabled);
 int Psyz_VideoGetWidescreen(void);
+/* Opt-in: with a scaled display target, preserve native VRAM coordinates
+ * for readback/feedback while widening only the presented image. */
+void Psyz_VideoSetWidescreenDisplayOnly(int enabled);
 
 /**
  * @brief Tell the presenter where the game's picture is in one buffer
