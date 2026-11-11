@@ -7,8 +7,11 @@
 #include <psyz/log.h>
 
 /* BIOS A(2Fh)/A(30h): unsigned 32-bit state, 15-bit result.
- * https://psx-spx.consoledev.net/ps1/kernelbios/misc-functions/ */
-static uint32_t biosRandomState = 1;
+ * https://psx-spx.consoledev.net/ps1/kernelbios/misc-functions/
+ * Before any srand the state is the word the kernel leaves at 0x80009010:
+ * 0x24040001 with the SCPH-1001 BIOS (as on DuckStation), so a game that
+ * never seeds draws the same numbers as there. */
+static uint32_t biosRandomState = UINT32_C(0x24040001);
 int Psyz_Rand(void) {
     biosRandomState = biosRandomState * UINT32_C(0x41c64e6d) + UINT32_C(0x3039);
     return (int)((biosRandomState >> 16) & 0x7fff);
