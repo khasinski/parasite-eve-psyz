@@ -379,7 +379,8 @@ static struct {
     uint64_t seek_end_us, read_first_us;
 } drive = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static int drive_instant = -1;
-static int drive_init_was_double; // the speed CdInit found
+// The BIOS boots at double speed: the first CdInit slows the drive down.
+static int drive_init_was_double = 1; // the speed CdInit finds
 
 void Psyz_CdSetInstantTiming(int instant) { drive_instant = instant != 0; }
 
@@ -527,6 +528,29 @@ void Psyz_CdShellOpen(int is_open) {
 
 static void close_track_file(void);
 
+static int read_raw_sector(int sector, u_char* out);
+static void drive_hold(int lba, int subq, int offset, uint64_t at);
+
+/* The BIOS hands over with the head just past the executable it read: the
+ * first sector of user data starting "PS-X EXE" within the first minute,
+ * plus its text size. */
+static void drive_boot_position(void) {
+    u_char sector[SECTOR_SIZE];
+    for (int lba = 16; lba < 75 * 60; lba++) {
+        if (read_raw_sector(lba, sector) < 0) {
+            return;
+        }
+        if (!memcmp(sector + 24, "PS-X EXE", 8)) {
+            u32 size = (u32)sector[24 + 0x1C] | (u32)sector[24 + 0x1D] << 8 |
+                       (u32)sector[24 + 0x1E] << 16 |
+                       (u32)sector[24 + 0x1F] << 24;
+            int end = lba + 1 + (int)((size + 2047) / 2048);
+            drive_hold(end, end, 2, 0);
+            return;
+        }
+    }
+}
+
 int Psyz_CdSetDiskPath(const char* diskPath) {
 #if PE_NATIVE_STATE_CPU_COMPONENTS
     extern void Psyz_StateCdChanged(void);Psyz_StateCdChanged();
@@ -544,6 +568,7 @@ int Psyz_CdSetDiskPath(const char* diskPath) {
     }
     is_disk_loaded = 1;
     DEBUGF("Disk path set: %s", diskPath);
+    drive_boot_position();
     return 0;
 }
 
@@ -1274,7 +1299,9 @@ static void callback(void) { NOT_IMPLEMENTED; }
 int CD_init(void) {
     u_char nop_result[8];
     CD_com = 0;
-    drive_init_was_double = (CD_mode & CdlModeSpeed) != 0;
+    if (CD_mode & CdlModeSpeed) {
+        drive_init_was_double = 1;
+    }
     CD_mode = 0;
     CD_cbready = 0;
     CD_cbsync = 0;
@@ -1676,10 +1703,18 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3);
 
 /* The acknowledge of the command being issued, which mechanical delays
  * count from. CD_cw waits for it, as libcd does, unless arg3 asks for no
- * wait (CdControlF). */
+ * wait (CdControlF). LIBCD's CD_cw, CD_sync and getintr (the matching
+ * decompilation in ridge-racer-type-4-decomp) set the model: CdSync(1) is
+ * CdlNoIntr until the Complete interrupt of a command with a second
+ * response, or the acknowledge of one without; an error acknowledge makes
+ * it CdlDiskError and the command fail. */
 static uint64_t command_ack_us;
 
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
+    // LIBCD's CD_cw first waits (CD_sync(0)) for the previous command to
+    // complete, a second response included.
+    drive_wait_until(drive.done_us);
+    Psyz_CdServiceDrive();
     CD_com = com; // CdLastCom
     command_ack_us = drive_now();
     if (!drive_is_instant()) {
@@ -2064,9 +2099,16 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
     return 0;
 }
 
+// LIBCD's: up to five attempts at one Init with the volume reset. (LIBCD
+// then installs callbacks delivering HwCdRom events; PsyZ raises those from
+// CD_cw, and a ready callback would take the sectors of polled reads.)
 int CdInit(void) {
-    CdReset(1);
-    return CD_init() == 0 ? 1 : 0;
+    for (int i = 0; i < 5; i++) {
+        if (CD_init() == 0 && CD_initvol() == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int CdReading() {
@@ -2079,6 +2121,12 @@ void ExecCd() { NOT_IMPLEMENTED; }
 /* CdRead, CdReadSync and CdReadCallback are LIBCD's (decomp cdread.c): a
  * ready callback that takes each sector the drive delivers. */
 
+/* Native save states (PE_NATIVE_STATE_CPU_COMPONENTS, built by Parasite Eve
+ * PC only; Ridge Racer Type 4 does not define it) keep their fixed 79584-byte
+ * PECD001 layout: the drive timing (struct drive, command_ack_us, the
+ * delivery timeline, timed interrupts) is not in it. A capture requires an
+ * idle data path; a restore leaves the head holding where it is with no
+ * command pending, so at most a seek's time differs after it. */
 #if PE_NATIVE_STATE_CPU_COMPONENTS
 #include "psyz/state_audio.h"
 #include "psyz/state_producers.h"
