@@ -166,6 +166,29 @@ void Psyz_SpendTime(unsigned ns);
  */
 void Psyz_MdecSetInstantTiming(int instant);
 
+/**
+ * @brief Account for a memory card ("bu") file transfer of `bytes`
+ *
+ * For a host-side BIOS file layer. An asynchronous (FASYNC) transfer
+ * raises SwCARD/EvSpIOE once the PS1 would have finished it, on the
+ * emulated clock; a synchronous one spends that time before returning.
+ */
+void Psyz_CardFileTransfer(long bytes, int async);
+
+/**
+ * @brief Spend the time the BIOS takes to create a card file
+ */
+void Psyz_CardFileCreate(void);
+
+/**
+ * @brief Complete memory card file I/O at once
+ *
+ * PSYZ_CARD_TIMING=instant does the same.
+ *
+ * @param instant Non-zero for instant transfers
+ */
+void Psyz_CardSetInstantTiming(int instant);
+
 #ifdef __cplusplus
 }
 #endif

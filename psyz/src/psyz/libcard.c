@@ -2,6 +2,10 @@
 #include <libapi.h>
 #include <psyz/log.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
+#include <libetc.h>
+#include <psyz/system.h>
 #include "../internal.h"
 
 // 1:valid, 0:invalid
@@ -154,4 +158,63 @@ long _card_read(long chan, long block, unsigned char* buf) {
     (void)block;
     (void)buf;
     return card_op(0, chan);
+}
+
+/* Memory card file timing ("bu" device). The BIOS moves one 128-byte frame
+ * of a file about every two fields (the card driver steps its transfers on
+ * the vblank interrupt), so an 8 KiB block takes 128 fields plus a few of
+ * setup; an FASYNC read or write returns at once and raises SwCARD/EvSpIOE
+ * when its last frame is done, a synchronous one returns then. Creating a
+ * file first writes its directory frames. Measured on DuckStation with
+ * Ridge Racer Type 4 (PAL): a 1-block save or load waits 133..134 fields
+ * for its event and the file creation blocks 8 fields.
+ * Psyz_CardSetInstantTiming(1) or PSYZ_CARD_TIMING=instant completes card
+ * I/O at once. */
+enum { CARD_FIELDS_PER_FRAME = 2, CARD_SETUP_FIELDS = 5, CARD_CREATE_FIELDS = 8 };
+
+static int card_instant = -1;
+
+void Psyz_CardSetInstantTiming(int instant) { card_instant = instant != 0; }
+
+static int card_is_instant(void) {
+    if (card_instant < 0) {
+        const char* timing = getenv("PSYZ_CARD_TIMING");
+        card_instant = timing && !strcmp(timing, "instant");
+    }
+    return card_instant;
+}
+
+static uint64_t card_fields_us(unsigned fields) {
+    /* PS1 field: 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks at
+     * 53.693175 MHz. */
+    uint64_t clocks = GetVideoMode() == MODE_PAL ? 3406ull * 314 : 3413ull * 263;
+    return (fields * clocks * 1000 + 26846) / 53693;
+}
+
+static unsigned card_transfer_fields(long bytes) {
+    long frames = (bytes + 127) / 128;
+    return (unsigned)(CARD_SETUP_FIELDS + frames * CARD_FIELDS_PER_FRAME);
+}
+
+static void card_async_done(void) { Psyz_KernelRaise(SwCARD, EvSpIOE); }
+
+void Psyz_CardFileTransfer(long bytes, int async) {
+    if (card_is_instant()) {
+        if (async) {
+            card_async_done();
+        }
+        return;
+    }
+    uint64_t us = card_fields_us(card_transfer_fields(bytes));
+    if (async) {
+        Psyz_KernelPostAt(Psyz_KernelNowUs() + us, card_async_done);
+    } else {
+        Psyz_SpendTime((unsigned)(us * 1000 < 0xFFFFFFFFu ? us * 1000 : 0xFFFFFFFFu));
+    }
+}
+
+void Psyz_CardFileCreate(void) {
+    if (!card_is_instant()) {
+        Psyz_SpendTime((unsigned)(card_fields_us(CARD_CREATE_FIELDS) * 1000));
+    }
 }
