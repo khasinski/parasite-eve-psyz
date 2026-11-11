@@ -31,6 +31,7 @@ set(PSYZ_SOURCES
     src/psyz/kernel.c
     src/psyz/libetc.c
     src/psyz/libgpu.c
+    src/psyz/gpudump.c
     ../decomp/src/libcard/card.c
     ../decomp/src/libcard/init.c
     ../decomp/src/libgpu/sys.c

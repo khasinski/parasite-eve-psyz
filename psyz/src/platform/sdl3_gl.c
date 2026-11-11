@@ -1617,3 +1617,8 @@ int Psyz_VideoSetDynamicLighting(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetDynamicLighting(void){return 0;}
 int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetEffectGeometryCorrection(void){return 0;}
+
+/* The OpenGL backend has no CPU rasterizer route. */
+int Psyz_VideoSetNativeRasterizer(int enabled) { return enabled ? -1 : 0; }
+int Psyz_VideoGetNativeRasterizer(void) { return 0; }
+int Psyz_VideoNativeRasterizerActive(void) { return 0; }

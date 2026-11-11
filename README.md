@@ -46,6 +46,33 @@ Opaque groups retain the texture mask bit through a separate alpha write.
 At native 1:1 sampling, a half-LSB correction on the 12-bit attribute lattice
 prevents floating interpolation from moving exact UV/color boundaries down.
 
+### Pixel-exact native rendering
+
+The CPU rasterizer (`sdl3_software.c`) reproduces the PS1 GPU bit for bit:
+triangles are scanned in two halves with 32.32 fixed-point edges (top/left
+inclusive, bottom/right exclusive), colours and texture coordinates step by
+12.12 gradients from a half-unit bias at the leftmost vertex, quads are the
+triangles (v0,v1,v2) and (v2,v1,v3), polygons spanning 1024+ columns or
+512+ rows are not drawn, lines step a 32.32 position along the major axis and
+are always dithered when dithering is on, a textured polygon's page becomes
+the drawing mode for later sprites, rectangle positions wrap to 11 bits, fills
+(GP0 02h) round X down and the width up to 16 pixels and ignore the mask
+settings, and uploads/copies follow the mask bit. libgpu cuts VRAM transfers
+and fills that run past the right or bottom edge into wrapped pieces (x modulo
+1024, y modulo 512) for every backend. With `Psyz_VideoSetNativeRasterizer(1)`
+the SDL3 GPU backend draws with this rasterizer whenever the internal
+resolution is 1 and no GPU-only enhancement is on, uploads the CPU VRAM each
+frame and presents it through its usual display pipeline; higher internal
+resolutions and the enhancements draw with the GPU rasterizer. Presented and
+captured RGB555 channels show as round(c * 255 / 31).
+
+`Psyz_GpuDumpBegin`/`Psyz_GpuDumpEnd` record the GP0/GP1 commands with the
+starting VRAM and drawing state as a GPUDUMP file (`.psxgpu`). DuckStation
+replays it (`duckstation-regtest -frames 1 file.psxgpu`), so a frame's VRAM can
+be compared pixel for pixel with its software GPU. The test
+`gpu::native_rasterization_matches_ps1_gpu` uses such a replay as its golden
+frame (`PSYZ_TEST_GPU_DUMP=file` records the test's commands).
+
 GPU shader headers can be regenerated with
 `sh psyz/src/platform/shaders/build_shaders.sh` using glslangValidator,
 SPIRV-Cross, xxd, and either dxc or SDL shadercross. Optional shader names

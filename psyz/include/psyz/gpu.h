@@ -38,6 +38,29 @@ int Psyz_GpuRegisterCommandHandler(
     unsigned int opcode, PsyzGpuCommandHandler handler, void* userdata);
 
 /**
+ * @brief Start recording a GPU dump (ps1dev GPUDUMP format, ".psxgpu").
+ *
+ * The dump begins with the current display mode, the whole VRAM and the
+ * current drawing state, then records every GP0 command and GP1 display
+ * command until Psyz_GpuDumpEnd. DuckStation replays such a file directly,
+ * so a frame drawn by PsyZ can be compared with a reference PS1 GPU.
+ *
+ * @return 0 on success, negative when the file cannot be written
+ */
+int Psyz_GpuDumpBegin(const char* path);
+
+/**
+ * @brief Finish the dump started by Psyz_GpuDumpBegin with a VSync event.
+ *
+ * When vram_path is not NULL, the VRAM after the recorded commands is also
+ * written there as 1024x512 little-endian 16-bit pixels (the layout of
+ * DuckStation's VRAM dumps).
+ *
+ * @return 0 on success, negative when no dump is active or a write failed
+ */
+int Psyz_GpuDumpEnd(const char* vram_path);
+
+/**
  * @brief Set the horizontal coordinate grid for subsequently rasterized
  * primitives.
  *

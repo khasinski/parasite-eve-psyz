@@ -597,12 +597,8 @@ void SetDrawEnv2(DR_ENV* dr_env, DRAWENV* env) {
             h = 0;
         }
         rect.h = h;
-#if __psyz
-        // HACK: temporarily disabled due to graphics glitches
-        if (0) {
-#else
+        /* GP0 02h fills whole 16-pixel columns; unaligned areas use a tile */
         if (rect.x & 0x3F || rect.w & 0x3F) {
-#endif
             rect.x -= env->ofs[0];
             rect.y -= env->ofs[1];
             PUSH_CODE = 0x60000000 | (env->b0 << 16) | (env->g0 << 8) | env->r0;
@@ -870,10 +866,6 @@ int SetIntrMask(int);
 int _reset(int mode) {
 #ifdef __psyz
     int psyz_gpu_version(int);
-    void Psyz_GpuCrtcReset(void);
-    if ((mode & 7) == 0 || (mode & 7) == 5) {
-        Psyz_GpuCrtcReset(); // GPU_STATUS = 0: GP1(00h)
-    }
     return psyz_gpu_version(mode);
 #endif
     u_long** queue = &_qout;

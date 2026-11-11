@@ -18,6 +18,9 @@ void Psyz_VideoSetShutdownCallback(void (*callback)(void)){native_shutdown_callb
 #include "sdl3_common.h"
 #include "rasterizer.h"
 static bool headless_renderer;
+/* Psyz_VideoSetNativeRasterizer: requested, and currently drawing on the CPU
+ * (only at 1x without GPU-only enhancements). */
+static bool native_rasterizer_requested, native_rasterizer;
 static bool hidden_gpu_renderer;
 #ifdef PE_PS5
 static bool ps5_interactive_software;
@@ -1437,8 +1440,15 @@ static bool UseSoftwareBackend(void) {
      * reported separately; never route a failed CPU boot to GPU. */
     return ps5_interactive_software || headless_renderer;
 #else
-    return headless_renderer;
+    return headless_renderer || native_rasterizer;
 #endif
+}
+
+/* Software drawing without a GPU device to present it (PSYZ_HEADLESS=1).
+ * The native rasterizer mode draws on the CPU but keeps the display state
+ * and the GPU presentation. */
+static bool SoftwareOnly(void) {
+    return UseSoftwareBackend() && !native_rasterizer;
 }
 
 int Psyz_CpuGeometryAvailable(void) {
@@ -2125,11 +2135,16 @@ static bool RefreshWindowSwapchain(void) {
     return swapchain_ok;
 }
 
+static void UpdateNativeRasterizer(void);
+static void PresentNativeVram(void);
+void Psyz_GpuResendDrawState(void); /* libgpu: E1h..E6h to the new backend */
+
 static void PlatformBackend_Present(void) {
     frame_presented=false;present_commit_pending=false;
     if(host_clock_pause_depth||SDL_GetAtomicInt(&app_in_background)){present_window_start=0;present_window_frames=present_window_mid=0;actual_present_fps=0;Psyz_GpuResetInterpolation();}
     if (gpu_failed) return;
-    if (UseSoftwareBackend()) {
+    UpdateNativeRasterizer();
+    if (SoftwareOnly()) {
 #ifdef PE_PS5
         // Reuse existing 15-bit VRAM and RGB24 conversion for display.
         if (ps5_interactive_software && sdl3_window && !present_skip) {
@@ -2236,6 +2251,8 @@ static void PlatformBackend_Present(void) {
 
     Draw_FlushBuffer();
     ApplyPendingInternalRes();
+    if (native_rasterizer)
+        PresentNativeVram();
     bool can_present = swapchain_ok && !present_skip;
     if (!ws_capture_active && !hidden_gpu_renderer &&
         !SDL_strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") &&
@@ -3221,7 +3238,7 @@ void Draw_Reset() {
 }
 
 void Draw_DisplayEnable(unsigned int on) {
-    if (UseSoftwareBackend()) {
+    if (SoftwareOnly()) {
 #ifdef PE_PS5
         /* Interactive software presentation still obeys the PS1 display mask. */
         if (ps5_interactive_software)
@@ -3252,7 +3269,7 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
     }
     display_area.x = (int)x;
     display_area.y = (int)y;
-    if (UseSoftwareBackend())
+    if (SoftwareOnly())
         return;
 
     Draw_FlushBuffer();
@@ -3264,7 +3281,7 @@ void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
     /* Queued geometry belongs to the old display contract and metadata. */
     Draw_FlushBuffer();
 #endif
-    if (UseSoftwareBackend())
+    if (SoftwareOnly())
         return;
     set_disp_horiz = (int)(end - start) / 10;
     ApplyDisplayPendingChanges();
@@ -3279,7 +3296,7 @@ void Draw_DisplayVerticalRange(unsigned int start, int unsigned end) {
         SoftwareRasterizer_Reject2x();
     set_disp_vert = (int)(end - start);
     display_size.y = set_disp_vert * (display_double_height ? 2 : 1);
-    if (UseSoftwareBackend())
+    if (SoftwareOnly())
         return;
     ApplyDisplayPendingChanges();
 }
@@ -3318,7 +3335,7 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     }
     display_double_height = mode->vertical_resolution;
     display_size.y = set_disp_vert * (display_double_height ? 2 : 1);
-    if (UseSoftwareBackend()) {
+    if (SoftwareOnly()) {
         // Games rewrite the display mode every frame (PutDispEnv); only a
         // change of video standard may reset the frame limiter.
         double fps = mode->pal ? VSYNC_PAL : VSYNC_NTSC;
@@ -3487,9 +3504,29 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             if (!isTextured) {
                 clut = -1;
                 tpage = cur_tpage | TPAGE_NOTEXTURE;
+            } else {
+                /* the polygon's page becomes the drawing mode (GPUSTAT
+                 * bits 0-8), as for an E1h command: later sprites use it */
+                cur_tpage = (u_short)((cur_tpage & ~0x1FF) | (tpage & 0x1FF));
             }
             if (CanPolyDither(isGouraud, isTextured, isShadeTex)) {
                 tpage |= TPAGE_DITHER;
+            }
+            /* the GPU skips a triangle spanning 1024+ columns or 512+ rows */
+            for (int t = 0; t < nIndices / 3; ++t) {
+                static const int corner[2][3] = {{0, 1, 2}, {1, 3, 2}};
+                int x0 = vertex_cur[corner[t][0]].x, x1 = x0;
+                int y0 = vertex_cur[corner[t][0]].y, y1 = y0;
+                for (int k = 1; k < 3; ++k) {
+                    const Vertex* q = &vertex_cur[corner[t][k]];
+                    x0 = q->x < x0 ? q->x : x0;
+                    x1 = q->x > x1 ? q->x : x1;
+                    y0 = q->y < y0 ? q->y : y0;
+                    y1 = q->y > y1 ? q->y : y1;
+                }
+                if (x1 - x0 >= VRAM_W || y1 - y0 >= VRAM_H)
+                    index_cur[t * 3] = index_cur[t * 3 + 1] =
+                        index_cur[t * 3 + 2] = n_vertices + corner[t][0];
             }
             if (!isGouraud || !isShadeTex) {
                 VRGBA(vertex_cur[1]) = VRGBA(vertex_cur[2]) =
@@ -3937,6 +3974,8 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
 }
 
+static void UploadVram(PS1_RECT* rect, const u16* p);
+
 void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     if (UseSoftwareBackend()) {
         software_rasterizer.load_image(rect, p);
@@ -3954,6 +3993,11 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
+    UploadVram(rect, (const u16*)p);
+}
+
+/* Writes native RGB555 pixels into the GPU VRAM (and the scaled target). */
+static void UploadVram(PS1_RECT* rect, const u16* p) {
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return;
@@ -3963,7 +4007,7 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
         ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
         return;
     }
-    ConvertRgb5551ToRgba8888((const u16*)p, map, (size_t)rect->w * rect->h);
+    ConvertRgb5551ToRgba8888(p, map, (size_t)rect->w * rect->h);
     SDL_UnmapGPUTransferBuffer(device, tex_upload_transfer);
 
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
@@ -4600,3 +4644,80 @@ int Psyz_GpuAuthoredFlareTint(unsigned page,unsigned clut,unsigned u,unsigned v,
 }
 
 #endif
+
+/* ===== Native rasterizer mode =====
+ * At 1x without GPU-only enhancements, primitives are drawn into native VRAM
+ * by the CPU rasterizer (sdl3_software.c), which follows the PS1 GPU's
+ * rasterization bit for bit. The GPU device keeps presenting: each frame the
+ * CPU VRAM is uploaded to vram_render and goes through the usual display
+ * pipeline. Higher internal resolutions and the other enhancements use the
+ * GPU rasterizer; switching hands over the VRAM and the drawing state at a
+ * frame boundary. */
+static bool NativeRasterizerWanted(void) {
+#ifdef PE_PS5
+    return false;
+#else
+    return native_rasterizer_requested && !headless_renderer && device &&
+           vram_render && is_platform_init_successful && set_internal_res == 1 &&
+           !set_antialiasing && !set_geometry_correction &&
+           !set_effect_geometry_correction && !set_model_filtering &&
+           !set_sprite_filtering && !widescreen && !interpolation_enabled &&
+           !(sprite_atlases_enabled && sprite_atlas_count);
+#endif
+}
+
+static void UpdateNativeRasterizer(void) {
+    bool want = NativeRasterizerWanted();
+    if (want == native_rasterizer)
+        return;
+    size_t pixels = (size_t)VRAM_W * VRAM_H;
+    u16* vram = malloc(pixels * sizeof(u16));
+    u8* rgba = want ? malloc(pixels * 4) : NULL;
+    if (!vram || (want && !rgba)) {
+        free(vram);
+        free(rgba);
+        return;
+    }
+    PS1_RECT all = {0, 0, VRAM_W, VRAM_H};
+    if (want) {
+        Draw_FlushBuffer();
+        if (!DownloadVramRegionAsRGBA8888(0, 0, VRAM_W, VRAM_H, rgba)) {
+            free(vram);
+            free(rgba);
+            return;
+        }
+        ConvertRgba8888ToRgb5551(rgba, vram, pixels);
+        native_rasterizer = true;
+        SoftwareRasterizer_SetVram(vram);
+    } else {
+        memcpy(vram, SoftwareRasterizer_GetVram(), pixels * sizeof(u16));
+        native_rasterizer = false;
+        UploadVram(&all, vram);
+    }
+    free(vram);
+    free(rgba);
+    Psyz_GpuResendDrawState();
+}
+
+static void PresentNativeVram(void) {
+    PS1_RECT all = {0, 0, VRAM_W, VRAM_H};
+    UploadVram(&all, SoftwareRasterizer_GetVram());
+}
+
+int Psyz_VideoSetNativeRasterizer(int enabled) {
+#ifdef PE_PS5
+    return enabled ? -1 : 0;
+#else
+    native_rasterizer_requested = enabled != 0;
+    return 0;
+#endif
+}
+
+int Psyz_VideoGetNativeRasterizer(void) {
+    return native_rasterizer_requested ? 1 : 0;
+}
+
+int Psyz_VideoNativeRasterizerActive(void) {
+    return (native_rasterizer || headless_renderer) ? 1 : 0;
+}
+

@@ -28,6 +28,7 @@ typedef struct {
 extern const DrawBackend software_rasterizer;
 void SoftwareRasterizer_Reset(void);
 const u16* SoftwareRasterizer_GetVram(void);
+void SoftwareRasterizer_SetVram(const u16* pixels);
 void SoftwareRasterizer_InvalidateMaterial(void);
 void SoftwareRasterizer_MaterialCoverage(unsigned long long *covered,unsigned long long *total);
 void SoftwareRasterizer_SetMaterialSampler(

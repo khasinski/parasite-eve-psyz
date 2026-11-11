@@ -50,3 +50,7 @@ int Psyz_DebugServer(int port) {
 }
 
 void Psyz_DebugServerStop(void) {}
+
+int Psyz_VideoSetNativeRasterizer(int enabled) { return enabled ? -1 : 0; }
+int Psyz_VideoGetNativeRasterizer(void) { return 0; }
+int Psyz_VideoNativeRasterizerActive(void) { return 0; }

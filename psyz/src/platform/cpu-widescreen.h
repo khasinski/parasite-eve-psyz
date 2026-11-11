@@ -213,7 +213,7 @@ unsigned char *SoftwareRasterizer_WideOutput(int x,int y,int w,int h,int scale,i
   if(!PeRenderReserve(&wide_rgb,WIDE_PIXELS*3))return NULL;
   unsigned char *out=wide_rgb.data;
   for(size_t n=0;n<(size_t)f->w*f->h;++n){u16 c=f->pixels[n];
-   out[n*3]=((c&31)<<3)|((c&31)>>2);out[n*3+1]=(((c>>5)&31)<<3)|(((c>>5)&31)>>2);out[n*3+2]=(((c>>10)&31)<<3)|(((c>>10)&31)>>2);}
+   out[n*3]=Expand5(c&31);out[n*3+1]=Expand5((c>>5)&31);out[n*3+2]=Expand5((c>>10)&31);}
   *ow=f->w;*oh=f->h;return out;
  }
  return NULL;

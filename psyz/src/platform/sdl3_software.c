@@ -4,6 +4,10 @@
 #include <string.h>
 #include "../internal.h"
 #include "rasterizer.h"
+/* RGB555 to RGB888 as every presented and captured frame: the PS1 video DAC
+ * spans the full range, so channel c shows as round(c * 255 / 31) (the
+ * GPU's UNORM expansion and color_5to8 in sdl3_common.h). */
+static unsigned char Expand5(unsigned c) { return (unsigned char)((c * 255 + 15) / 31); }
 static bool pe2_sample_visible,pe2_material_used;
 #define PE2_MATERIAL_USED pe2_material_used
 #define PE2_SAMPLE_VISIBLE(value) (pe2_sample_visible)
@@ -73,9 +77,9 @@ unsigned char *SoftwareRasterizer_Alloc2x(int x,int y,int w,int h,int scale) {
     if(!out){Pe2RejectReason(&raster2x,PE2_ALLOC);return NULL;}
     for(size_t i=0;i<count;++i) {
         u16 c=src[i];
-        out[i*3]=(unsigned char)(((c&31)<<3)|((c&31)>>2));
-        out[i*3+1]=(unsigned char)((((c>>5)&31)<<3)|(((c>>5)&31)>>2));
-        out[i*3+2]=(unsigned char)((((c>>10)&31)<<3)|(((c>>10)&31)>>2));
+        out[i*3]=Expand5(c&31);
+        out[i*3+1]=Expand5((c>>5)&31);
+        out[i*3+2]=Expand5((c>>10)&31);
     }
     return out;
 }
@@ -247,17 +251,6 @@ static u16 ShadeTexel(
     return PackColor(tr, tg, tb, (texel & 0x8000) != 0);
 }
 
-static int64_t Edge(const SwVertex* a, const SwVertex* b, int px2, int py2) {
-    return (int64_t)(px2 - a->x * 2) * (b->y - a->y) -
-           (int64_t)(py2 - a->y * 2) * (b->x - a->x);
-}
-
-static bool IsTopLeft(const SwVertex* a, const SwVertex* b) {
-    int dy = b->y - a->y;
-    int dx = b->x - a->x;
-    return dy < 0 || (dy == 0 && dx > 0);
-}
-
 static int Pe2Dither(int x,int y) {return dither[y&3][x&3];}
 static u16 Pe2PackDither(int r,int g,int b,int d) {
     return PackColor((r+d)>>3,(g+d)>>3,(b+d)>>3,false);
@@ -320,6 +313,302 @@ static bool Pe2TextureDisjoint(SwVertex a,SwVertex b,SwVertex c,u16 tpage,u16 cl
 }
 #include "cpu-widescreen.h"
 
+/* ===== Native PS1 polygon and line rasterization =====
+ *
+ * The GPU scans a triangle top to bottom in two parts split at the middle
+ * vertex. Both edges are 32.32 fixed-point X positions stepped once per
+ * line from a start just below the vertex's integer X, and a line covers the
+ * pixels [left, right) of the two truncated positions. This gives the
+ * hardware's fill convention: the top and left edges are inside, the bottom
+ * and right edges outside, and pixel centres are not sampled. Colours and
+ * texture coordinates step by per-pixel and per-line gradients (12 integer +
+ * 12 fractional bits, kept in 32-bit wrapping registers) from a half-unit
+ * bias at the leftmost vertex. Lines step a 32.32 position along the major
+ * axis. The arithmetic follows the Mednafen/DuckStation software GPU, which
+ * reproduces hardware test results; RGB555 output, dithering, blending and
+ * the mask bit are shared with sprites through ShadeTexel/WritePixel. */
+
+typedef struct {
+    bool textured, raw, semi, gouraud, dither;
+    u16 tpage, clut;
+    int abr;
+    int r, g, b;           /* flat colour */
+    u32 dx[5], dy[5];      /* R, G, B, U, V gradients */
+} NativePoly;
+
+static void NativeStep(u32* attr, const u32* step, int count) {
+    for (int i = 0; i < 5; i++)
+        attr[i] += step[i] * (u32)count;
+}
+
+static void NativePixel(const NativePoly* p, int x, int y, const u32* attr) {
+    int r = p->gouraud ? (int)(attr[0] >> 24) : p->r;
+    int g = p->gouraud ? (int)(attr[1] >> 24) : p->g;
+    int b = p->gouraud ? (int)(attr[2] >> 24) : p->b;
+    u16 color;
+    bool blend = p->semi;
+    if (p->textured) {
+        u16 texel = SampleTexture((int)(attr[3] >> 24), (int)(attr[4] >> 24),
+                                  p->tpage, p->clut);
+        if (!texel)
+            return;
+        blend = p->semi && (texel & 0x8000);
+        color = ShadeTexel(texel, r, g, b, p->raw, x, y, p->dither);
+    } else {
+        int d = p->dither ? dither[y & 3][x & 3] : 0;
+        color = PackColor((r + d) >> 3, (g + d) >> 3, (b + d) >> 3, false);
+    }
+    WritePixel(x, y, color, blend, p->abr);
+}
+
+static void NativeSpan(const NativePoly* p, int y, int x_start, int x_bound,
+                       const u32* line_attr) {
+    int width = x_bound - x_start;
+    int x = Sign11(x_start);
+    if (x < draw_area_start.x) {
+        int delta = draw_area_start.x - x;
+        x_start += delta;
+        x += delta;
+        width -= delta;
+    }
+    if (x + width > draw_area_end.x + 1)
+        width = draw_area_end.x + 1 - x;
+    if (width <= 0)
+        return;
+    u32 attr[5];
+    memcpy(attr, line_attr, sizeof(attr));
+    NativeStep(attr, p->dx, x_start);
+    do {
+        NativePixel(p, x, y, attr);
+        x++;
+        NativeStep(attr, p->dx, 1);
+    } while (--width > 0);
+}
+
+typedef struct {
+    uint64_t x[2], step[2]; /* left and right edge, 32.32 */
+    int y, end_y;
+    bool upwards;      /* drawn from y - 1 up to end_y */
+} NativePart;
+
+static int NativeEdgeX(uint64_t fp) { return (int)(s32)(u32)(fp >> 32); }
+
+static void NativeDrawPart(const NativePoly* p, const NativePart* part,
+                           const u32* origin) {
+    uint64_t left = part->x[0], right = part->x[1];
+    int y = part->y;
+    u32 attr[5];
+    memcpy(attr, origin, sizeof(attr));
+    if (part->upwards) {
+        if (y <= part->end_y)
+            return;
+        NativeStep(attr, p->dy, y);
+        do {
+            y--;
+            left -= part->step[0];
+            right -= part->step[1];
+            int line = Sign11(y);
+            if (line < draw_area_start.y)
+                break;
+            NativeStep(attr, p->dy, -1);
+            if (line > draw_area_end.y)
+                continue;
+            NativeSpan(p, line & (VRAM_H - 1), NativeEdgeX(left),
+                       NativeEdgeX(right), attr);
+        } while (y > part->end_y);
+    } else {
+        if (y >= part->end_y)
+            return;
+        NativeStep(attr, p->dy, y);
+        do {
+            int line = Sign11(y);
+            if (line > draw_area_end.y)
+                break;
+            if (line >= draw_area_start.y)
+                NativeSpan(p, line & (VRAM_H - 1), NativeEdgeX(left),
+                           NativeEdgeX(right), attr);
+            y++;
+            left += part->step[0];
+            right += part->step[1];
+            NativeStep(attr, p->dy, 1);
+        } while (y < part->end_y);
+    }
+}
+
+static int64_t NativeEdgeStart(int x) {
+    return (int64_t)x * 4294967296LL + (4294967296LL - 2048);
+}
+
+static int64_t NativeEdgeStep(int dx, int dy) {
+    int64_t bias = dx < 0 ? -(dy - 1) : (dx > 0 ? dy - 1 : 0);
+    return ((int64_t)dx * 4294967296LL + bias) / dy;
+}
+
+static int NativeAttr(const SwVertex* v, int i) {
+    switch (i) {
+    case 0: return v->r;
+    case 1: return v->g;
+    case 2: return v->b;
+    case 3: return v->u;
+    default: return v->v;
+    }
+}
+
+static void RasterTriangleNative(
+    const SwVertex* v0, const SwVertex* v1, const SwVertex* v2, bool textured,
+    bool raw_texture, bool semi, bool gouraud, u16 tpage, u16 clut) {
+    const SwVertex* swap;
+    /* tl: one bit per position, tracking the leftmost vertex (ties keep the
+     * earlier vertex) through the sort by Y */
+    unsigned tl;
+    if (v1->x <= v0->x)
+        tl = v2->x <= v1->x ? 4 : 2;
+    else
+        tl = v2->x < v0->x ? 4 : 1;
+    if (v2->y < v1->y) {
+        swap = v2; v2 = v1; v1 = swap;
+        tl = ((tl >> 1) & 2) | ((tl << 1) & 4) | (tl & 1);
+    }
+    if (v1->y < v0->y) {
+        swap = v1; v1 = v0; v0 = swap;
+        tl = ((tl >> 1) & 1) | ((tl << 1) & 2) | (tl & 4);
+    }
+    if (v2->y < v1->y) {
+        swap = v2; v2 = v1; v1 = swap;
+        tl = ((tl >> 1) & 2) | ((tl << 1) & 4) | (tl & 1);
+    }
+    const SwVertex* vertex[3] = {v0, v1, v2};
+    tl >>= 1;
+    if (v0->y == v2->y)
+        return;
+
+    int64_t base = NativeEdgeStart(v0->x);
+    int64_t base_step = NativeEdgeStep(v2->x - v0->x, v2->y - v0->y);
+    int64_t upper_step =
+        v1->y == v0->y ? 0 : NativeEdgeStep(v1->x - v0->x, v1->y - v0->y);
+    int64_t lower_step =
+        v2->y == v1->y ? 0 : NativeEdgeStep(v2->x - v1->x, v2->y - v1->y);
+    int vo = tl != 0 ? 1 : 0;
+    int vp = tl == 2 ? 3 : 0;
+    bool right_facing =
+        v1->y == v0->y ? v1->x > v0->x : upper_step > base_step;
+    int rfi = right_facing ? 1 : 0, ofi = !rfi;
+
+    NativePart parts[2];
+    NativePart* po = &parts[vo];
+    NativePart* pp = &parts[vo ^ 1];
+    po->y = vertex[0 ^ vo]->y;
+    po->end_y = vertex[1 ^ vo]->y;
+    pp->y = vertex[1 ^ vp]->y;
+    pp->end_y = vertex[2 ^ vp]->y;
+    po->x[rfi] = (uint64_t)NativeEdgeStart(vertex[0 ^ vo]->x);
+    po->step[rfi] = (uint64_t)upper_step;
+    po->x[ofi] = (uint64_t)(base + (int64_t)(vertex[vo]->y - vertex[0]->y) * base_step);
+    po->step[ofi] = (uint64_t)base_step;
+    po->upwards = vo != 0;
+    pp->x[rfi] = (uint64_t)NativeEdgeStart(vertex[1 ^ vp]->x);
+    pp->step[rfi] = (uint64_t)lower_step;
+    pp->x[ofi] =
+        (uint64_t)(base + (int64_t)(vertex[1 ^ vp]->y - vertex[0]->y) * base_step);
+    pp->step[ofi] = (uint64_t)base_step;
+    pp->upwards = vp != 0;
+
+    s32 det = (v1->x - v0->x) * (v2->y - v1->y) - (v2->x - v1->x) * (v1->y - v0->y);
+    if (!det)
+        return;
+    NativePoly p = {
+        .textured = textured,
+        .raw = raw_texture,
+        .semi = semi,
+        .gouraud = gouraud,
+        .dither = SoftwareDither() && (gouraud || (textured && !raw_texture)),
+        .tpage = tpage,
+        .clut = clut,
+        .abr = (tpage >> 5) & 3,
+    };
+    const SwVertex* left = vertex[tl];
+    p.r = left->r;
+    p.g = left->g;
+    p.b = left->b;
+    for (int i = 0; i < 5; i++) {
+        if (i < 3 ? !gouraud : !textured)
+            continue;
+        s32 a0 = NativeAttr(v0, i), a1 = NativeAttr(v1, i), a2 = NativeAttr(v2, i);
+        s32 per_x = (a1 - a0) * (v2->y - v1->y) - (a2 - a1) * (v1->y - v0->y);
+        s32 per_y = (v1->x - v0->x) * (a2 - a1) - (v2->x - v1->x) * (a1 - a0);
+        p.dx[i] = (u32)(s32)((int64_t)per_x * 4096 / det) << 12;
+        p.dy[i] = (u32)(s32)((int64_t)per_y * 4096 / det) << 12;
+    }
+    u32 origin[5];
+    for (int i = 0; i < 5; i++)
+        origin[i] = (((u32)NativeAttr(left, i) << 12) + (1u << 11)) << 12;
+    NativeStep(origin, p.dx, -left->x);
+    NativeStep(origin, p.dy, -left->y);
+    for (int i = 0; i < 2; i++)
+        NativeDrawPart(&p, &parts[i], origin);
+}
+
+/* Polygons whose bounding box spans 1024 or more columns or 512 or more rows
+ * are not drawn. */
+static bool NativeTriangleCulled(const SwVertex* a, const SwVertex* b,
+                                 const SwVertex* c) {
+    return Max3(a->x, b->x, c->x) - Min3(a->x, b->x, c->x) >= VRAM_W ||
+           Max3(a->y, b->y, c->y) - Min3(a->y, b->y, c->y) >= VRAM_H;
+}
+
+static void RasterLineNative(const SwVertex* p0, const SwVertex* p1, bool semi,
+                             bool gouraud, u16 tpage) {
+    int dx = abs(p1->x - p0->x), dy = abs(p1->y - p0->y);
+    int k = dx > dy ? dx : dy;
+    if (dx >= VRAM_W || dy >= VRAM_H)
+        return;
+    if (p0->x >= p1->x && k > 0) {
+        const SwVertex* swap = p0;
+        p0 = p1;
+        p1 = swap;
+    }
+    int64_t step_x = 0, step_y = 0;
+    s32 step_c[3] = {0, 0, 0};
+    const int c0[3] = {p0->r, p0->g, p0->b}, c1[3] = {p1->r, p1->g, p1->b};
+    if (k) {
+        int64_t delta[2] = {p1->x - p0->x, p1->y - p0->y};
+        int64_t step[2];
+        for (int i = 0; i < 2; i++)
+            step[i] = (delta[i] * 4294967296LL - (delta[i] < 0 ? k - 1 : 0) +
+                       (delta[i] > 0 ? k - 1 : 0)) / k;
+        step_x = step[0];
+        step_y = step[1];
+        if (gouraud)
+            for (int i = 0; i < 3; i++)
+                step_c[i] = (s32)((u32)(c1[i] - c0[i]) << 12) / k;
+    }
+    int64_t x = (int64_t)p0->x * 4294967296LL + (1LL << 31) - 1024;
+    int64_t y = (int64_t)p0->y * 4294967296LL + (1LL << 31) - (step_y < 0 ? 1024 : 0);
+    s32 c[3];
+    for (int i = 0; i < 3; i++)
+        c[i] = (c0[i] << 12) | (1 << 11);
+    bool dithered = SoftwareDither() != 0;
+    int abr = (tpage >> 5) & 3;
+    for (int i = 0; i <= k; i++) {
+        int px = Sign11((int)(x >> 32)), py = Sign11((int)(y >> 32));
+        if (px >= draw_area_start.x && px <= draw_area_end.x &&
+            py >= draw_area_start.y && py <= draw_area_end.y) {
+            int r = gouraud ? (u8)(c[0] >> 12) : c0[0];
+            int g = gouraud ? (u8)(c[1] >> 12) : c0[1];
+            int b = gouraud ? (u8)(c[2] >> 12) : c0[2];
+            int d = dithered ? dither[py & 3][px & 3] : 0;
+            WritePixel(px, py & (VRAM_H - 1),
+                       PackColor((r + d) >> 3, (g + d) >> 3, (b + d) >> 3, false),
+                       semi, abr);
+        }
+        x += step_x;
+        y += step_y;
+        for (int j = 0; j < 3; j++)
+            c[j] += step_c[j];
+    }
+}
+
+
 static void RasterTriangle(
     SwVertex a, SwVertex b, SwVertex c, bool textured, bool raw_texture,
     bool semi, bool gouraud, u16 tpage, u16 clut, bool centered, bool owned_line) {
@@ -339,109 +628,10 @@ static void RasterTriangle(
             (Pe2Paint){semi,set_mask_bit,preserve_masked,(tpage>>5)&3,NativeDestinationWrite},
             (textured && (((tpage>>7)&3)==3 || !Pe2TextureDisjoint(a,b,c,tpage,clut))) || centered);
     }
-    SwVertex anchor = b.x <= a.x ? (c.x <= b.x ? c : b) : (c.x < a.x ? c : a);
-    int64_t area =
-        (int64_t)(b.x - a.x) * (c.y - a.y) - (int64_t)(b.y - a.y) * (c.x - a.x);
-    if (!area) {
-        return;
-    }
-    if (area < 0) {
-        SwVertex swap = b;
-        b = c;
-        c = swap;
-        area = -area;
-    }
-    /* PS1 polygon attributes start half a unit above the leftmost vertex
-     * and use gradients truncated to 12 fractional bits. Exact barycentric
-     * division loses both the sample bias and the accumulated precision.
-     * Choose the anchor before winding normalization: tied X coordinates
-     * retain the GPU's original vertex priority. */
-    const int av[5] = {a.r, a.g, a.b, a.u, a.v};
-    const int bv[5] = {b.r, b.g, b.b, b.u, b.v};
-    const int cv[5] = {c.r, c.g, c.b, c.u, c.v};
-    const int origin[5] = {anchor.r, anchor.g, anchor.b, anchor.u, anchor.v};
-    int64_t step_x[5] = {0}, step_y[5] = {0};
-    if (!centered) {
-        for (int i = 0; i < 5; i++) {
-            step_x[i] = (((int64_t)bv[i] - av[i]) * (c.y - a.y) -
-                         ((int64_t)cv[i] - av[i]) * (b.y - a.y)) *
-                        4096 / area;
-            step_y[i] = (((int64_t)cv[i] - av[i]) * (b.x - a.x) -
-                         ((int64_t)bv[i] - av[i]) * (c.x - a.x)) *
-                        4096 / area;
-        }
-    }
-    int min_x = CLAMP(Min3(a.x, b.x, c.x), draw_area_start.x, draw_area_end.x);
-    int max_x = CLAMP(Max3(a.x, b.x, c.x), draw_area_start.x, draw_area_end.x);
-    int min_y = CLAMP(Min3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
-    int max_y = CLAMP(Max3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
-    min_x = CLAMP(min_x, 0, VRAM_W - 1);
-    max_x = CLAMP(max_x, 0, VRAM_W - 1);
-    min_y = CLAMP(min_y, 0, VRAM_H - 1);
-    max_y = CLAMP(max_y, 0, VRAM_H - 1);
-    int abr = (tpage >> 5) & 3;
-    for (int y = min_y; y <= max_y; y++) {
-        for (int x = min_x; x <= max_x; x++) {
-            int64_t wa = Edge(&b, &c, x * 2 + centered, y * 2 + centered);
-            int64_t wb = Edge(&c, &a, x * 2 + centered, y * 2 + centered);
-            int64_t wc = Edge(&a, &b, x * 2 + centered, y * 2 + centered);
-            if (wa > 0 || (wa == 0 && !IsTopLeft(&b, &c)) || wb > 0 ||
-                (wb == 0 && !IsTopLeft(&c, &a)) || wc > 0 ||
-                (wc == 0 && !IsTopLeft(&a, &b))) {
-                continue;
-            }
-            wa = -wa;
-            wb = -wb;
-            wc = -wc;
-            int denom = (int)(area * 2);
-            int attributes[5] = {0};
-            if (!centered) {
-                for (int i = 0; i < 5; i++) {
-                    u32 value = (u32)(origin[i] * 4096 + 2048) +
-                                (u32)((x - anchor.x) * step_x[i] +
-                                      (y - anchor.y) * step_y[i]);
-                    attributes[i] = (value >> 12) & 255;
-                }
-            }
-            int r = gouraud
-                        ? (centered
-                               ? (int)((wa * a.r + wb * b.r + wc * c.r) / denom)
-                               : attributes[0])
-                        : a.r;
-            int g = gouraud
-                        ? (centered
-                               ? (int)((wa * a.g + wb * b.g + wc * c.g) / denom)
-                               : attributes[1])
-                        : a.g;
-            int blue =
-                gouraud ? (centered
-                               ? (int)((wa * a.b + wb * b.b + wc * c.b) / denom)
-                               : attributes[2])
-                        : a.b;
-            u16 color;
-            bool blend = semi;
-            if (textured) {
-                int u = centered
-                            ? (int)((wa * a.u + wb * b.u + wc * c.u) / denom)
-                            : attributes[3];
-                int v = centered
-                            ? (int)((wa * a.v + wb * b.v + wc * c.v) / denom)
-                            : attributes[4];
-                u16 texel = SampleTexture(u, v, tpage, clut);
-                if (texel == 0) {
-                    continue;
-                }
-                blend = semi && (texel & 0x8000);
-                color = ShadeTexel(texel, r, g, blue, raw_texture, x, y,
-                                   SoftwareDither() != 0 && !raw_texture);
-            } else {
-                int d = SoftwareDither() && gouraud ? dither[y & 3][x & 3] : 0;
-                color = PackColor(
-                    (r + d) >> 3, (g + d) >> 3, (blue + d) >> 3, false);
-            }
-            WritePixel(x, y, color, blend, abr);
-        }
-    }
+    if (owned_line)
+        return; /* native lines use the GPU's line stepping (DrawLine) */
+    RasterTriangleNative(&a, &b, &c, textured, raw_texture, semi, gouraud,
+                         tpage, clut);
 }
 
 static SwVertex VertexXY(u32 word, u32 color) {
@@ -473,8 +663,7 @@ static void DrawLine(SwVertex a, SwVertex b, bool semi, u16 tpage) {
                 PackColor(a.r>>3,a.g>>3,a.b>>3,false),NULL,NULL,
                 (Pe2Paint){semi,set_mask_bit,preserve_masked,(tpage>>5)&3,NativeDestinationWrite},false);
         }
-        WritePixel(a.x, a.y, PackColor(a.r >> 3, a.g >> 3, a.b >> 3, false),
-                   semi, (tpage >> 5) & 3);
+        RasterLineNative(&a, &b, semi, true, tpage);
         return;
     }
     int ox, oy, ex, ey;
@@ -499,8 +688,11 @@ static void DrawLine(SwVertex a, SwVertex b, bool semi, u16 tpage) {
     q2.y += ey + oy;
     q3.x += ox;
     q3.y += oy;
+    /* The 2x lane draws the line as a pixel-wide quad; VRAM uses the GPU's
+     * line stepping. */
     RasterTriangle(q0, q1, q2, false, false, semi, true, tpage, 0, true, true);
     RasterTriangle(q0, q2, q3, false, false, semi, true, tpage, 0, true, true);
+    RasterLineNative(&a, &b, semi, true, tpage);
 }
 
 static void RasterSprite(
@@ -527,14 +719,13 @@ static void RasterSprite(
     int abr = (cur_tpage >> 5) & 3;
     for (int py = 0; py < h; py++) {
         int y = origin->y + py;
-        if (y < draw_area_start.y || y > draw_area_end.y || y < 0 ||
-            y >= VRAM_H) {
+        if (y < draw_area_start.y || y > draw_area_end.y) {
             continue;
         }
+        y &= VRAM_H - 1;
         for (int px = 0; px < w; px++) {
             int x = origin->x + px;
-            if (x < draw_area_start.x || x > draw_area_end.x || x < 0 ||
-                x >= VRAM_W) {
+            if (x < draw_area_start.x || x > draw_area_end.x) {
                 continue;
             }
             u16 color;
@@ -631,21 +822,38 @@ static void Software_SetMask(int bit0, int bit1) {
 
 static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     SoftwareRasterizer_InvalidateMaterial();
-    u16 color = PackColor(r >> 3, g >> 3, b >> 3, set_mask_bit);
+    /* GP0 02h writes bit 15 clear and ignores both mask settings; libgpu
+     * passes rectangles already rounded and cut at the VRAM edges. */
+    u16 color = PackColor(r >> 3, g >> 3, b >> 3, false);
     WideClear(rect,color);
     int x0 = CLAMP(rect->x, 0, VRAM_W);
     int y0 = CLAMP(rect->y, 0, VRAM_H);
     int x1 = CLAMP(rect->x + rect->w, 0, VRAM_W);
     int y1 = CLAMP(rect->y + rect->h, 0, VRAM_H);
     for (int y = y0; y < y1; y++) {
-        Pe2ClearSpan(&raster2x,x0,y,x1-x0,color,preserve_masked);
+        Pe2ClearSpan(&raster2x,x0,y,x1-x0,color,false);
         for (int x = x0; x < x1; x++) {
-            u16* p = &vram[y * VRAM_W + x];
-            if (!preserve_masked || !(*p & 0x8000)) {
-                *p = color;
-            }
+            vram[y * VRAM_W + x] = color;
         }
     }
+}
+
+/* Writes one VRAM row of an upload or copy with the GPU's mask rules: a
+ * pixel with bit 15 set is kept while "check mask" is on, and "set mask"
+ * forces bit 15 of each written pixel. Rows wrap at the VRAM width. */
+static void TransferRow(int x, int y, int w, const u16* src) {
+    u16* row = &vram[(y & (VRAM_H - 1)) * VRAM_W];
+    if (!set_mask_bit && !preserve_masked && x >= 0 && x + w <= VRAM_W) {
+        memcpy(&row[x], src, (size_t)w * sizeof(u16));
+    } else {
+        for (int i = 0; i < w; i++) {
+            u16* p = &row[(x + i) & (VRAM_W - 1)];
+            if (!preserve_masked || !(*p & 0x8000))
+                *p = (u16)(src[i] | (set_mask_bit ? 0x8000 : 0));
+        }
+    }
+    if (x >= 0 && x + w <= VRAM_W)
+        Pe2CanonicalSpan(&raster2x, x, y & (VRAM_H - 1), w, &row[x]);
 }
 
 static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
@@ -655,26 +863,9 @@ static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
         return;
     }
     const u16* src = (const u16*)data;
-    if (rect->x >= 0 && rect->y >= 0 && rect->x + rect->w <= VRAM_W &&
-        rect->y + rect->h <= VRAM_H) {
-        for (int y = 0; y < rect->h; y++) {
-            memcpy(&vram[(rect->y + y) * VRAM_W + rect->x], &src[y * rect->w],
-                   (size_t)rect->w * sizeof(u16));
-            Pe2CanonicalSpan(&raster2x,rect->x,rect->y+y,rect->w,
-                &vram[(rect->y+y)*VRAM_W+rect->x]);
-        }
-        return;
-    }
-    for (int y = 0; y < rect->h; y++) {
-        for (int x = 0; x < rect->w; x++) {
-            int vx = rect->x + x;
-            int vy = rect->y + y;
-            if ((unsigned)vx < VRAM_W && (unsigned)vy < VRAM_H) {
-                vram[vy * VRAM_W + vx] = src[y * rect->w + x];
-                Pe2CanonicalSpan(&raster2x,vx,vy,1,&vram[vy*VRAM_W+vx]);
-            }
-        }
-    }
+    for (int y = 0; y < rect->h; y++)
+        TransferRow(rect->x & (VRAM_W - 1), rect->y + y, rect->w,
+                    &src[(size_t)y * rect->w]);
 }
 
 static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
@@ -705,24 +896,14 @@ static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
 static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     SoftwareRasterizer_WideReject();
     SoftwareRasterizer_InvalidateMaterial();
-    int src_x = CLAMP(rect->x, 0, VRAM_W - 1);
-    int src_y = CLAMP(rect->y, 0, VRAM_H - 1);
-    int dst_x = CLAMP((int)x, 0, VRAM_W - 1);
-    int dst_y = CLAMP((int)y, 0, VRAM_H - 1);
-    int max_w =
-        VRAM_W - src_x < VRAM_W - dst_x ? VRAM_W - src_x : VRAM_W - dst_x;
-    int max_h =
-        VRAM_H - src_y < VRAM_H - dst_y ? VRAM_H - src_y : VRAM_H - dst_y;
-    int w = CLAMP(rect->w, 0, max_w);
-    int h = CLAMP(rect->h, 0, max_h);
-    if (!w || !h) {
-        return;
-    }
-    for (int row = 0; row < h; row++) {
-        memmove(&vram[(dst_y + row) * VRAM_W + dst_x],
-                &vram[(src_y + row) * VRAM_W + src_x], (size_t)w * sizeof(u16));
-        Pe2CanonicalSpan(&raster2x,dst_x,dst_y+row,w,
-            &vram[(dst_y+row)*VRAM_W+dst_x]);
+    int w = CLAMP(rect->w, 0, VRAM_W);
+    u16 line[VRAM_W];
+    /* row by row from the top, each row read before it is written */
+    for (int row = 0; row < rect->h; row++) {
+        const u16* src = &vram[((rect->y + row) & (VRAM_H - 1)) * VRAM_W];
+        for (int i = 0; i < w; i++)
+            line[i] = src[(rect->x + i) & (VRAM_W - 1)];
+        TransferRow((int)x, (int)y + row, w, line);
     }
 }
 
@@ -789,10 +970,16 @@ static int Software_PushPrim(u_long* words, int max_len) {
                 color = words[at++];
             }
         }
-        RasterTriangle(v[0], v[1], v[2], textured, raw_texture, semi, gouraud,
-                       tpage, clut, false, false);
-        if (count == 4) {
-            RasterTriangle(v[1], v[3], v[2], textured, raw_texture, semi,
+        if (textured) {
+            /* A textured polygon's page (bits 0-8) becomes the GPU's drawing
+             * mode, as an E1h command would set it: later sprites use it. */
+            cur_tpage = (u16)((cur_tpage & ~0x1ff) | (tpage & 0x1ff));
+        }
+        if (!NativeTriangleCulled(&v[0], &v[1], &v[2]))
+            RasterTriangle(v[0], v[1], v[2], textured, raw_texture, semi,
+                           gouraud, tpage, clut, false, false);
+        if (count == 4 && !NativeTriangleCulled(&v[2], &v[1], &v[3])) {
+            RasterTriangle(v[2], v[1], v[3], textured, raw_texture, semi,
                            gouraud, tpage, clut, false, false);
         }
         return at;
@@ -832,6 +1019,9 @@ static int Software_PushPrim(u_long* words, int max_len) {
             return max_len;
         }
         SwVertex origin = VertexXY(words[at++], words[0]);
+        /* rectangle positions wrap to 11 bits after the drawing offset */
+        origin.x = Sign11(origin.x);
+        origin.y = Sign11(origin.y);
         u16 clut = 0;
         int u = 0, v = 0;
         if (textured && at < max_len) {
@@ -844,8 +1034,8 @@ static int Software_PushPrim(u_long* words, int max_len) {
         switch (code & ~3) {
         case 0x60:
         case 0x64:
-            w = (short)(words[at] & 0xffff);
-            h = (short)(words[at++] >> 16);
+            w = (int)(words[at] & (VRAM_W - 1));
+            h = (int)((words[at++] >> 16) & (VRAM_H - 1));
             break;
         case 0x68:
         case 0x6c:
@@ -882,6 +1072,11 @@ void SoftwareRasterizer_Reset(void) {
 }
 
 const u16* SoftwareRasterizer_GetVram(void) { return vram; }
+
+void SoftwareRasterizer_SetVram(const u16* pixels) {
+    SoftwareRasterizer_Reject2x();
+    memcpy(vram, pixels, sizeof(vram));
+}
 
 static void Software_FlushBuffer(void) {}
 static void Software_ResetBuffer(void) {}

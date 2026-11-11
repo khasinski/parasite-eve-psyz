@@ -204,6 +204,31 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier);
 unsigned Psyz_VideoGetInternalResolution(void);
 
 /**
+ * @brief Draw at native resolution with the CPU rasterizer (default: off)
+ *
+ * When enabled, the internal resolution is 1 and no enhancement that needs
+ * the GPU rasterizer is on (antialiasing, geometry correction, model or
+ * sprite filtering, widescreen, frame interpolation, loaded sprite atlases),
+ * primitives and VRAM transfers are processed by the CPU rasterizer, which
+ * reproduces the PS1 GPU pixel for pixel (fill convention, attribute
+ * stepping, dithering, blending, mask bit, VRAM wrapping). The GPU device
+ * still presents the frame. Otherwise the GPU rasterizer draws and the
+ * internal resolution applies. The switch happens at the next present, which
+ * hands over the VRAM and the drawing state. PSYZ_HEADLESS=1 always uses the
+ * CPU rasterizer. Backends without it return -1.
+ *
+ * @param enabled Non-zero to request the CPU rasterizer at 1x
+ * @return 0 on success, -1 when unsupported
+ */
+int Psyz_VideoSetNativeRasterizer(int enabled);
+
+/** @return 1 when the CPU rasterizer is requested at 1x, otherwise 0 */
+int Psyz_VideoGetNativeRasterizer(void);
+
+/** @return 1 while the CPU rasterizer draws (native mode or headless) */
+int Psyz_VideoNativeRasterizerActive(void);
+
+/**
  * @brief Enable or disable subpixel 3D geometry & perspective UV correction
  *
  * Preserves native 1x VRAM and GTE integer state for game logic while using

@@ -10,6 +10,7 @@
 #include <psyz/log.h>
 #include "../draw.h"
 #include "../internal.h"
+#include "gpudump.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -123,7 +124,7 @@ static void VramCopyMove(RECT rect, int x, int y) {
     vram_area_marked = 0;
     int w = VRAM_COPY_MIN(rect.w, dst.w), h = VRAM_COPY_MIN(rect.h, dst.h);
     for (int j = 0; j < h; j++) {
-        int sj = dst.y > rect.y ? h - 1 - j : j; // overlapping rows
+        int sj = j; // the GPU copies rows top to bottom, even overlapping
         size_t s = (size_t)(rect.y + sj) * VRAM_W + rect.x;
         size_t d = (size_t)(dst.y + sj) * VRAM_W + dst.x;
         memmove(vram_copy + d, vram_copy + s, w * sizeof(u16));
@@ -144,6 +145,124 @@ static void VramCopyDrawn(void) {
             memset(vram_copy_known + (size_t)(rect.y + j) * VRAM_W + rect.x, 0,
                    rect.w);
         }
+    }
+}
+
+
+/* VRAM transfers address the VRAM modulo 1024x512: a rectangle that runs
+ * past the right or bottom edge wraps to the left or top. Backends and the
+ * CPU copy take non-wrapping pieces; these helpers cut a transfer at the
+ * edges. Coordinates and sizes are already reduced to the GPU's ranges. */
+typedef struct {
+    int x, y, w, h;   /* VRAM piece */
+    int ox, oy;       /* offset of the piece inside the transfer */
+} VramPiece;
+
+static int VramPieces(int x, int y, int w, int h, VramPiece* out) {
+    int n = 0;
+    for (int oy = 0; oy < h;) {
+        int py = (y + oy) % VRAM_H, ph = VRAM_COPY_MIN(h - oy, VRAM_H - py);
+        for (int ox = 0; ox < w;) {
+            int px = (x + ox) % VRAM_W, pw = VRAM_COPY_MIN(w - ox, VRAM_W - px);
+            out[n++] = (VramPiece){px, py, pw, ph, ox, oy};
+            ox += pw;
+        }
+        oy += ph;
+    }
+    return n;
+}
+
+static u32 gpu_mask_setting; /* last E6h: bit 0 set mask, bit 1 check mask */
+
+static void VramFill(const u_long* words) {
+    /* GP0 02h: X in 16-pixel units, width rounded up to 16, mask ignored */
+    u32 xy = (u32)words[1], wh = (u32)words[2], color = (u32)words[0];
+    int x = (int)(xy & 0x3F0), y = (int)((xy >> 16) & 0x1FF);
+    int w = (int)(((wh & 0x3FF) + 0xF) & ~0xFu), h = (int)((wh >> 16) & 0x1FF);
+    VramPiece piece[4];
+    int n = w && h ? VramPieces(x, y, w, h, piece) : 0;
+    for (int i = 0; i < n; i++) {
+        RECT rect = {(short)piece[i].x, (short)piece[i].y, (short)piece[i].w,
+                     (short)piece[i].h};
+        u_char r = (u_char)(color & 0xFF), g = (u_char)((color >> 8) & 0xFF),
+               b = (u_char)((color >> 16) & 0xFF);
+        VramCopyFill(rect, r, g, b);
+        Draw_ClearImage(&rect, r, g, b);
+    }
+}
+
+static void VramMove(const u_long* words) {
+    /* GP0 80h; DuckStation cuts copies running past an edge the same way */
+    u32 src = (u32)words[1], dst = (u32)words[2], wh = (u32)words[3];
+    int sx = (int)(src & 0x3FF), sy = (int)((src >> 16) & 0x1FF);
+    int dx = (int)(dst & 0x3FF), dy = (int)((dst >> 16) & 0x1FF);
+    int w = (int)(wh & 0x3FF), h = (int)((wh >> 16) & 0x1FF);
+    if (!w)
+        w = VRAM_W;
+    if (!h)
+        h = VRAM_H;
+    if (sx == dx && sy == dy && !(gpu_mask_setting & 1))
+        return;
+    for (int oy = 0; oy < h;) {
+        int csy = (sy + oy) % VRAM_H, cdy = (dy + oy) % VRAM_H;
+        int rows = VRAM_COPY_MIN(h - oy, VRAM_COPY_MIN(VRAM_H - csy, VRAM_H - cdy));
+        for (int ox = 0; ox < w;) {
+            int csx = (sx + ox) % VRAM_W, cdx = (dx + ox) % VRAM_W;
+            int cols = VRAM_COPY_MIN(w - ox, VRAM_COPY_MIN(VRAM_W - csx, VRAM_W - cdx));
+            RECT rect = {(short)csx, (short)csy, (short)cols, (short)rows};
+            VramCopyMove(rect, cdx, cdy);
+            Draw_MoveImage(&rect, (unsigned)cdx, (unsigned)cdy);
+            ox += cols;
+        }
+        oy += rows;
+    }
+}
+
+/* Image transfers keep the caller's rectangle layout; out of range
+ * coordinates wrap. Returns the number of pieces, 0 for an empty transfer. */
+static int VramTransferPieces(const RECT* rect, VramPiece* piece) {
+    if (rect->w <= 0 || rect->h <= 0 || rect->w > VRAM_W || rect->h > VRAM_H)
+        return 0;
+    return VramPieces(rect->x & (VRAM_W - 1), rect->y & (VRAM_H - 1), rect->w,
+                      rect->h, piece);
+}
+
+static void VramTransfer(RECT* rect, u_long* data, int store) {
+    VramPiece piece[4];
+    int n = VramTransferPieces(rect, piece);
+    if (n == 1) {
+        RECT r = {(short)piece[0].x, (short)piece[0].y, rect->w, rect->h};
+        if (store) {
+            Draw_StoreImage(&r, data);
+        } else {
+            VramCopyLoad(&r, data);
+            Draw_LoadImage(&r, data);
+        }
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        u16* image = (u16*)data;
+        u16* part = malloc((size_t)piece[i].w * piece[i].h * sizeof(u16));
+        RECT r = {(short)piece[i].x, (short)piece[i].y, (short)piece[i].w,
+                  (short)piece[i].h};
+        if (!part)
+            return;
+        if (!store)
+            for (int j = 0; j < piece[i].h; j++)
+                memcpy(part + (size_t)j * piece[i].w,
+                       image + (size_t)(piece[i].oy + j) * rect->w + piece[i].ox,
+                       (size_t)piece[i].w * sizeof(u16));
+        if (store) {
+            Draw_StoreImage(&r, (u_long*)part);
+            for (int j = 0; j < piece[i].h; j++)
+                memcpy(image + (size_t)(piece[i].oy + j) * rect->w + piece[i].ox,
+                       part + (size_t)j * piece[i].w,
+                       (size_t)piece[i].w * sizeof(u16));
+        } else {
+            VramCopyLoad(&r, (u_long*)part);
+            Draw_LoadImage(&r, (u_long*)part);
+        }
+        free(part);
     }
 }
 
@@ -182,11 +301,11 @@ int Psyz_GpuSetHorizontalGrid(
 }
 
 static void DispatchPackets(u_long* buf, int len) {
-    RECT rect;
-    unsigned int x, y;
     for (int i = 0; i < len; i++) {
         u_long op = buf[i];
         int code = (int)(buf[i] >> 24) & 0xFF;
+        int start = i;
+        GpuDump_TrackDrawState((u32)op);
         // https://psx-spx.consoledev.net/graphicsprocessingunitgpu/#gpu-render-polygon-commands
         switch (code) {
         case 0x00:
@@ -196,26 +315,11 @@ static void DispatchPackets(u_long* buf, int len) {
             GPU_clear_cache();
             break;
         case 0x02: // frame buffer rectangle draw
-            rect.x = (short)(buf[i + 1] & 0xFFFF);
-            rect.y = (short)((buf[i + 1] >> 16) & 0xFFFF);
-            rect.w = (short)(buf[i + 2] & 0xFFFF);
-            rect.h = (short)((buf[i + 2] >> 16) & 0xFFFF);
-            VramCopyFill(rect, (u_char)(op & 0xFF), (u_char)((op >> 8) & 0xFF),
-                         (u_char)((op >> 16) & 0xFF));
-            Draw_ClearImage(
-                &rect, (u_char)(op & 0xFF), (u_char)((op >> 8) & 0xFF),
-                (u_char)((op >> 16) & 0xFF));
+            VramFill(&buf[i]);
             i += 2;
             break;
         case 0x80: // move image
-            rect.x = (short)(buf[i + 1] & 0xFFFF);
-            rect.y = (short)((buf[i + 1] >> 16) & 0xFFFF);
-            rect.w = (short)(buf[i + 3] & 0xFFFF);
-            rect.h = (short)((buf[i + 3] >> 16) & 0xFFFF);
-            x = (short)(buf[i + 2] & 0xFFFF);
-            y = (short)((buf[i + 2] >> 16) & 0xFFFF);
-            VramCopyMove(rect, (int)(short)x, (int)(short)y);
-            Draw_MoveImage(&rect, x, y);
+            VramMove(&buf[i]);
             i += 3;
             break;
         case 0xA0: // write image
@@ -249,6 +353,7 @@ static void DispatchPackets(u_long* buf, int len) {
             Draw_SetOffset((int)op & 0x7FF, (int)(op >> 11) & 0x7FF);
             break;
         case 0xE6:
+            gpu_mask_setting = (u32)op & 3;
             Draw_SetMask(!!(op & 1), !!(op & 2));
             break;
         default:
@@ -270,7 +375,19 @@ static void DispatchPackets(u_long* buf, int len) {
             }
             WARNF("unsupported command %02X", code);
         }
+        /* Application-defined commands are not PS1 GPU commands. */
+        if (GpuDump_Active() && (code <= 0x02 || (code >= 0x20 && code <= 0x80) ||
+                                 (code >= 0xE1 && code <= 0xE6)))
+            GpuDump_GP0(&buf[start], i - start + 1);
     }
+}
+
+void Psyz_GpuResendDrawState(void) {
+    const u32* state = GpuDump_DrawState();
+    u_long words[6];
+    for (int i = 0; i < 6; i++)
+        words[i] = state[i + 1];
+    DispatchPackets(words, 6);
 }
 
 int Psyz_GpuExeque() {
@@ -375,13 +492,13 @@ static int GPU_EnqueueTrampoline(u_long p1, u_long p2) {
 
 static int GPU_DataWrite(RECT* rect, u_long* data) {
     Psyz_GpuExeque();
-    VramCopyLoad(rect, data);
-    Draw_LoadImage(rect, data);
+    GpuDump_Image(rect, data);
+    VramTransfer(rect, data, 0);
     return 0;
 }
 static int GPU_DataRead(RECT* rect, u_long* data) {
     Psyz_GpuExeque();
-    Draw_StoreImage(rect, data);
+    VramTransfer(rect, data, 1);
     return 0;
 }
 static int psyz_cwb(u32* data, s32 n) {
@@ -449,27 +566,11 @@ static int psyz_clr(RECT* rect, u32 color) {
     return 0;
 }
 
-/* The CRTC's vertical display range, which places the vblank interrupt
- * (Psyz_AudioDisplayRangeChanged). A GPU reset sets lines 16..255. */
-enum { CRTC_RESET_Y1 = 0x10, CRTC_RESET_Y2 = 0xFF };
-static unsigned crtc_y1 = CRTC_RESET_Y1, crtc_y2 = CRTC_RESET_Y2;
-
-static void CrtcVerticalRange(unsigned y1, unsigned y2) {
-    if (y1 == crtc_y1 && y2 == crtc_y2) {
-        return;
-    }
-    Psyz_AudioDisplayRangeChanged(crtc_y1, crtc_y2, y1, y2);
-    crtc_y1 = y1;
-    crtc_y2 = y2;
-}
-
-void Psyz_GpuCrtcReset(void) { CrtcVerticalRange(CRTC_RESET_Y1, CRTC_RESET_Y2); }
-
 void Psyz_GpuDisplayCommand(unsigned int cmd) {
     unsigned char op = (cmd >> 24) & 0x3F;
+    GpuDump_TrackDisplay(cmd);
     switch (op) {
     case 0:
-        Psyz_GpuCrtcReset();
         Draw_Reset();
         break;
     case 1:
@@ -491,7 +592,6 @@ void Psyz_GpuDisplayCommand(unsigned int cmd) {
         Draw_DisplayHorizontalRange(cmd & 0xFFF, (cmd >> 12) & 0xFFF);
         break;
     case 7:
-        CrtcVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         Draw_DisplayVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         break;
     case 8:

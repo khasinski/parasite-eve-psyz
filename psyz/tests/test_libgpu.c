@@ -478,7 +478,7 @@ ZTEST(gpu, vram_copy_follows_uploads_fills_and_copies) {
     const unsigned char* known = NULL;
     const unsigned short* vram;
     u16 pixels[4 * 2] = {0x1234, 0x0000, 0x8000, 0x7FFF, 1, 2, 3, 4};
-    RECT load = {600, 300, 4, 2}, fill = {700, 300, 8, 4};
+    RECT load = {600, 300, 4, 2}, fill = {704, 300, 16, 4};
     zassert_ptr_eq(NULL, Psyz_GpuGetVramCopy(NULL));
     zassert_s32_eq(0, Psyz_GpuSetVramCopy(1));
     vram = Psyz_GpuGetVramCopy(&known);
@@ -499,8 +499,8 @@ ZTEST(gpu, vram_copy_follows_uploads_fills_and_copies) {
     /* fills are kept as RGB5551 */
     ClearImage(&fill, 255, 0, 8);
     DrawSync(0);
-    zexpect_s32_eq(0x041F, vram[302 * 1024 + 703]);
-    zexpect_u8_eq(1, known[303 * 1024 + 707]);
+    zexpect_s32_eq(0x041F, vram[302 * 1024 + 705]);
+    zexpect_u8_eq(1, known[303 * 1024 + 719]);
 
     /* copies move texels and what is known */
     MoveImage(&load, 640, 310);
@@ -521,17 +521,17 @@ ZTEST(gpu, vram_copy_follows_uploads_fills_and_copies) {
     setWH(&tile, 2, 2);
     DrawPrim(&tile);
     DrawSync(0);
-    zexpect_u8_eq(0, known[302 * 1024 + 703]);
+    zexpect_u8_eq(0, known[302 * 1024 + 705]);
     zexpect_u8_eq(1, known[300 * 1024 + 600]);
 
     /* A later upload in the same drawing area is known until the next
      * primitive. No new drawing-area command is required. */
-    LoadImage(&fill, (u_long*)((u16[32]){0x1234}));
+    LoadImage(&fill, (u_long*)((u16[64]){0x1234}));
     DrawSync(0);
-    zexpect_u8_eq(1, known[300 * 1024 + 700]);
+    zexpect_u8_eq(1, known[300 * 1024 + 704]);
     DrawPrim(&tile);
     DrawSync(0);
-    zexpect_u8_eq(0, known[300 * 1024 + 700]);
+    zexpect_u8_eq(0, known[300 * 1024 + 704]);
 
     zassert_s32_eq(0, Psyz_GpuSetVramCopy(0));
     zexpect_ptr_eq(NULL, Psyz_GpuGetVramCopy(NULL));
@@ -1810,6 +1810,126 @@ ZTEST(gpu, drawenv_clear_vram) {
     }
 }
 
+/* PS1 GPU rasterization rules on the CPU rasterizer (PSYZ_HEADLESS=1, or the
+ * native rasterizer at 1x on SDL GPU): polygon fill convention and attribute
+ * stepping on slivers, rotated and Gouraud/dithered polygons, line stepping
+ * (flat, Gouraud, polyline, single point), textured-polygon page latching for
+ * a following sprite, blending, culling of polygons 1024 pixels wide and
+ * GP0 02h fill rounding to 16 pixels. The golden frame is DuckStation's
+ * software GPU replaying this test's GP0 commands: PSYZ_TEST_GPU_DUMP=file
+ * records them as a GPUDUMP file for duckstation-regtest. */
+ZTEST(gpu, native_rasterization_matches_ps1_gpu) {
+    zskip_targets("psp");
+    u_short tpage, clut;
+    if (LoadTim(img_4bpp, &tpage, &clut)) {
+        return;
+    }
+#if defined(__psyz) && !defined(__PSP__)
+    Psyz_VideoSetNativeRasterizer(1);
+    VSync(0); /* the SDL GPU backend switches rasterizers at a present */
+    const char* dump = getenv("PSYZ_TEST_GPU_DUMP");
+    if (dump && *dump)
+        Psyz_GpuDumpBegin(dump);
+#endif
+    ClearImage(&cdb->draw.clip, 60, 120, 120);
+    DR_MODE mode;
+    SetDrawMode(&mode, 0, 1, tpage, NULL); /* dithering on */
+    DrawPrim(&mode);
+
+    POLY_F3 f3;
+    static const short slivers[][6] = {
+        {10, 10, 60, 13, 12, 40}, {70, 10, 71, 60, 69, 30},
+        {75, 12, 95, 12, 85, 13}, {5, 45, 40, 47, 6, 90}};
+    for (int i = 0; i < 4; ++i) {
+        SetPolyF3(&f3);
+        setRGB0(&f3, 200 - i * 40, 60 + i * 30, 90);
+        setXY3(&f3, slivers[i][0], slivers[i][1], slivers[i][2],
+               slivers[i][3], slivers[i][4], slivers[i][5]);
+        DrawPrim(&f3);
+    }
+    POLY_G3 g3;
+    SetPolyG3(&g3);
+    setRGB0(&g3, 255, 0, 0);
+    setRGB1(&g3, 0, 255, 0);
+    setRGB2(&g3, 0, 0, 255);
+    setXY3(&g3, 100, 10, 200, 30, 120, 90);
+    DrawPrim(&g3);
+
+    POLY_FT4 ft4;
+    SetPolyFT4(&ft4);
+    setRGB0(&ft4, 128, 100, 160);
+    setXY4(&ft4, 20, 100, 90, 110, 10, 170, 80, 185);
+    setUVWH(&ft4, 0, 0, 63, 63);
+    ft4.tpage = tpage;
+    ft4.clut = clut;
+    DrawPrim(&ft4);
+
+    POLY_GT3 gt3;
+    SetPolyGT3(&gt3);
+    setRGB0(&gt3, 255, 128, 64);
+    setRGB1(&gt3, 64, 128, 255);
+    setRGB2(&gt3, 128, 255, 128);
+    setXY3(&gt3, 110, 100, 140, 180, 100, 170);
+    setUV3(&gt3, 0, 0, 63, 20, 10, 63);
+    /* page with subtract blending: the polygon latches it for the sprite */
+    gt3.tpage = (u_short)((tpage & ~0x60) | (2 << 5));
+    gt3.clut = clut;
+    DrawPrim(&gt3);
+
+    LINE_F2 lf2;
+    SetLineF2(&lf2);
+    setRGB0(&lf2, 255, 255, 0);
+    setXY2(&lf2, 150, 100, 250, 130);
+    DrawPrim(&lf2);
+    LINE_G2 lg2;
+    SetLineG2(&lg2);
+    setRGB0(&lg2, 255, 0, 255);
+    setRGB1(&lg2, 0, 255, 255);
+    setXY2(&lg2, 240, 120, 150, 140);
+    DrawPrim(&lg2);
+    LINE_F3 lf3;
+    SetLineF3(&lf3);
+    setRGB0(&lf3, 30, 200, 30);
+    setXY3(&lf3, 160, 150, 230, 200, 155, 210);
+    DrawPrim(&lf3);
+    setXY2(&lf2, 200, 220, 200, 220);
+    DrawPrim(&lf2);
+
+    SPRT sprt;
+    SetSprt(&sprt);
+    setRGB0(&sprt, 128, 128, 128);
+    setXY0(&sprt, 150, 160);
+    setWH(&sprt, 40, 30);
+    setUV0(&sprt, 8, 8);
+    sprt.clut = clut;
+    setSemiTrans(&sprt, 1);
+    DrawPrim(&sprt);
+
+    TILE tile;
+    setTile(&tile);
+    setRGB0(&tile, 40, 80, 120);
+    setXY0(&tile, 30, 190);
+    setWH(&tile, 90, 25);
+    setSemiTrans(&tile, 1);
+    DrawPrim(&tile);
+
+    setXY3(&f3, 0, 0, 1100, 0, 0, 50); /* 1024+ pixels wide: not drawn */
+    DrawPrim(&f3);
+    RECT fill = {5, 222, 20, 10}; /* the GPU fills x 0..31 */
+    ClearImage(&fill, 250, 250, 250);
+    DrawSync(0);
+#if defined(__psyz) && !defined(__PSP__)
+    if (dump && *dump)
+        Psyz_GpuDumpEnd(NULL);
+#endif
+    VSync(0);
+    PutDispEnv(&cdb->disp);
+    ASSERT_FRAME("native_rasterization", 0, 1.0f);
+#if defined(__psyz) && !defined(__PSP__)
+    Psyz_VideoSetNativeRasterizer(0);
+#endif
+}
+
 ZTEST(gpu, move_image) {
     u_short tpage, clut;
     RECT rect = {16, 16, 64, 64};
@@ -1966,9 +2086,10 @@ ZTEST(gpu, polygon_attribute_batch_boundaries) {
 }
 
 ZTEST(gpu, clear_image_quantizes_rgb555_before_blending) {
-    enum { width = 258, height = 6 };
-    u16 expected[width * height], actual[width * height];
-    RECT region = {400, 300, width, height};
+    /* GP0 02h fills whole 16-pixel columns: one 16x1 fill per value */
+    enum { width = 1024, height = 16 };
+    static u16 expected[width * height], actual[width * height];
+    RECT region = {0, 300, width, height};
     for (int i = 0; i < width * height; ++i)
         expected[i] = 0x5a5a;
     LoadImage(&region, (u_long*)expected);
@@ -1978,10 +2099,12 @@ ZTEST(gpu, clear_image_quantizes_rgb555_before_blending) {
             u8 r = row == 0 || row == 3 ? value : 0;
             u8 g = row == 1 ? value : row == 3 ? 255 - value : 0;
             u8 b = row == 2 ? value : row == 3 ? value ^ 0x55 : 0;
-            RECT pixel = {401 + value, 301 + row, 1, 1};
+            int x = (value % 64) * 16, y = row * 4 + value / 64;
+            RECT pixel = {(short)x, (short)(300 + y), 16, 1};
             ClearImage(&pixel, r, g, b);
-            expected[(row + 1) * width + value + 1] =
-                (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10);
+            for (int i = 0; i < 16; ++i)
+                expected[y * width + x + i] =
+                    (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10);
         }
     }
     DrawSync(0);
@@ -1989,6 +2112,49 @@ ZTEST(gpu, clear_image_quantizes_rgb555_before_blending) {
     DrawSync(0);
     for (int i = 0; i < width * height; ++i)
         zexpect_u16_eq(expected[i], actual[i]);
+}
+
+/* VRAM transfers wrap at the right and bottom edges (x modulo 1024, y modulo
+ * 512); fills round X down and the width up to 16 pixels and ignore the
+ * mask settings. */
+ZTEST(gpu, vram_transfers_wrap_and_fills_round) {
+    u16 row[8] = {1, 2, 3, 4, 5, 6, 7, 8}, back[8] = {0};
+    u16 column[3] = {0x111, 0x222, 0x333}, back_column[3] = {0};
+    RECT clear = {0, 0, 1024, 511}, wide = {1020, 40, 8, 1};
+    RECT tall = {50, 510, 1, 3};
+    ClearImage(&clear, 0, 0, 0);
+    LoadImage(&wide, (u_long*)row);
+    LoadImage(&tall, (u_long*)column);
+    DrawSync(0);
+    StoreImage(&wide, (u_long*)back);
+    StoreImage(&tall, (u_long*)back_column);
+    DrawSync(0);
+    for (int i = 0; i < 8; ++i)
+        zexpect_u16_eq(row[i], back[i]);
+    for (int i = 0; i < 3; ++i)
+        zexpect_u16_eq(column[i], back_column[i]);
+    u16 left[4], right[4], top[1];
+    RECT at_left = {0, 40, 4, 1}, at_right = {1020, 40, 4, 1};
+    RECT at_top = {50, 0, 1, 1};
+    StoreImage(&at_left, (u_long*)left);
+    StoreImage(&at_right, (u_long*)right);
+    StoreImage(&at_top, (u_long*)top);
+    DrawSync(0);
+    for (int i = 0; i < 4; ++i) {
+        zexpect_u16_eq(row[i], right[i]);
+        zexpect_u16_eq(row[4 + i], left[i]);
+    }
+    zexpect_u16_eq(0x333, top[0]);
+
+    /* fill at x=1012, 8 wide: the GPU fills x 1008..1023 */
+    RECT fill = {1012, 60, 8, 1}, probe = {1000, 60, 24, 1};
+    u16 line[24];
+    ClearImage(&fill, 255, 255, 255);
+    DrawSync(0);
+    StoreImage(&probe, (u_long*)line);
+    DrawSync(0);
+    for (int i = 0; i < 24; ++i)
+        zexpect_u16_eq(i < 8 ? 0 : 0x7fff, line[i]);
 }
 
 ZTEST(gpu, move_image_internal_res) {
