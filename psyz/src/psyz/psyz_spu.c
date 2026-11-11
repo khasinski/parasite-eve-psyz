@@ -1,6 +1,9 @@
 #include <psyz.h>
 #include <psyz/log.h>
+#include <libetc.h>
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "spu_voice.h"
 
@@ -139,7 +142,23 @@ void Psyz_SpuMemWrite(unsigned int offset, const void* src, unsigned int size) {
     Psyz_AudioUnlock();
 }
 
+/* PSYZ_SPU_KEY_TRACE=1 logs each key on with its voice registers to stderr,
+ * in the format of the DuckStation regtest's DUCKSTATION_SPU_KEY_TRACE. */
+static int spu_key_trace = -1;
+
 static void spu_key_on_voice(int v) {
+    if (spu_key_trace < 0) {
+        const char* trace = getenv("PSYZ_SPU_KEY_TRACE");
+        spu_key_trace = trace && *trace && *trace != '0';
+    }
+    if (spu_key_trace) {
+        const volatile SPU_VOICE_REG* r = &_spu_RXX->rxx.voice[v];
+        fprintf(stderr,
+                "PSYZ-SPU key-on voice=%d addr=%u repeat=%u pitch=%u left=%d "
+                "right=%d adsr1=%u adsr2=%u\n",
+                v, r->addr, r->loop_addr, r->pitch, r->volume.left,
+                r->volume.right, r->adsr[0], r->adsr[1]);
+    }
     spu_voice_key_on(&spu.voice[v], &_spu_RXX->rxx.voice[v]);
     spu.voice[v].delay_ticks = ENV_KEYON_DELAY_TICKS - 1;
 }
@@ -151,6 +170,19 @@ void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
     }
     if (reg_offset == offsetof(SPU_RXX, spustat)) { // read-only
         return;
+    }
+    {
+        /* PSYZ_SPU_REG_TRACE=1 logs writes to the voice and voice-mask
+         * registers, like DuckStation regtest's DUCKSTATION_SPU_REG_TRACE. */
+        static int reg_trace = -1;
+        if (reg_trace < 0) {
+            const char* trace = getenv("PSYZ_SPU_REG_TRACE");
+            reg_trace = trace && *trace && *trace != '0';
+        }
+        if (reg_trace && reg_offset < 0x1A0) {
+            fprintf(stderr, "PSYZ-SPU reg frame=%ld off=%03x val=%04x\n",
+                    (long)VSync(-1), reg_offset, value);
+        }
     }
     // Register strobes latch at a sample boundary. Serialize their pending
     // flags with mixing; a retrigger must retain the current output sample.
