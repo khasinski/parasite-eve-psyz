@@ -2916,14 +2916,13 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     return pixels;
 }
 
+/* The drawing area clips every primitive. One whose end lies before its
+ * start (a menu row's clip collapsed to zero width) draws nothing on the
+ * PS1: the scissor becomes empty and Draw_FlushBuffer drops such batches
+ * instead of keeping the previous area. */
 static void UpdateScissor() {
     int width = draw_area_end.x - draw_area_start.x + 1;
     int height = draw_area_end.y - draw_area_start.y + 1;
-    if (width <= 0 || height <= 0) {
-        // Draw_SetAreaStart gets called before Draw_SetAreaEnd, it happens
-        // that either width or height are zero. Just ignore the call.
-        return;
-    }
 
     if (!sdl3_window || !InitPlatform()) {
         return;
@@ -2932,8 +2931,8 @@ static void UpdateScissor() {
 
     scissor_rect.x = draw_area_start.x;
     scissor_rect.y = draw_area_start.y;
-    scissor_rect.w = width;
-    scissor_rect.h = height;
+    scissor_rect.w = width > 0 ? width : 0;
+    scissor_rect.h = height > 0 ? height : 0;
 }
 
 unsigned Psyz_VideoGetInternalResolution(void) {
@@ -3838,6 +3837,8 @@ void Draw_SetAreaStart(int x, int y) {
     }
     draw_area_start.x = x;
     draw_area_start.y = y;
+    /* GP0 E3 and E4 each take effect on their own */
+    UpdateScissor();
 }
 void Draw_SetAreaEnd(int x, int y) {
     if (UseSoftwareBackend()) {
@@ -3879,6 +3880,8 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
+    /* the fill comes after the primitives queued before it */
+    Draw_FlushBuffer();
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return;
@@ -4113,6 +4116,11 @@ void Draw_FlushBuffer(void) {
         return;
     }
     if (n_vertices == 0) {
+        return;
+    }
+    if (scissor_rect.w <= 0 || scissor_rect.h <= 0) {
+        /* an empty drawing area (UpdateScissor) draws nothing */
+        Draw_ResetBuffer();
         return;
     }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();

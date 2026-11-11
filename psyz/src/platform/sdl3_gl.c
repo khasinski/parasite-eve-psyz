@@ -894,14 +894,12 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
     return 0;
 }
 
+/* The drawing area clips every primitive; one whose end lies before its
+ * start draws nothing on the PS1, so it becomes an empty scissor instead of
+ * keeping the previous one (or a ClearImage's). */
 static void UpdateScissor(void) {
     int width = draw_area_end.x - draw_area_start.x + 1;
     int height = draw_area_end.y - draw_area_start.y + 1;
-    if (width <= 0 || height <= 0) {
-        // Draw_SetAreaStart gets called before Draw_SetAreaEnd, it happens
-        // that either width or height are zero. Just ignore the call.
-        return;
-    }
 
     if (!sdl3_window && !InitPlatform()) {
         return;
@@ -910,8 +908,8 @@ static void UpdateScissor(void) {
 
     int sx = draw_area_start.x * internal_res;
     int sy = draw_area_start.y * internal_res;
-    int sw = width * internal_res;
-    int sh = height * internal_res;
+    int sw = (width > 0 ? width : 0) * internal_res;
+    int sh = (height > 0 ? height : 0) * internal_res;
     glEnable(GL_SCISSOR_TEST);
     glScissor(sx, sy, sw, sh);
 }
@@ -1314,6 +1312,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
 void Draw_SetAreaStart(int x, int y) {
     draw_area_start.x = x;
     draw_area_start.y = y;
+    /* GP0 E3 and E4 each take effect on their own */
+    UpdateScissor();
 }
 void Draw_SetAreaEnd(int x, int y) {
     draw_area_end.x = x;
@@ -1346,6 +1346,8 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
+    /* the fill comes after the primitives queued before it */
+    Draw_FlushBuffer();
     glClearColor((float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, 0.0f);
     glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo);
     glScissor(rect->x, rect->y, rect->w, rect->h);
