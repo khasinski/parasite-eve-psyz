@@ -1,5 +1,6 @@
 #include "libsnd_private.h"
 
+#ifndef __psyz
 void _SsVmKeyOnNow(unsigned short vagCount, unsigned short pitch) {
     volatile int pad;
     unsigned chL;
@@ -77,3 +78,79 @@ void _SsVmKeyOnNow(unsigned short vagCount, unsigned short pitch) {
     _svm_okof1 &= ~_svm_okon1;
     _svm_okof2 &= ~_svm_okon2;
 }
+#else
+/* PSY-Q 4.x: sound effects (seq_sep_no 0x21) keep the linear volume; only
+ * sequence voices get the squared volume curve. */
+void _SsVmKeyOnNow(unsigned short vagCount, unsigned short pitch) {
+    struct SeqStruct* ss;
+    unsigned l, r, v;
+    unsigned short voice = _svm_cur.voice;
+    unsigned short low, high;
+    u8 pan;
+
+    (void)vagCount;
+    v = _svm_cur.volume * 0x3FFF * _svm_vh->mvol / 16129;
+    v = v * _svm_cur.mvol * _svm_cur.tone_vol / 16129;
+    l = r = v;
+    if (_svm_cur.seq_sep_no != 0x21) {
+        ss = &_ss_score[_svm_cur.seq_sep_no & 0xFF]
+                       [(_svm_cur.seq_sep_no & 0xFF00) >> 8];
+        l = v * ss->voll / 127;
+        r = v * ss->volr / 127;
+    }
+    pan = _svm_cur.tone_pan;
+    if (pan < 0x40) {
+        r = r * pan / 63;
+    } else {
+        l = l * (0x7F - pan) / 63;
+    }
+    pan = _svm_cur.mpan;
+    if (pan < 0x40) {
+        r = r * pan / 63;
+    } else {
+        l = l * (0x7F - pan) / 63;
+    }
+    pan = _svm_cur.pan;
+    if (pan < 0x40) {
+        r = r * pan / 63;
+    } else {
+        l = l * (0x7F - pan) / 63;
+    }
+    if (_svm_stereo_mono == 1) {
+        if (l < r) {
+            l = r;
+        } else {
+            r = l;
+        }
+    }
+    if (_svm_cur.seq_sep_no != 0x21) {
+        l = l * l / 16383;
+        r = r * r / 16383;
+    }
+    _svm_sreg_buf[voice].pitch = pitch;
+    _svm_sreg_buf[voice].volume.left = l;
+    _svm_sreg_buf[voice].volume.right = r;
+    _svm_sreg_dirty[voice] |= 7;
+    _svm_voice[voice].unk04 = pitch;
+    if (voice < 16) {
+        low = 1 << voice;
+        high = 0;
+    } else {
+        low = 0;
+        high = 1 << (voice - 16);
+    }
+    if (_svm_cur.tone_mode & 4) {
+        _svm_orev1 |= low;
+        _svm_orev2 |= high;
+    } else {
+        _svm_orev1 &= ~low;
+        _svm_orev2 &= ~high;
+    }
+    _svm_onos1 &= ~low;
+    _svm_onos2 &= ~high;
+    _svm_okon2 |= high;
+    _svm_okon1 |= low;
+    _svm_okof1 &= ~_svm_okon1;
+    _svm_okof2 &= ~_svm_okon2;
+}
+#endif

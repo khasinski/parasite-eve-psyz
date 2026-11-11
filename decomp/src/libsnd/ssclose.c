@@ -1,7 +1,22 @@
 #include "libsnd_private.h"
 
+#ifdef __psyz
+/* The public entry points below hold the interrupt lock (sound API vs. the
+ * sequencer tick, see libsnd_private.h). */
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+#define SsSeqClose SsSeqClose_Unlocked
+#define SsSepClose SsSepClose_Unlocked
+#endif
+
 void _SsClose(s16 seq_sep_num) {
     s32 seq_num;
+
+#ifdef __psyz
+    if (!_SsScore(seq_sep_num, 0)) {
+        return;
+    }
+#endif
     _SsVmSetSeqVol(seq_sep_num, 0, 0, 1);
     _SsVmSeqKeyOff(seq_sep_num);
     _snd_openflag &= ~(1 << seq_sep_num);
@@ -26,3 +41,19 @@ void _SsClose(s16 seq_sep_num) {
 void SsSeqClose(short seq_access_num) { _SsClose(seq_access_num); }
 
 void SsSepClose(short sep_access_num) { _SsClose(sep_access_num); }
+
+#ifdef __psyz
+#undef SsSeqClose
+void SsSeqClose(short seq_access_num) {
+    Psyz_KernelLockInterrupts();
+    SsSeqClose_Unlocked(seq_access_num);
+    Psyz_KernelUnlockInterrupts();
+}
+
+#undef SsSepClose
+void SsSepClose(short sep_access_num) {
+    Psyz_KernelLockInterrupts();
+    SsSepClose_Unlocked(sep_access_num);
+    Psyz_KernelUnlockInterrupts();
+}
+#endif

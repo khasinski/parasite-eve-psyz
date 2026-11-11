@@ -55,6 +55,8 @@ void Psyz_CdServiceDrive(void);
 
 // Services due timers when the host has no thread to run them.
 void Psyz_KernelPoll(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 
 // Subpixel GTE->GPU coordinate cache for optional geometry correction.
 /* Bounded diagnostic only; no cache entries, addresses or rendering policy altered. */

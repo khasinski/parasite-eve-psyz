@@ -142,7 +142,8 @@
 
 #define SPU_OFF 0   /**< Off state */
 #define SPU_ON 1    /**< On state */
-#define SPU_BIT 2   /**< Direct bit pattern mode */
+#define SPU_CLEAR 2 /**< Clear state */
+#define SPU_BIT 8   /**< Direct bit pattern mode */
 #define SPU_RESET 3 /**< Reset state */
 
 #define SPU_ERROR (-1) /**< Error return value */

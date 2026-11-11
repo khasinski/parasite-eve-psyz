@@ -9,6 +9,8 @@ unsigned short _svm_okof1;
 unsigned short _svm_okof2;
 unsigned short _svm_orev1;
 unsigned short _svm_orev2;
+unsigned short _svm_onos1;
+unsigned short _svm_onos2;
 struct SpuVoice _svm_voice[NUM_VOICES];
 unsigned int _svm_envx_ptr;
 static int _dummy;
@@ -23,6 +25,7 @@ void (*_autopan)();
 
 extern unsigned char _svm_auto_kof_mode;
 
+#ifndef __psyz
 void _SsVmFlush(void) {
     s32 i;
     unsigned int var_s2;
@@ -154,3 +157,81 @@ void _SsVmFlush(void) {
     sreg->rev_mode[1] = rev2;
 #endif
 }
+#else
+/* PSY-Q 4.x flush, run at the start of each SsSeqCalledTbyT: tracks the
+ * envelopes to release silent voices, runs the auto volume/pan, writes the
+ * dirty voice registers and the key on/off, reverb and noise voice masks. */
+void _SsVmFlush(void) {
+    short envx;
+    unsigned mask;
+    int i;
+
+    _svm_envx_ptr = (_svm_envx_ptr + 1) & 0xF;
+    _svm_envx_hist[_svm_envx_ptr] = 0;
+    for (i = 0; i < _SsVmMaxVoice; i++) {
+        SpuGetVoiceEnvelope(i, &envx);
+        _svm_voice[i].key_stat = envx;
+        if (envx == 0) {
+            _svm_envx_hist[_svm_envx_ptr] |= 1 << i;
+        }
+    }
+    if (_svm_auto_kof_mode == 0) {
+        mask = -1;
+        for (i = 0; i < LEN(_svm_envx_hist) - 1; i++) {
+            mask &= _svm_envx_hist[i];
+        }
+        for (i = 0; i < _SsVmMaxVoice; i++) {
+            if (mask & (1 << i)) {
+                if (_svm_voice[i].unk1b == 2) {
+                    /* As the PS1: the low half of the mask is sign
+                     * extended, so voice 15 also releases voices 16-23. */
+                    if (i < 16) {
+                        SpuSetNoiseVoice(
+                            SPU_OFF, (u_long)(long)(short)(1 << i));
+                    } else {
+                        SpuSetNoiseVoice(SPU_OFF, (u8)(1 << (i - 16)) << 16);
+                    }
+                }
+                _svm_voice[i].unk1b = 0;
+            }
+        }
+    }
+    _svm_okon1 &= ~_svm_okof1;
+    _svm_okon2 &= ~_svm_okof2;
+    for (i = 0; i < NUM_VOICES; i++) {
+        if (_svm_voice[i].auto_vol) {
+            _autovol(i);
+        }
+        if (_svm_voice[i].auto_pan) {
+            _autopan(i);
+        }
+    }
+    for (i = 0; i < NUM_VOICES; i++) {
+        if (_svm_sreg_dirty[i] & 1) {
+            SPUWV(i, volume.left, _svm_sreg_buf[i].volume.left);
+            SPUWV(i, volume.right, _svm_sreg_buf[i].volume.right);
+        }
+        if (_svm_sreg_dirty[i] & 4) {
+            SPUWV(i, pitch, _svm_sreg_buf[i].pitch);
+        }
+        if (_svm_sreg_dirty[i] & 8) {
+            SPUWV(i, addr, _svm_sreg_buf[i].addr);
+        }
+        if (_svm_sreg_dirty[i] & 0x10) {
+            SPUWV(i, adsr[0], _svm_sreg_buf[i].adsr[0]);
+            SPUWV(i, adsr[1], _svm_sreg_buf[i].adsr[1]);
+        }
+        _svm_sreg_dirty[i] = 0;
+    }
+    SpuSetKey(SPU_OFF, ((u8)_svm_okof2 << 16) | _svm_okof1);
+    SpuSetKey(SPU_ON, ((u8)_svm_okon2 << 16) | _svm_okon1);
+    SpuSetReverbVoice(SPU_BIT, ((u8)_svm_orev2 << 16) | _svm_orev1);
+    SpuSetNoiseVoice(SPU_BIT, ((u8)_svm_onos2 << 16) | _svm_onos1);
+    _svm_okof1 = 0;
+    _svm_okof2 = 0;
+    _svm_okon1 = 0;
+    _svm_okon2 = 0;
+    _svm_onos1 = 0;
+    _svm_onos2 = 0;
+}
+#endif

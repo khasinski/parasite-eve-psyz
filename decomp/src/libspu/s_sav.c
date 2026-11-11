@@ -32,6 +32,21 @@ u_long _SpuSetAnyVoice(long on_off, u_long voice_bit, int lo_reg, int hi_reg) {
         }
         ret &= ~(voice_bit & 0xFFFFFF);
         break;
+#ifdef __psyz
+    case SPU_BIT:
+        /* PSY-Q 4.x: replace the whole voice mask (_SsVmFlush relies on it
+         * for the reverb and noise voices). */
+        if (_spu_env & 1) {
+            _spu_RQ[lo_reg - 0xC4] = voice_bit;
+            _spu_RQ[hi_reg - 0xC4] = (voice_bit >> 16) & 0xFF;
+            _spu_RQmask |= 1 << ((lo_reg - 0xC6) >> 1);
+        } else {
+            SPUW_RAW(lo_reg, voice_bit);
+            SPUW_RAW(hi_reg, (voice_bit >> 16) & 0xFF);
+        }
+        ret = voice_bit & 0xFFFFFF;
+        break;
+#endif
     }
     return ret & 0xFFFFFF;
 }

@@ -1,5 +1,13 @@
 #include "libsnd_private.h"
 
+#ifdef __psyz
+/* The public entry points below hold the interrupt lock (sound API vs. the
+ * sequencer tick, see libsnd_private.h). */
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+#define SsUtAllKeyOff SsUtAllKeyOff_Unlocked
+#endif
+
 void SsUtAllKeyOff(short mode) {
     short i;
 
@@ -20,3 +28,12 @@ void SsUtAllKeyOff(short mode) {
         _SsVmKeyOffNow(1);
     }
 }
+
+#ifdef __psyz
+#undef SsUtAllKeyOff
+void SsUtAllKeyOff(short mode) {
+    Psyz_KernelLockInterrupts();
+    SsUtAllKeyOff_Unlocked(mode);
+    Psyz_KernelUnlockInterrupts();
+}
+#endif

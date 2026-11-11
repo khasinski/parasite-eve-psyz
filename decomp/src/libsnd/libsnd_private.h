@@ -29,16 +29,18 @@ typedef void (*sCb)();
 #define NUM_CC 13
 #define NUM_DE 20
 
+/* ADSR register fields, as _SsUtResolveADSR splits them and
+ * _SsUtBuildADSR packs them again. */
 struct Unk {
-    u16 unk0;
-    u16 unk2;
-    u16 unk4;
-    u16 unk6;
-    u16 unk8;
-    s16 unkA;
-    s16 unkC;
-    u16 unkE;
-    s16 unk10;
+    u16 attack_rate;
+    u16 decay_rate;
+    u16 sustain_level;
+    u16 sustain_rate;
+    u16 release_rate;
+    s16 attack_exp;
+    s16 sustain_exp;
+    s16 release_exp;
+    s16 sustain_decrease;
 };
 
 struct SeqStruct {
@@ -46,7 +48,7 @@ struct SeqStruct {
     /* 0x04 */ u8* read_pos;
     /* 0x08 */ u8* next_sep_pos;
     /* 0x0C */ u8* loop_pos;
-    /* 0x10 */ u32 unk10;
+    /* 0x10 */ u8* unk10; /* end of the next SEP (SsSetNext); a pointer */
     /* 0x14 */ u8 play_mode;
     /* 0x15 */ u8 unk15;
     /* 0x16 */ u8 running_status;
@@ -142,6 +144,9 @@ struct SpuVoice {
     s16 unk2e;
     s16 start_pan; /* 0x30 */
     s16 end_pan;   /* 0x32 */
+    /* PSY-Q 4.x keeps the MIDI channel of a sequence voice (offset 0x0C of
+     * its 0x36-byte voice record); host code keeps it here. */
+    s16 channel;
 };
 
 struct struct_svm {
@@ -206,6 +211,27 @@ extern SPU_RXX* _svm_sreg;
 #endif
 
 extern struct SeqStruct* _ss_score[32];
+
+#ifdef __psyz
+/* The sequencer tick runs on the timer thread; the public sound API holds
+ * these so that, as on the PS1, the tick never runs in the middle of it
+ * (psyz/src/psyz/kernel.c). */
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+#endif
+
+#ifdef __psyz
+/* Score of an access number and SEP track, or NULL when the pair was never
+ * opened: games pass -1 when no sequence is open, which the PS1 resolved to
+ * unrelated memory. */
+static inline struct SeqStruct* _SsScore(int access_num, int seq_num) {
+    if (access_num < 0 || access_num >= _snd_seq_s_max || seq_num < 0 ||
+        seq_num >= _snd_seq_t_max || !_ss_score[access_num]) {
+        return NULL;
+    }
+    return &_ss_score[access_num][seq_num];
+}
+#endif
 extern s32 _svm_brr_start_addr[];
 extern short kMaxPrograms;
 extern struct struct_svm _svm_cur;
@@ -216,6 +242,8 @@ extern unsigned short _svm_okof1;
 extern unsigned short _svm_okof2;
 extern unsigned short _svm_orev1;
 extern unsigned short _svm_orev2;
+extern unsigned short _svm_onos1;
+extern unsigned short _svm_onos2;
 extern struct SpuVoice _svm_voice[NUM_VOICES];
 extern int _svm_envx_hist[16];
 extern SpuReverbAttr _svm_rattr;
@@ -285,7 +313,31 @@ int _SsReadDeltaValue(short seq_access_num, short seq_num);
 char _SsVmAlloc(short voice);
 void vmNoiseOn(char voice);
 void vmNoiseOff(char voice);
+unsigned short note2pitch(void);
 unsigned short note2pitch2(unsigned short note, unsigned short fine);
+int _SsVmKeyOn(short seq_sep_no, short vabId, short prog, short note,
+               short voll, short pan);
+int _SsVmKeyOff(short seq_sep_no, short vabId, short prog, short note);
+int _SsVmPitchBend(short seq_sep_no, short vabId, short prog, short bend);
+short _SsVmPBVoice(
+    short voice, short seq_sep_no, short vabId, short prog, short bend);
+int _SsVmSetVol(
+    short seq_sep_no, short vabId, short prog, short voll, short pan);
+int _SsVmSetProgVol(short vabId, short prog, unsigned char vol);
+int _SsVmGetProgVol(short vabId, short prog);
+int _SsVmSetProgPan(short vabId, short prog, unsigned char pan);
+int _SsVmGetProgPan(short vabId, short prog);
+short _SsVmGetSeqLVol(short seq_sep_no);
+short _SsVmGetSeqRVol(short seq_sep_no);
+unsigned char _SsVmSelectToneAndVag(unsigned char* tones, unsigned char* vags);
+void _SsVmDamperOn(void);
+void _SsVmKeyOffNow(int mode);
+void vmNoiseOff(char voice);
+void _SsSeqGetEof(short seq_access_num, short seq_num);
+int _SsGetSeqData(short seq_access_num, short seq_num);
+void _SsSndNextSep(short seq_access_num, short seq_num);
+void _SsUtBuildADSR(
+    struct Unk* adsr, unsigned short* adsr1, unsigned short* adsr2);
 void _SsVmKeyOnNow(unsigned short vagCount, unsigned short pitch);
 int _SsVmVSetUp(short vabId, short prog);
 void _SsVmDoAllocate(void);

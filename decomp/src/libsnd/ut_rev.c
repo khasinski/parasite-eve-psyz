@@ -1,5 +1,13 @@
 #include "libsnd_private.h"
 
+#ifdef __psyz
+/* The public entry points below hold the interrupt lock (sound API vs. the
+ * sequencer tick, see libsnd_private.h). */
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+#define SsUtSetReverbType SsUtSetReverbType_Unlocked
+#endif
+
 short SsUtSetReverbType(short type) {
     short _type;
     int is_neg;
@@ -28,3 +36,15 @@ short SsUtSetReverbType(short type) {
 }
 
 short SsUtGetReverbType(void) { return _svm_rattr.mode; }
+
+#ifdef __psyz
+#undef SsUtSetReverbType
+short SsUtSetReverbType(short type) {
+    short ret;
+
+    Psyz_KernelLockInterrupts();
+    ret = SsUtSetReverbType_Unlocked(type);
+    Psyz_KernelUnlockInterrupts();
+    return ret;
+}
+#endif

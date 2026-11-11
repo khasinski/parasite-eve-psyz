@@ -1,10 +1,27 @@
 #include "libsnd_private.h"
 
+#ifdef __psyz
+/* The public entry points below hold the interrupt lock (sound API vs. the
+ * sequencer tick, see libsnd_private.h). */
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+#define SsSeqStop SsSeqStop_Unlocked
+#define SsSepStop SsSepStop_Unlocked
+#endif
+
 void _SsSndStop(short sep_access_num, short seq_num) {
     struct SeqStruct* score;
     int i;
 
+#ifdef __psyz
+    /* PSY-Q 4.x leaves the reverb on when a sequence stops. */
+    score = _SsScore(sep_access_num, seq_num);
+    if (!score) {
+        return;
+    }
+#else
     score = &_ss_score[sep_access_num][seq_num];
+#endif
     _ss_score[sep_access_num][seq_num].flags &= ~SEQ_FLAG_1;
     _ss_score[sep_access_num][seq_num].flags &= ~SEQ_FLAG_2;
     _ss_score[sep_access_num][seq_num].flags &= ~SEQ_FLAG_8;
@@ -12,7 +29,9 @@ void _SsSndStop(short sep_access_num, short seq_num) {
     _ss_score[sep_access_num][seq_num].flags |= SEQ_FLAG_4;
     _SsVmSeqKeyOff(sep_access_num | (seq_num << 8));
     _SsVmDamperOff();
+#ifndef __psyz
     SsUtReverbOff();
+#endif
     score->play_mode = SSPLAY_PAUSE;
     score->unk88 = 0;
     score->unk1C = 0;
@@ -47,3 +66,19 @@ void SsSeqStop(short seq_access_num) { _SsSndStop(seq_access_num, 0); }
 void SsSepStop(short sep_access_num, short seq_num) {
     _SsSndStop(sep_access_num, seq_num);
 }
+
+#ifdef __psyz
+#undef SsSeqStop
+void SsSeqStop(short seq_access_num) {
+    Psyz_KernelLockInterrupts();
+    SsSeqStop_Unlocked(seq_access_num);
+    Psyz_KernelUnlockInterrupts();
+}
+
+#undef SsSepStop
+void SsSepStop(short sep_access_num, short seq_num) {
+    Psyz_KernelLockInterrupts();
+    SsSepStop_Unlocked(sep_access_num, seq_num);
+    Psyz_KernelUnlockInterrupts();
+}
+#endif

@@ -1,5 +1,13 @@
 #include "libsnd_private.h"
 
+#ifdef __psyz
+/* The public entry points below hold the interrupt lock (sound API vs. the
+ * sequencer tick, see libsnd_private.h). */
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+#define SsSepOpenJ SsSepOpenJ_Unlocked
+#endif
+
 short SsSepOpenJ(unsigned long* addr, short vab_id, short seq_cnt) {
     short bit;
     short i;
@@ -32,3 +40,15 @@ short SsSepOpenJ(unsigned long* addr, short vab_id, short seq_cnt) {
     }
     return flag;
 }
+
+#ifdef __psyz
+#undef SsSepOpenJ
+short SsSepOpenJ(unsigned long* addr, short vab_id, short seq_cnt) {
+    short ret;
+
+    Psyz_KernelLockInterrupts();
+    ret = SsSepOpenJ_Unlocked(addr, vab_id, seq_cnt);
+    Psyz_KernelUnlockInterrupts();
+    return ret;
+}
+#endif

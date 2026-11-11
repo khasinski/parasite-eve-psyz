@@ -63,6 +63,11 @@ void _SsVmInit(char numVoices) {
         _svm_voice[i].unk2e = 0;
         _svm_voice[i].start_pan = 0;
         _svm_voice[i].start_vol = 0;
+#ifdef __psyz
+        _svm_voice[i].channel = 0;
+        _svm_voice[i].end_vol = 0;
+        _svm_voice[i].end_pan = 0;
+#endif
         SPUWV(i, addr, 0x200);
         SPUWV(i, pitch, 0x1000);
         SPUWV(i, adsr[0], 0x80FF);
@@ -79,6 +84,10 @@ void _SsVmInit(char numVoices) {
     _svm_okof1 = 0;
     _svm_orev1 = 0;
     _svm_orev2 = 0;
+#ifdef __psyz
+    _svm_onos1 = 0;
+    _svm_onos2 = 0;
+#endif
     _svm_rattr.mask = 0;
     _svm_rattr.mode = 0;
     _svm_auto_kof_mode = 0;

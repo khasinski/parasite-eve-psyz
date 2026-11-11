@@ -354,6 +354,15 @@ void Psyz_KernelVBlank(void) {
     LatchLine(IRQ_VBLANK);
 }
 
+/* Library code that the PS1 ran atomically with respect to an interrupt
+ * handler (libsnd's sound API against its sequencer tick, which only checks
+ * _snd_ev_flag) holds the kernel lock: the interrupt callbacks, which run
+ * under it on the timer thread, wait instead of running concurrently. A PS1
+ * interrupt could not run in parallel, nor see the state half updated. */
+void Psyz_KernelLockInterrupts(void) { KernelLock(); }
+
+void Psyz_KernelUnlockInterrupts(void) { KernelUnlock(); }
+
 void PS1_EnterCriticalSection(void) {
     if (OwnsKernel()) {
         return; // already in one, or inside an interrupt handler
