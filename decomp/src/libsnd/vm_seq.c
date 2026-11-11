@@ -9,6 +9,15 @@ short _SsVmSetSeqVol(short seq_sep_no, u16 voll, u16 volr, short arg3) {
     u8 pan;
     short i;
 
+#ifdef __psyz
+    /* An access number of an unopened sequence (games pass -1) indexes past
+     * the score table; the PS1 wrote into unrelated memory. Ignore it. */
+    if ((seq_sep_no & 0xFF) >= _snd_seq_s_max ||
+        ((seq_sep_no & 0xFF00) >> 8) >= _snd_seq_t_max ||
+        _ss_score[seq_sep_no & 0xFF] == NULL) {
+        return 0;
+    }
+#endif
     score = &_ss_score[seq_sep_no & 0xFF][(seq_sep_no & 0xFF00) >> 8];
     _svm_cur.seq_sep_no = seq_sep_no;
     if (voll == 0) {
