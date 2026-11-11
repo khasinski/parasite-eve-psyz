@@ -38,6 +38,7 @@ static bool video_pal;
  * native busy wait (Psyz_AudioWaitUs) spends part of a field, or crosses
  * blanks; VSync(0) then mixes only the rest of the field. */
 static unsigned field_frames_left;
+static unsigned field_frames_total; // the current field's length
 static unsigned wait_fraction; // carried sub-sample part of waited time
 
 static PsyzAudioCaptureCallback capture_callback;
@@ -254,7 +255,7 @@ int Psyz_AudioWaitUs(uint64_t us) {
     wait_fraction = (unsigned)(scaled % 1000000);
     while (frames) {
         if (!field_frames_left)
-            field_frames_left = NextFieldFrames(video_pal);
+            field_frames_left = field_frames_total = NextFieldFrames(video_pal);
         unsigned batch = field_frames_left;
         if (batch > FIELD_FRAMES_MAX)
             batch = FIELD_FRAMES_MAX;
@@ -266,11 +267,53 @@ int Psyz_AudioWaitUs(uint64_t us) {
         frames -= batch;
         field_frames_left -= batch;
         if (!field_frames_left) {
-            field_frames_left = NextFieldFrames(video_pal);
+            field_frames_left = field_frames_total = NextFieldFrames(video_pal);
             Psyz_VideoWaitBlank();
         }
     }
     return 1;
+}
+
+/* The CRTC's vertical display range changed (GP1(07h), a GPU reset). The
+ * vblank interrupt comes when the beam leaves the display range, at its end
+ * line, so the current field is cut or stretched: the next blank comes when
+ * the beam reaches the new end line, or at once when the current line was
+ * inside the old range and is outside the new one (DuckStation's CRTC). A
+ * game's first PutDispEnv after ResetGraph(0) moves the end from the reset
+ * value (line 255) to its screen's, e.g. 291 for a 256-line PAL screen at
+ * y 16: that field lasts 36 lines. Offline clock only; the real-time clock
+ * paces fields from the host. */
+void Psyz_AudioDisplayRangeChanged(
+    unsigned y1, unsigned y2, unsigned new_y1, unsigned new_y2) {
+    StartOfflineClock();
+    if (!is_audio_init || !video_clock || video_paused || mixing)
+        return;
+    const unsigned total = video_pal ? 314 : 263;
+    const double field = video_pal
+                             ? (double)FIELD_SAMPLES_PAL / FIELD_DIVISOR_PAL
+                             : (double)FIELD_SAMPLES_NTSC / FIELD_DIVISOR_NTSC;
+    y1 = y1 < total ? y1 : total;
+    y2 = y2 < total ? y2 : total;
+    new_y1 = new_y1 < total ? new_y1 : total;
+    new_y2 = new_y2 < total ? new_y2 : total;
+    unsigned elapsed = field_frames_left ? field_frames_total - field_frames_left : 0;
+    double line = y2 + elapsed * total / field;
+    while (line >= total)
+        line -= total;
+    unsigned current = (unsigned)line;
+    int was_blank = current < y1 || current >= y2;
+    int is_blank = current < new_y1 || current >= new_y2;
+    if (!was_blank && is_blank)
+        Psyz_VideoWaitBlank();
+    double lines = new_y2 - line;
+    if (lines <= 0)
+        lines += total;
+    unsigned frames = (unsigned)(lines * field / total + 0.5);
+    if (frames < 1)
+        frames = 1;
+    if (frames > FIELD_FRAMES_MAX)
+        frames = FIELD_FRAMES_MAX;
+    field_frames_left = field_frames_total = frames;
 }
 
 /* A blank VSync(0) waited for: the rest of the current field. */
@@ -279,7 +322,7 @@ void Sdl3Audio_VBlank(bool pal) {
     if (!is_audio_init || !video_clock || video_paused)
         return;
     if (!field_frames_left || pal != video_pal)
-        field_frames_left = NextFieldFrames(pal);
+        field_frames_left = field_frames_total = NextFieldFrames(pal);
     SDL_LockMutex(mutex);
     MixOfflineFrames(field_frames_left);
     SDL_UnlockMutex(mutex);

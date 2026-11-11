@@ -2,11 +2,22 @@
 #include "libapi.h"
 
 long SpuIsTransferCompleted(long immediateFlag) {
-#ifdef __psyz // HACK the TestEvent must work
-    if (immediateFlag == 0) {
+#ifdef __psyz
+    /* The DMA end is the emulated transfer's (spu.c), not the event. */
+    int Psyz_SpuDmaBusy(void);
+    void Psyz_SpuDmaWait(void);
+    void Psyz_SpendTime(unsigned ns);
+    if (_spu_trans_mode == 1 || _spu_inTransfer == 1) {
         return 1;
     }
-    return 0;
+    if (immediateFlag == 1) {
+        Psyz_SpuDmaWait();
+    } else if (Psyz_SpuDmaBusy()) {
+        Psyz_SpendTime(1000); // the PS1 time of a poll
+        return 0;
+    }
+    _spu_inTransfer = 1;
+    return 1;
 #endif
     s32 in_transfer;
 

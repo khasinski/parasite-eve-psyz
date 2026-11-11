@@ -870,6 +870,10 @@ int SetIntrMask(int);
 int _reset(int mode) {
 #ifdef __psyz
     int psyz_gpu_version(int);
+    void Psyz_GpuCrtcReset(void);
+    if ((mode & 7) == 0 || (mode & 7) == 5) {
+        Psyz_GpuCrtcReset(); // GPU_STATUS = 0: GP1(00h)
+    }
     return psyz_gpu_version(mode);
 #endif
     u_long** queue = &_qout;

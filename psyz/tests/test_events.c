@@ -1115,6 +1115,29 @@ ZTEST(events, card_load_with_card_raises_ioe) {
     zexpect_s32_eq(CARD_IOE, card_poll(card_sw, 180));
 }
 
+static int card_vblanks_until_event(const long* events) {
+    for (int n = 0; n <= 8; n++) {
+        for (int i = 0; i < CARD_SPECS; i++) {
+            if (TestEvent(events[i])) {
+                return n;
+            }
+        }
+        VSync(0);
+    }
+    return -1;
+}
+
+// The BIOS card driver serves each port on alternate vblanks: a request
+// finishes at that port's next turn (one or two vblanks later), an empty
+// port times out a vblank after its turn.
+ZTEST(events, card_info_takes_the_drivers_turn_of_the_port) {
+    card_start();
+    zassert_s32_eq(1, _card_info(CARD_SLOT_1));
+    int n = card_vblanks_until_event(card_sw);
+    zexpect_s32_ge(1, n);
+    zexpect_s32_le(3, n);
+}
+
 ZTEST(events, disabled_card_event_misses_card_info_result) {
     card_start();
     for (int i = 0; i < CARD_SPECS; i++) {

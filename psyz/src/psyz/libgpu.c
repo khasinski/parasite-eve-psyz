@@ -449,10 +449,27 @@ static int psyz_clr(RECT* rect, u32 color) {
     return 0;
 }
 
+/* The CRTC's vertical display range, which places the vblank interrupt
+ * (Psyz_AudioDisplayRangeChanged). A GPU reset sets lines 16..255. */
+enum { CRTC_RESET_Y1 = 0x10, CRTC_RESET_Y2 = 0xFF };
+static unsigned crtc_y1 = CRTC_RESET_Y1, crtc_y2 = CRTC_RESET_Y2;
+
+static void CrtcVerticalRange(unsigned y1, unsigned y2) {
+    if (y1 == crtc_y1 && y2 == crtc_y2) {
+        return;
+    }
+    Psyz_AudioDisplayRangeChanged(crtc_y1, crtc_y2, y1, y2);
+    crtc_y1 = y1;
+    crtc_y2 = y2;
+}
+
+void Psyz_GpuCrtcReset(void) { CrtcVerticalRange(CRTC_RESET_Y1, CRTC_RESET_Y2); }
+
 void Psyz_GpuDisplayCommand(unsigned int cmd) {
     unsigned char op = (cmd >> 24) & 0x3F;
     switch (op) {
     case 0:
+        Psyz_GpuCrtcReset();
         Draw_Reset();
         break;
     case 1:
@@ -474,6 +491,7 @@ void Psyz_GpuDisplayCommand(unsigned int cmd) {
         Draw_DisplayHorizontalRange(cmd & 0xFFF, (cmd >> 12) & 0xFFF);
         break;
     case 7:
+        CrtcVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         Draw_DisplayVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         break;
     case 8:

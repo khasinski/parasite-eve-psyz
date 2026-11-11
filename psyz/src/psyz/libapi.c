@@ -52,6 +52,7 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
 
 void Psyz_VSyncBlank(void) {
     ReadPadsOnVsync();
+    Psyz_CardVBlank();
     if (g_PsyzVsyncCb)
         g_PsyzVsyncCb();
     Psyz_KernelVBlank();
@@ -189,6 +190,12 @@ void SystemError(char c, long n) {
 
 struct DIRENTRY* my_firstfile(char* dirPath, struct DIRENTRY* firstEntry);
 struct DIRENTRY* firstfile(char* dirPath, struct DIRENTRY* firstEntry) {
+    // The BIOS checks the card ("buPS:") by reading its sector 0 first.
+    if (dirPath && dirPath[0] == 'b' && dirPath[1] == 'u' &&
+        dirPath[2] >= '0' && dirPath[2] <= '1' && dirPath[3] >= '0' &&
+        dirPath[3] <= '3') {
+        Psyz_CardSyncTransfer(((dirPath[2] - '0') << 4) | (dirPath[3] - '0'));
+    }
     return my_firstfile(dirPath, firstEntry);
 }
 

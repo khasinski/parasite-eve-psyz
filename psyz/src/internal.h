@@ -77,9 +77,21 @@ int Psyz_AudioWaitUs(uint64_t us);
 // A blank that came due during such a wait (offline clock, SDL platform):
 // counts it in VSync(-1) and runs its VSync work (Psyz_VSyncBlank).
 void Psyz_VideoWaitBlank(void);
+// The CRTC's vertical display range [y1, y2) became [new_y1, new_y2): moves
+// the next blank of the offline clock (sdl3_audio.c).
+void Psyz_AudioDisplayRangeChanged(
+    unsigned y1, unsigned y2, unsigned new_y1, unsigned new_y2);
+// A GPU reset (GP1(00h)): the CRTC's display range returns to its default.
+void Psyz_GpuCrtcReset(void);
 // The work of one blank (libapi.c): pad refresh, the VSync hook, the
 // vblank interrupt.
 void Psyz_VSyncBlank(void);
+
+// The BIOS memory card driver's work at a vblank (libcard.c).
+void Psyz_CardVBlank(void);
+// A BIOS file service that reads a card sector itself and waits for it
+// without raising events (firstfile reads sector 0).
+void Psyz_CardSyncTransfer(long chan);
 
 // Services due timers when the host has no thread to run them.
 void Psyz_KernelPoll(void);

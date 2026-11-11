@@ -181,12 +181,64 @@ void _spu_FiDMA(void) {
 INCLUDE_ASM("asm/nonmatchings/libspu/spu", _spu_Fr_);
 
 #ifdef __psyz
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 void Psyz_KernelRaise(unsigned int desc, unsigned int spec);
+uint64_t Psyz_KernelNowUs(void);
+void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void));
+void Psyz_SpendTime(unsigned ns);
 void _spu_DmaDone(void) {
     if (_spu_transferCallback) {
         _spu_transferCallback();
     } else {
         Psyz_KernelRaise(HwSPU, EvSpCOMP);
+    }
+}
+
+/* SPU RAM DMA takes its PS1 time: the SPU moves a halfword per 16 system
+ * clocks (DuckStation spu.cpp TRANSFER_TICKS_PER_HALFWORD), so a 276 KiB
+ * sound bank takes over three fields. The data lands in SPU RAM at once;
+ * the end of the transfer (callback, HwSPU/EvSpCOMP, SpuIsTransferCompleted)
+ * comes when the DMA would have finished, on the emulated clock.
+ * PSYZ_SPU_TIMING=instant ends transfers at once. */
+static volatile int spu_dma_busy;
+
+static int spu_dma_instant(void) {
+    static int instant = -1;
+    if (instant < 0) {
+        const char* timing = getenv("PSYZ_SPU_TIMING");
+        instant = timing && !strcmp(timing, "instant");
+    }
+    return instant;
+}
+
+static void spu_dma_end(void) {
+    if (!spu_dma_busy) {
+        return;
+    }
+    spu_dma_busy = 0;
+    _spu_DmaDone();
+}
+
+static void spu_dma_start(unsigned size) {
+    if (spu_dma_busy) {
+        spu_dma_end(); // a new transfer starts after the previous one
+    }
+    if (spu_dma_instant()) {
+        _spu_DmaDone();
+        return;
+    }
+    spu_dma_busy = 1;
+    uint64_t us = ((uint64_t)size * 8 * 1000000 + 33868800 / 2) / 33868800;
+    Psyz_KernelPostAt(Psyz_KernelNowUs() + us, spu_dma_end);
+}
+
+int Psyz_SpuDmaBusy(void) { return spu_dma_busy; }
+
+void Psyz_SpuDmaWait(void) {
+    while (spu_dma_busy) {
+        Psyz_SpendTime(64000);
     }
 }
 #endif
@@ -279,7 +331,7 @@ unsigned _spu_Fw(unsigned char* addr, unsigned size) {
 #ifdef __psyz
     SPUW(trans_addr, _spu_tsa);
     Psyz_SpuMemWrite(_spu_tsa << _spu_mem_mode_plus, addr, size);
-    _spu_DmaDone();
+    spu_dma_start(size);
 #else
     _spu_t(2, _spu_tsa << _spu_mem_mode_plus);
     _spu_t(1);
@@ -292,7 +344,7 @@ unsigned _spu_Fr(unsigned char* addr, unsigned size) {
 #ifdef __psyz
     SPUW(trans_addr, _spu_tsa);
     Psyz_SpuMemRead(_spu_tsa << _spu_mem_mode_plus, addr, size);
-    _spu_DmaDone();
+    spu_dma_start(size);
 #else
     _spu_t(2, _spu_tsa << _spu_mem_mode_plus);
     _spu_t(0);

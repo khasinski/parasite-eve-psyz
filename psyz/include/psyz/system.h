@@ -181,13 +181,33 @@ void Psyz_CardFileTransfer(long bytes, int async);
 void Psyz_CardFileCreate(void);
 
 /**
- * @brief Complete memory card file I/O at once
+ * @brief Complete memory card requests and file I/O at once
  *
+ * By default the BIOS card driver serves the two ports on alternate
+ * vblanks, a sector transfer per turn, and an empty port times out a vblank
+ * later (_card_info, _card_load, _card_read/_card_write, _bu_init).
  * PSYZ_CARD_TIMING=instant does the same.
  *
  * @param instant Non-zero for instant transfers
  */
 void Psyz_CardSetInstantTiming(int instant);
+
+/**
+ * @brief Start a raw command on memory card channel `chan`
+ *
+ * For a host-side library that talks to the card port itself (libmcx):
+ * the card driver transfers it on that port's next vblank and it is
+ * answered at the vblank after. Returns 0 while a command is in progress.
+ */
+int Psyz_CardRawBegin(long chan);
+
+/**
+ * @brief Poll (wait = 0) or wait for the raw command
+ *
+ * @return 1 once answered (the command is then finished), 0 while it runs,
+ *         -1 when none was started
+ */
+int Psyz_CardRawSync(int wait);
 
 /** Memory card slot states (Psyz_CardSlotState). */
 enum { PSYZ_CARD_NONE, PSYZ_CARD_FORMATTED, PSYZ_CARD_UNFORMATTED };
