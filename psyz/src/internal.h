@@ -4,6 +4,8 @@
 #ifndef PSYZ_INTERNAL_H
 #define PSYZ_INTERNAL_H
 
+#include <stdint.h>
+
 #define INCLUDE_ASM(path, func)
 #define WEAK_INCLUDE_ASM(path, func)
 #define NOP
@@ -26,6 +28,9 @@
 // SDL platform lifecycle code uses this to avoid undoing an explicit game
 // audio pause when the application returns from the background.
 int Psyz_AudioIsPaused(void);
+
+// Emulated time (us) shared by the root counters and the CD drive.
+uint64_t Psyz_KernelNowUs(void);
 
 // Offline sample clock and root-counter deadlines; no host-time advancement.
 unsigned Psyz_KernelAudioBatch(unsigned maximum);
@@ -52,6 +57,14 @@ void Psyz_KernelVBlank(void);
 
 // Delivers the sectors a callback-driven CD read has reached (libcd.c).
 void Psyz_CdServiceDrive(void);
+// The same for a game polling the drive in a busy wait: on the offline clock
+// a poll that finds no new sector waits for the next one.
+void Psyz_CdPollDrive(void);
+
+// Offline clock only: mixes `us` of emulated time without a VBlank, for a
+// native busy wait on a device that runs on that clock. Returns 0 (and does
+// nothing) on a real-time clock, where the time passes by itself.
+int Psyz_AudioWaitUs(uint64_t us);
 
 // Services due timers when the host has no thread to run them.
 void Psyz_KernelPoll(void);

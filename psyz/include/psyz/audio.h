@@ -30,7 +30,8 @@ void Psyz_AudioSetCaptureCallback(PsyzAudioCaptureCallback callback,
  *
  * Opens the host audio device and the SPU mixer. Idempotent.
  * With PSYZ_AUDIO_CLOCK=video, opens no device and advances the mixer once
- * per blocking SDL video VSync instead (NTSC 60000/1001 Hz or PAL 50 Hz).
+ * per blocking SDL video VSync instead (one PS1 field: NTSC 59.817 Hz or PAL
+ * 49.747 Hz).
  * Pause also suspends this offline clock; direct sample pulls remain available.
  *
  * @return 0 on success, -1 on failure
@@ -46,7 +47,7 @@ void Psyz_AudioDestroy(void);
 
 /**
  * Advance offline playback toward the next emulated timer edge while a native
- * synchronous I/O routine waits for its timer handler (at most 883 frames per
+ * synchronous I/O routine waits for its timer handler (at most 887 frames per
  * call). Does not advance VBlank.
  * Returns 1 when the video-clock backend generated samples, otherwise 0:
  * real-time backends already run independently and the caller should poll/wait

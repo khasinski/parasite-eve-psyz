@@ -85,8 +85,8 @@ static inline void AtomicAdd(AtomicWord* p, long v) {
 
 #define SYSTEM_CLOCK_HZ 33868800
 #define DOT_CLOCK_HZ 6711647 // GPU clock / 8, the 320 pixel wide modes
-#define HBLANK_NTSC_HZ 15734
-#define HBLANK_PAL_HZ 15625
+#define HBLANK_NTSC_HZ 15732 // GPU clock / 3413 (NTSC) or / 3406 (PAL)
+#define HBLANK_PAL_HZ 15620
 #define MIN_PERIOD_US 32      // faster timers would only spin the host
 #define MAX_CATCHUP_US 200000 // ticks owed past a longer host stall are lost
 
@@ -191,6 +191,11 @@ static uint64_t KernelNowUs(void) {
     return Psyz_OsNowUs() * (uint64_t)AtomicLoad(&host_clock_speed) -
            AtomicTimeLoad(&host_clock_offset_us);
 }
+
+/* Emulated time for devices that run on their own clock (the CD drive): the
+ * offline sample clock, or the host clock without pauses and at game speed,
+ * like the root counters. */
+uint64_t Psyz_KernelNowUs(void) { return KernelNowUs(); }
 
 static void KernelInit(void) {
     if (kernel_lock) {

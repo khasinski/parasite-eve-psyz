@@ -1771,7 +1771,7 @@ ZTEST(spu_malloc, SpuMallocWithStartAddrSplitsFreeBlock) {
 extern void Sdl3Audio_VBlank(bool pal);
 
 typedef struct {
-    short samples[4414 * 2];
+    short samples[4423 * 2];
     unsigned frames, calls;
     bool overflow;
 } AudioCaptureProof;
@@ -1780,7 +1780,7 @@ static void capture_playback_pcm(
     const short* samples, int frames, void* userdata) {
     AudioCaptureProof* proof = userdata;
     ++proof->calls;
-    if (frames <= 0 || (unsigned)frames > 4414 - proof->frames) {
+    if (frames <= 0 || (unsigned)frames > 4423 - proof->frames) {
         proof->overflow = true;
         return;
     }
@@ -1971,14 +1971,14 @@ ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
         1, SDL_SetEnvironmentVariable(
                SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true));
     zassert_s32_eq(0, Psyz_AudioInit());
-    static short expected[4414 * 2], expected_tail[96 * 2], tail[96 * 2];
+    static short expected[4423 * 2], expected_tail[96 * 2], tail[96 * 2];
     static AudioCaptureProof proof;
     memset(&proof, 0, sizeof(proof));
     capture_test_voice();
-    Psyz_SpuPullSamples(expected, 4414);
+    Psyz_SpuPullSamples(expected, 4423);
     Psyz_SpuPullSamples(expected_tail, 96);
     unsigned nonzero = 0;
-    for (unsigned i = 0; i < 4414 * 2; ++i)
+    for (unsigned i = 0; i < 4423 * 2; ++i)
         if (expected[i])
             ++nonzero;
     zassert_s32_eq(1, nonzero > 0);
@@ -1991,7 +1991,7 @@ ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
     for (unsigned i = 0; i < 6; ++i)
         Sdl3Audio_VBlank(false);
     zassert_u32_eq(6, proof.calls);
-    zassert_u32_eq(4414, proof.frames);
+    zassert_u32_eq(4423, proof.frames);
     zassert_s32_eq(0, proof.overflow);
     zassert_s32_eq(0, memcmp(expected, proof.samples, sizeof(expected)));
     Psyz_AudioPause();
@@ -2020,6 +2020,42 @@ ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
 #endif
 }
 
+/* A field is 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks: 49.747 and
+ * 59.817 Hz of 44100 Hz audio, not 50 and 59.94 Hz. */
+ZTEST(audio_capture, video_clock_fields_last_as_long_as_on_hardware) {
+    zskip_targets("ps1;psp");
+#if defined(__psyz) && !defined(__PSP__)
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    char* saved = clock ? SDL_strdup(clock) : NULL;
+    Psyz_AudioDestroy();
+    SDL_SetEnvironmentVariable(
+        SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true);
+    zassert_s32_eq(0, Psyz_AudioInit());
+    SDL_AtomicInt rendered = {0};
+    Psyz_AudioSetCaptureCallback(count_concurrent_pcm, &rendered);
+    Sdl3Audio_VBlank(true);
+    zassert_s32_eq(886, SDL_GetAtomicInt(&rendered));
+    for (unsigned i = 1; i < 1000; ++i)
+        Sdl3Audio_VBlank(true);
+    // 1000 * 1069484 * 588 / 709379 = 886488.9
+    zassert_s32_eq(886488, SDL_GetAtomicInt(&rendered));
+    SDL_SetAtomicInt(&rendered, 0);
+    for (unsigned i = 0; i < 1000; ++i)
+        Sdl3Audio_VBlank(false);
+    // a change of standard drops the fraction: 1000 * 897619 * 588 / 715909
+    zassert_s32_eq(737244, SDL_GetAtomicInt(&rendered));
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    Psyz_AudioDestroy();
+    if (saved) {
+        SDL_SetEnvironmentVariable(
+            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
+        SDL_free(saved);
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    zassert_s32_eq(0, Psyz_AudioInit());
+#endif
+}
+
 ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
@@ -2030,11 +2066,11 @@ ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
     zassert_s32_eq(0, Psyz_AudioInit());
     Psyz_AudioPause();
     Psyz_AudioLock();
-    static short expected[4414 * 2];
+    static short expected[4423 * 2];
     static AudioCaptureProof proof;
     memset(&proof, 0, sizeof(proof));
     capture_test_voice();
-    Psyz_SpuPullSamples(expected, 4414);
+    Psyz_SpuPullSamples(expected, 4423);
     capture_test_voice();
     Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
     Psyz_AudioUnlock();
@@ -2049,7 +2085,7 @@ ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
     }
     Psyz_AudioSetCaptureCallback(NULL, NULL);
     zassert_s32_eq(1, proof.frames > 0);
-    zassert_s32_eq(1, proof.frames <= 4414);
+    zassert_s32_eq(1, proof.frames <= 4423);
     zassert_s32_eq(0, memcmp(expected, proof.samples,
                              (size_t)proof.frames * 2 * sizeof(short)));
     unsigned calls = proof.calls;
@@ -2125,11 +2161,11 @@ ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
         zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
     Psyz_AudioDestroy();
     zassert_s32_eq(0, Psyz_AudioInit());
-    static short expected[4414 * 2];
+    static short expected[4423 * 2];
     static AudioCaptureProof proof;
     memset(&proof, 0, sizeof(proof));
     capture_test_voice();
-    Psyz_SpuPullSamples(expected, 4414);
+    Psyz_SpuPullSamples(expected, 4423);
     capture_test_voice();
     offline_timer_ticks = 0;
     offline_timer_mutes = true;
@@ -2147,9 +2183,9 @@ ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
     CloseEvent(event);
     offline_timer_mutes = false;
     zassert_u32_eq(24, offline_timer_ticks);
-    zassert_u32_eq(4414, proof.frames);
+    zassert_u32_eq(4423, proof.frames);
     zassert_s32_eq(0, proof.overflow);
-    for (unsigned frame = 0; frame < 4414; ++frame) {
+    for (unsigned frame = 0; frame < 4423; ++frame) {
         bool muted = ((frame * 4 / 735) & 1) != 0;
         for (unsigned ch = 0; ch < 2; ++ch)
             zassert_s32_eq(muted ? 0 : expected[frame * 2 + ch],

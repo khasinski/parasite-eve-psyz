@@ -6,7 +6,7 @@ u_long StGetNext(u_long** addr, u_long** header) {
     volatile StHEADER* ptr;
 #ifdef __psyz
     // The drive keeps filling the ring while the caller polls for a frame.
-    Psyz_CdServiceDrive();
+    Psyz_CdPollDrive();
 #endif
     ptr = &StRingAddr[StRingIdx3];
     if (ptr->id == 1) {

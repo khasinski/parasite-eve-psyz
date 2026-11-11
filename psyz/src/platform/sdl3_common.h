@@ -50,8 +50,13 @@ static unsigned char* Sdl3Common_ReadRgb24(int x, int y, int w, int h) {
     return rgb;
 }
 
-#define VSYNC_NTSC 59.94
-#define VSYNC_PAL 50.0
+/* PS1 field rates: 263 lines of 3413 GPU clocks (NTSC) and 314 lines of 3406
+ * (PAL), the GPU clock being the 33.8688 MHz system clock * 715909/451584
+ * (NTSC) or * 709379/451584 (PAL). About 59.817 and 49.747 Hz, not the 59.94
+ * and 50 Hz of broadcast video: frame-counted game time keeps the original
+ * relation to the root counters and the 44100 Hz SPU (music, sequencer). */
+#define VSYNC_NTSC (33868800.0 * 715909 / (451584.0 * 3413 * 263))
+#define VSYNC_PAL (33868800.0 * 709379 / (451584.0 * 3406 * 314))
 
 // hooks the including renderer backend must implement
 static bool PlatformBackend_SetDriverVsync(bool enable);
@@ -561,8 +566,8 @@ int Psyz_VideoVSync(int mode) {
             return (int)(unsigned short)++limitless_lines;
         /* A game that waits on VSync(1) past the end of a field (e.g. a
          * 384-line threshold for a 2-field frame) misses that blank. */
-        blanks += limitless_lines / (is_pal ? 313u : 263u);
-        limitless_vblank_base += limitless_lines / (is_pal ? 313u : 263u);
+        blanks += limitless_lines / (is_pal ? 314u : 263u);
+        limitless_vblank_base += limitless_lines / (is_pal ? 314u : 263u);
         ret = (unsigned short)limitless_lines;
         limitless_lines = 0;
     } else {

@@ -1063,11 +1063,16 @@ static struct {
 
 /* Callback-driven reads (a CdReadyCallback installed during CdlReadN/ReadS,
  * as CdRead2 streaming does): the drive delivers sectors at its rate, 75 or
- * 150 per second, measured on the host clock from the read command. Each one
+ * 150 per second, measured on the emulated clock (Psyz_KernelNowUs: the
+ * root counters' time, which follows the offline sample clock, pauses and
+ * game speed) from the read command, so the data sectors stay in step with
+ * the XA audio the mixer plays from the same stream. Each one
  * raises DataReady on the ready callback, which fetches it with
  * CdGetSector; a sector it does not take is lost, as on hardware. Sectors
  * are delivered when the game services the drive: every VSync and while it
- * polls the stream ring (StGetNext), so a busy wait sees them arrive. */
+ * polls the stream ring (StGetNext), so a busy wait sees them arrive. On
+ * the offline clock no time passes while the game spins, so such a poll
+ * that finds nothing new waits for the drive's next sector itself. */
 #define DRIVE_MAX_BURST 600 // sectors; older ones of a long stall are skipped
 static uint64_t drive_start_us;
 static uint64_t drive_delivered;
@@ -1080,7 +1085,7 @@ static void start_data_read(void) {
     data_sector_valid = 0;
     data_getsector_count = 0;
     data_read_active = 1;
-    drive_start_us = Psyz_OsNowUs();
+    drive_start_us = Psyz_KernelNowUs();
     drive_delivered = 0;
     drive_generation++;
     memset(&st_frame, 0, sizeof(st_frame));
@@ -1124,7 +1129,7 @@ void Psyz_CdServiceDrive(void) {
     }
     drive_servicing = 1;
     uint64_t rate = (CD_mode & CdlModeSpeed) ? 150 : 75;
-    uint64_t due = (Psyz_OsNowUs() - drive_start_us) * rate / 1000000;
+    uint64_t due = (Psyz_KernelNowUs() - drive_start_us) * rate / 1000000;
     if (due > drive_delivered + DRIVE_MAX_BURST) {
         uint64_t skipped = due - drive_delivered - DRIVE_MAX_BURST;
         data_sector_number += (int)skipped;
@@ -1138,6 +1143,22 @@ void Psyz_CdServiceDrive(void) {
         }
     }
     drive_servicing = 0;
+}
+
+void Psyz_CdPollDrive(void) {
+    uint64_t delivered = drive_delivered;
+    Psyz_CdServiceDrive();
+    if (!data_read_active || !CD_cbready || drive_servicing ||
+        drive_delivered != delivered) {
+        return;
+    }
+    uint64_t rate = (CD_mode & CdlModeSpeed) ? 150 : 75;
+    uint64_t next_us =
+        drive_start_us + ((drive_delivered + 1) * 1000000 + rate - 1) / rate;
+    uint64_t now = Psyz_KernelNowUs();
+    if (next_us > now && Psyz_AudioWaitUs(next_us - now)) {
+        Psyz_CdServiceDrive();
+    }
 }
 
 /* StCdInterrupt: the ready-callback half of LIBCD streaming. It moves the
