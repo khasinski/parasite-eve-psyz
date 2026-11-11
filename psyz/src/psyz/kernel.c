@@ -197,6 +197,31 @@ static uint64_t KernelNowUs(void) {
  * like the root counters. */
 uint64_t Psyz_KernelNowUs(void) { return KernelNowUs(); }
 
+int Psyz_KernelOfflineClock(void) { return UsesAudioClock(); }
+
+static uint64_t spend_carry_ns;
+static uint64_t spend_deadline_ns;
+void Psyz_SpendTime(unsigned ns) {
+    if (UsesAudioClock()) {
+        spend_carry_ns += ns;
+        if (spend_carry_ns >= 1000) {
+            uint64_t us = spend_carry_ns / 1000;
+            spend_carry_ns %= 1000;
+            Psyz_AudioWaitUs(us);
+        }
+        return;
+    }
+    // A deadline already passed (other work ran since) restarts from now.
+    uint64_t now_ns = KernelNowUs() * 1000;
+    if (spend_deadline_ns < now_ns || spend_deadline_ns > now_ns + 1000000000) {
+        spend_deadline_ns = now_ns;
+    }
+    spend_deadline_ns += ns;
+    while (KernelNowUs() * 1000 < spend_deadline_ns) {
+        Psyz_KernelPoll();
+    }
+}
+
 static void KernelInit(void) {
     if (kernel_lock) {
         return;
@@ -545,6 +570,69 @@ static void CounterRestart(RootCounter* c, uint64_t now_us) {
     c->frac_acc = 0;
 }
 
+/* One-shot device completions on the emulated clock (an MDEC transfer),
+ * fired as interrupts once their time comes, like the root counters. */
+#define TIMED_MAX 8
+static struct {
+    uint64_t at_us;
+    void (*fn)(void);
+} timed[TIMED_MAX];
+static int timed_len;
+
+static void StartIrqThread(void);
+void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void)) {
+    StartIrqThread();
+    KernelLock();
+    if (timed_len < TIMED_MAX) {
+        timed[timed_len].at_us = at_us;
+        timed[timed_len].fn = fn;
+        timed_len++;
+        uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
+        if (at_us < deadline) {
+            AtomicTimeStore(&poll_deadline_us, at_us);
+        }
+    } else {
+        WARNF("dropped a timed interrupt");
+    }
+    KernelUnlock();
+    Psyz_OsBellRing(bell_irq);
+}
+
+void Psyz_KernelCancel(void (*fn)(void)) {
+    KernelLock();
+    for (int i = 0; i < timed_len;) {
+        if (timed[i].fn == fn) {
+            timed[i] = timed[--timed_len];
+        } else {
+            i++;
+        }
+    }
+    KernelUnlock();
+}
+
+// Fires the due one-shot completions, earliest first; returns 1 with the
+// next one's time in *next_us when some remain.
+static int ServiceTimed(uint64_t now, uint64_t* next_us) {
+    for (;;) {
+        int first = -1;
+        for (int i = 0; i < timed_len; i++) {
+            if (first < 0 || timed[i].at_us < timed[first].at_us) {
+                first = i;
+            }
+        }
+        if (first < 0) {
+            return 0;
+        }
+        if (!IsDue(timed[first].at_us, now) || in_critical_section) {
+            *next_us = timed[first].at_us;
+            return 1;
+        }
+        void (*fn)(void) = timed[first].fn;
+        timed[first] = timed[--timed_len];
+        fn();
+    }
+}
+
 // Fires every timer interrupt that came due. Returns 0 when no timer is
 // triggered, otherwise 1 with the earliest deadline in *deadline_us.
 static int ServiceTimers(uint64_t* deadline_us) {
@@ -573,6 +661,12 @@ static int ServiceTimers(uint64_t* deadline_us) {
             *deadline_us = c->next_us;
             triggered = 1;
         }
+    }
+    uint64_t timed_next;
+    if (ServiceTimed(now, &timed_next) &&
+        (!triggered || timed_next < *deadline_us)) {
+        *deadline_us = timed_next;
+        triggered = 1;
     }
     in_interrupt = 0;
     AtomicTimeStore(

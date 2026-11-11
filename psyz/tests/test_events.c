@@ -22,6 +22,10 @@ int Psyz_OsThreadStart(void (*fn)(void), const char* name) {
     (void)name;
     return -1;
 }
+int Psyz_AudioWaitUs(uint64_t us) {
+    (void)us;
+    return 0;
+}
 void psyz_log(unsigned level, const char* file, unsigned line, const char* func,
               const char* fmt, ...) {
     (void)level;

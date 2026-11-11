@@ -34,6 +34,11 @@ static SDL_Mutex* mutex;
 static bool video_clock, video_paused;
 static unsigned video_remainder;
 static bool video_pal;
+/* Offline clock: samples left in the current field, until the next blank. A
+ * native busy wait (Psyz_AudioWaitUs) spends part of a field, or crosses
+ * blanks; VSync(0) then mixes only the rest of the field. */
+static unsigned field_frames_left;
+static unsigned wait_fraction; // carried sub-sample part of waited time
 
 static PsyzAudioCaptureCallback capture_callback;
 static void* capture_userdata;
@@ -86,6 +91,8 @@ int Psyz_AudioInit(void) {
         video_paused = false;
         video_remainder = 0;
         video_pal = false;
+        field_frames_left = 0;
+        wait_fraction = 0;
         is_audio_init = true;
         return 0;
     }
@@ -185,15 +192,21 @@ int Psyz_AudioIsPaused(void) {
 #define FIELD_DIVISOR_PAL 709379u
 #define FIELD_FRAMES_MAX 887 // a PAL field, rounded up
 
+/* Device interrupts fire while samples are mixed (Psyz_KernelAdvanceAudio);
+ * a wait inside one spends no further time. */
+static int mixing;
+
 static void MixOfflineFrames(unsigned frames) {
     short samples[2 * FIELD_FRAMES_MAX];
     unsigned offset = 0;
+    mixing++;
     while (offset < frames) {
         unsigned batch = Psyz_KernelAudioBatch(frames - offset);
         Psyz_SpuPullSamples(samples + offset * 2, (int)batch);
         Psyz_KernelAdvanceAudio(batch);
         offset += batch;
     }
+    mixing--;
     if (capture_callback)
         capture_callback(samples, (int)frames, capture_userdata);
 }
@@ -207,24 +220,8 @@ int Psyz_AudioWaitForTimer(void) {
     return 1;
 }
 
-int Psyz_AudioWaitUs(uint64_t us) {
-    if (!is_audio_init || !video_clock || video_paused)
-        return 0;
-    uint64_t frames = (us * PSYZ_SPU_SAMPLE_RATE + 999999) / 1000000;
-    SDL_LockMutex(mutex);
-    while (frames) {
-        unsigned batch = frames < FIELD_FRAMES_MAX ? (unsigned)frames
-                                                   : FIELD_FRAMES_MAX;
-        MixOfflineFrames(batch);
-        frames -= batch;
-    }
-    SDL_UnlockMutex(mutex);
-    return 1;
-}
-
-void Sdl3Audio_VBlank(bool pal) {
-    if (!is_audio_init || !video_clock || video_paused)
-        return;
+/* Length of the next field in samples, the fraction carried. */
+static unsigned NextFieldFrames(bool pal) {
     if (pal != video_pal)
         video_remainder = 0;
     video_pal = pal;
@@ -232,9 +229,61 @@ void Sdl3Audio_VBlank(bool pal) {
     video_remainder += pal ? FIELD_SAMPLES_PAL : FIELD_SAMPLES_NTSC;
     unsigned frames = video_remainder / divisor;
     video_remainder %= divisor;
+    return frames;
+}
+
+/* A native busy wait spends emulated time as a PS1 spinning on a device
+ * would: blanks it crosses happen during the wait (Psyz_VideoWaitBlank:
+ * counter, VSync interrupt), so the field count stays on the same clock as
+ * the root counters, the CD drive and the mixed audio. */
+/* The offline clock runs from the first blank, not only once the game
+ * initialises sound: root counters and the CD drive use it from boot. */
+static void StartOfflineClock(void) {
+    if (!is_audio_init && Psyz_KernelOfflineClock())
+        Psyz_AudioInit();
+}
+
+int Psyz_AudioWaitUs(uint64_t us) {
+    StartOfflineClock();
+    if (!is_audio_init || !video_clock || video_paused)
+        return 0;
+    if (mixing)
+        return 1;
+    uint64_t scaled = us * PSYZ_SPU_SAMPLE_RATE + wait_fraction;
+    uint64_t frames = scaled / 1000000;
+    wait_fraction = (unsigned)(scaled % 1000000);
+    while (frames) {
+        if (!field_frames_left)
+            field_frames_left = NextFieldFrames(video_pal);
+        unsigned batch = field_frames_left;
+        if (batch > FIELD_FRAMES_MAX)
+            batch = FIELD_FRAMES_MAX;
+        if (batch > frames)
+            batch = (unsigned)frames;
+        SDL_LockMutex(mutex);
+        MixOfflineFrames(batch);
+        SDL_UnlockMutex(mutex);
+        frames -= batch;
+        field_frames_left -= batch;
+        if (!field_frames_left) {
+            field_frames_left = NextFieldFrames(video_pal);
+            Psyz_VideoWaitBlank();
+        }
+    }
+    return 1;
+}
+
+/* A blank VSync(0) waited for: the rest of the current field. */
+void Sdl3Audio_VBlank(bool pal) {
+    StartOfflineClock();
+    if (!is_audio_init || !video_clock || video_paused)
+        return;
+    if (!field_frames_left || pal != video_pal)
+        field_frames_left = NextFieldFrames(pal);
     SDL_LockMutex(mutex);
-    MixOfflineFrames(frames);
+    MixOfflineFrames(field_frames_left);
     SDL_UnlockMutex(mutex);
+    field_frames_left = 0;
 }
 
 #if PE_NATIVE_STATE_CPU_COMPONENTS
@@ -251,5 +300,5 @@ static void state_audio_clock_put(unsigned char *p,uint32_t v){for(unsigned i=0;
 static uint32_t state_audio_clock_get(const unsigned char *p){return(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 int Psyz_StateAudioClockCapture(unsigned char *out,size_t n){if(!out||n!=20||!Psyz_StateAudioOwned())return 0;memcpy(out,"PEAUDCLK",8);state_audio_clock_put(out+8,video_clock);state_audio_clock_put(out+12,video_pal);state_audio_clock_put(out+16,video_remainder);return 1;}
 int Psyz_StateAudioClockValidate(const unsigned char *in,size_t n){return in&&n==20&&Psyz_StateAudioOwned()&&!memcmp(in,"PEAUDCLK",8)&&state_audio_clock_get(in+8)==(uint32_t)video_clock&&state_audio_clock_get(in+12)<=1&&state_audio_clock_get(in+16)<(state_audio_clock_get(in+12)?FIELD_DIVISOR_PAL:FIELD_DIVISOR_NTSC);}
-int Psyz_StateAudioClockRestore(const unsigned char *in,size_t n){if(!Psyz_StateAudioClockValidate(in,n))return 0;video_pal=state_audio_clock_get(in+12)!=0;video_remainder=state_audio_clock_get(in+16);return 1;}
+int Psyz_StateAudioClockRestore(const unsigned char *in,size_t n){if(!Psyz_StateAudioClockValidate(in,n))return 0;video_pal=state_audio_clock_get(in+12)!=0;video_remainder=state_audio_clock_get(in+16);field_frames_left=0;wait_fraction=0;return 1;}
 #endif

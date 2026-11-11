@@ -50,6 +50,13 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
     return prev;
 }
 
+void Psyz_VSyncBlank(void) {
+    ReadPadsOnVsync();
+    if (g_PsyzVsyncCb)
+        g_PsyzVsyncCb();
+    Psyz_KernelVBlank();
+}
+
 /* SDK VSync(n) waits for the interval since the previous blocking call,
  * then at least the next blank. Queries do not reset that interval. */
 static unsigned int last_vsync_count;
@@ -72,10 +79,7 @@ int VSync(int mode) {
         now = (unsigned int)Psyz_VideoVSync(-1);
         unsigned int advanced = now - before;
         while (advanced--) {
-            ReadPadsOnVsync();
-            if (g_PsyzVsyncCb)
-                g_PsyzVsyncCb();
-            Psyz_KernelVBlank();
+            Psyz_VSyncBlank();
         }
     } while ((int32_t)(now - target) < 0);
     Psyz_CdServiceDrive();

@@ -1,5 +1,11 @@
 #include <common.h>
 #include <libcd.h>
+#ifdef __psyz
+#include <libetc.h>
+#include "libcd_stream.h"
+int CdGetSector2(void* madr, int size);
+int CdDataSync(int mode);
+#endif
 
 typedef struct {
     int num_sectors;
@@ -13,7 +19,7 @@ typedef struct {
     int pos;
     CdlCB sync_callback;
     CdlCB ready_callback;
-    CdlCB data_callback;
+    void (*data_callback)();
     int read_mode;
     u_char* result;
     int : 32;
@@ -21,6 +27,14 @@ typedef struct {
 
 static CdlCB CD_cbread = NULL;
 static volatile CD_READ_ATTR ReadAttr = {0};
+
+#ifdef __psyz
+// The buffer advances by the 32-bit words of a sector, not host u_longs.
+#define ADVANCE_SECTOR() \
+    (ReadAttr.cur_buf = (u_long*)((char*)ReadAttr.cur_buf + ReadAttr.size * 4))
+#else
+#define ADVANCE_SECTOR() (ReadAttr.cur_buf += ReadAttr.size)
+#endif
 
 void cb_data(void);
 int cd_read_retry(int mode);
@@ -49,7 +63,7 @@ void cb_read(u_char intr, u_char* result) {
                 CdGetSector2(ReadAttr.cur_buf, ReadAttr.size);
             } else {
                 CdGetSector(ReadAttr.cur_buf, ReadAttr.size);
-                ReadAttr.cur_buf += ReadAttr.size;
+                ADVANCE_SECTOR();
                 ReadAttr.remaining--;
                 ReadAttr.pos++;
             }
@@ -80,7 +94,7 @@ void cb_read(u_char intr, u_char* result) {
 }
 
 void cb_data(void) {
-    ReadAttr.cur_buf += ReadAttr.size;
+    ADVANCE_SECTOR();
     ReadAttr.remaining--;
     ReadAttr.pos++;
     if (ReadAttr.remaining == 0) {
@@ -173,7 +187,7 @@ int CdRead(int sectors, u_long* buf, int mode) {
     ReadAttr.sync_callback = CdSyncCallback(NULL);
     ReadAttr.ready_callback = CdReadyCallback(NULL);
     if (ReadAttr.read_mode & 1) {
-        ReadAttr.data_callback = CdDataCallback(NULL);
+        ReadAttr.data_callback = (void (*)())CdDataCallback(NULL);
     }
     ReadAttr.start_time = VSync(-1);
     if (CdStatus() & (CdlStatPlay | CdlStatSeek | CdlStatRead)) {
@@ -186,6 +200,10 @@ int CdReadSync(int mode, u_char* result) {
     int ret;
 
     do {
+#ifdef __psyz
+        // The drive reads on while the caller polls.
+        Psyz_CdPollQuery();
+#endif
         if (VSync(-1) > ReadAttr.start_time + 1200) {
             ret = -1;
         } else if (

@@ -21,8 +21,11 @@ int DsReadyCallback(void (*callback)(u_char, u_char*));
 /* Delivers the sectors the emulated drive has read since the last call to
  * the ready callback (StCdInterrupt while streaming). */
 void Psyz_CdServiceDrive(void);
-/* The same from a busy wait, which on the offline clock waits for the
- * drive's next sector when none is new. */
+/* The same from a StGetNext busy wait, which spends the PS1 time of a poll
+ * of the ring. */
 void Psyz_CdPollDrive(void);
+/* A drive query in a busy loop (CdReadSync): spends its PS1 time and
+ * delivers what the drive has read meanwhile. */
+void Psyz_CdPollQuery(void);
 #endif
 #endif

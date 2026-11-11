@@ -139,6 +139,33 @@ typedef void (*PsyzVSyncCb)(void);
  */
 PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb);
 
+/**
+ * @brief Spend emulated time as the PS1 CPU would on native work
+ *
+ * Native code runs in no emulated time. Where a game's timing depends on
+ * how long the PS1 took for a computation or a busy loop (a frame decoded
+ * in software, a poll loop with a retry count), it can account for that
+ * time here: on the offline clock (PSYZ_AUDIO_CLOCK=video) the time is
+ * mixed, with the blanks it crosses happening meanwhile (VSync callbacks,
+ * the VSync count); on a real-time clock the host waits until that much
+ * time has passed since the previous call's deadline, so a run of short
+ * calls adds up exactly.
+ *
+ * @param ns Nanoseconds of PS1 time
+ */
+void Psyz_SpendTime(unsigned ns);
+
+/**
+ * @brief Complete MDEC output transfers at once
+ *
+ * By default the MDEC takes its PS1 time per macroblock and an output
+ * transfer raises its DMA callback once its data is decoded, on the
+ * emulated clock.
+ *
+ * @param instant Non-zero for instant transfers
+ */
+void Psyz_MdecSetInstantTiming(int instant);
+
 #ifdef __cplusplus
 }
 #endif

@@ -54,6 +54,7 @@ set(PSYZ_SOURCES
     ../decomp/src/libcd/c_008.c
     ../decomp/src/libcd/c_009.c
     ../decomp/src/libcd/c_010.c
+    ../decomp/src/libcd/cdread.c
     ../decomp/src/libcd/cdread2.c
     ../decomp/src/libcd/cdrom.c
     ../decomp/src/libcd/iso9660.c

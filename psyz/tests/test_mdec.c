@@ -242,6 +242,11 @@ ZTEST(mdec, hardware_full_blocks_without_end_codes) {
 #include <libpress.h>
 #include <libetc.h>
 #include "../../decomp/src/libpress/libpress_private.h"
+#include <psyz/system.h>
+
+// These check the decoded data; the decoder's timing is not modelled here.
+ZTEST_SETUP(mdec) { Psyz_MdecSetInstantTiming(1); }
+ZTEST_TEARDOWN(mdec) { Psyz_MdecSetInstantTiming(0); }
 
 static unsigned input_calls, output_calls, callback_depth, maximum_depth;
 static u32 callback_pixels[192];

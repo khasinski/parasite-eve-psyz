@@ -67,6 +67,19 @@ size_t Psyz_CdPullSamples(short* out, size_t num_frames);
  */
 void Psyz_CdSetReadCB(PsyzCdReadCB cb);
 
+/**
+ * @brief Drop the drive's mechanical timing (instant loading)
+ *
+ * By default the emulated drive takes the PS1's time: command
+ * acknowledges, seeks, pauses and 75 or 150 sectors per second. With
+ * instant timing, commands complete at once and plain data reads deliver
+ * as fast as the game polls them; ADPCM (CdlModeRT) streams keep their
+ * rate. The PSYZ_CD_TIMING=instant environment variable sets it as well.
+ *
+ * @param instant Non-zero for instant timing, zero for the PS1's timing
+ */
+void Psyz_CdSetInstantTiming(int instant);
+
 #ifdef __cplusplus
 }
 #endif

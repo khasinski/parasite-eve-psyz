@@ -348,6 +348,160 @@ static int data_sector_valid = 0;
 static int data_sector_number = 0;
 static int data_getsector_count = 0;
 
+/* Drive timing. The controller acknowledges a command after about 0.74 ms;
+ * seeks, pauses, stops and the reset take their mechanical time, and a read
+ * delivers its first sector one sector period after the seek, then one per
+ * period (75 or 150 per second, CdlModeSpeed). The model is DuckStation's
+ * (cdrom.cpp: GetAckDelayForCommand, GetTicksForSeek, GetTicksForPause,
+ * GetTicksForStop, GetTicksForSpeedChange), on the emulated clock
+ * (Psyz_KernelNowUs): CdSync reports CdlNoIntr until the last command has
+ * completed and blocking waits spend that time. Psyz_CdSetInstantTiming(1)
+ * (or PSYZ_CD_TIMING=instant) drops the mechanical delays: commands
+ * complete at once and reads deliver as fast as they are polled. */
+#define DRIVE_CLOCK 33868800ull // system clock ticks per second
+#define DRIVE_ACK_TICKS 25000
+#define DRIVE_INIT_ACK_TICKS 80000
+#define DRIVE_INIT_TICKS 4000000
+static struct {
+    int motor_on;
+    uint64_t done_us;   // the last command completes (CdSync) at this time
+    int sync_cb_due;    // CD_cbsync waits for done_us
+    uint64_t speed_us;  // a speed change in progress ends here
+    int setloc_pending; // a Setloc not yet used by a seek, read or play
+    // Idle head: it holds near hold_lba, its subchannel position cycling
+    // through the track before it (hold_subq at hold_us, one sector per
+    // period). A seek starts from there.
+    int hold_lba, hold_subq, hold_offset;
+    uint64_t hold_us;
+    // A read or play: seeks to read_lba, reaches it at seek_end_us, the
+    // first sector arrives at read_first_us, one per period after it.
+    int read_lba;
+    uint64_t seek_end_us, read_first_us;
+} drive = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static int drive_instant = -1;
+static int drive_init_was_double; // the speed CdInit found
+
+void Psyz_CdSetInstantTiming(int instant) { drive_instant = instant != 0; }
+
+static int drive_is_instant(void) {
+    if (drive_instant < 0) {
+        const char* timing = getenv("PSYZ_CD_TIMING");
+        drive_instant = timing && !strcmp(timing, "instant");
+    }
+    return drive_instant;
+}
+
+static uint64_t ticks_us(uint64_t ticks) {
+    return (ticks * 1000000 + DRIVE_CLOCK / 2) / DRIVE_CLOCK;
+}
+
+static int drive_double_speed(void) { return (CD_mode & CdlModeSpeed) != 0; }
+
+static uint64_t drive_sector_ticks(void) {
+    return DRIVE_CLOCK / (drive_double_speed() ? 150 : 75);
+}
+
+static uint64_t drive_sector_us(void) { return ticks_us(drive_sector_ticks()); }
+
+static uint64_t drive_rate(void) { return drive_double_speed() ? 150 : 75; }
+
+// Sectors per revolution at a position (the 71 minute table).
+static int drive_sectors_per_track(int lba) {
+    static const unsigned char spt_end[][2] = {
+        {0, 8},   {4, 9},   {7, 10},  {11, 11}, {16, 12}, {23, 13},
+        {27, 14}, {32, 15}, {39, 16}, {44, 17}, {52, 18}, {60, 19},
+        {67, 20}, {74, 21}, {255, 22}};
+    int mm = lba > 0 ? lba / (75 * 60) : 0;
+    for (int i = 0; i < LEN(spt_end); i++) {
+        if (mm <= spt_end[i][0]) {
+            return spt_end[i][1];
+        }
+    }
+    return 22;
+}
+
+// Time for the head to reach `to` from `from`, including a spin-up and the
+// rest of a speed change.
+static uint64_t drive_seek_ticks(int from, int to) {
+    uint64_t ticks = 0;
+    if (!drive.motor_on) {
+        ticks += DRIVE_CLOCK; // spin-up, 1 second
+        from = 0;
+    }
+    unsigned diff = (unsigned)(to > from ? to - from : from - to);
+    uint64_t per_sector = drive_sector_ticks();
+    int spt = drive_sectors_per_track(from);
+    int tjump = from >= spt ? from - spt : 0;
+    if (from < to && diff <= (unsigned)spt) {
+        // just ahead: the mech reads on until the sector comes up
+        ticks += per_sector * (diff > 2 ? diff : 2);
+    } else if (from >= to && tjump <= to) {
+        // one track back
+        unsigned n = (unsigned)(to - tjump);
+        ticks += per_sector * (n > 1 ? n : 1);
+    } else if (diff < 7200) {
+        double minutes = (double)from / (75 * 60);
+        minutes = minutes < 1 ? 1 : minutes > 72 ? 72 : minutes;
+        unsigned switch_point = (unsigned)(330.0f + (-63.1333f * logf((float)minutes)));
+        ticks += (uint64_t)((diff < switch_point ? 0.05f : 0.1f) * DRIVE_CLOCK);
+    } else {
+        // sled seek: about 0.2 s, up to 0.9 s across the whole disc
+        const float fixed = 0.05f, variable = 0.9f - fixed, log_weight = 0.4f;
+        const float max_lba = 72.0f * 75 * 60;
+        float seconds = fixed +
+                        variable * (logf((float)diff) / logf(max_lba)) * log_weight +
+                        variable * ((float)diff / max_lba) * (1.0f - log_weight);
+        ticks += (uint64_t)(seconds * DRIVE_CLOCK);
+    }
+    ticks += DRIVE_CLOCK * 3 / 4000; // 0.5-1 ms of servo settling
+    return ticks;
+}
+
+static uint64_t drive_now(void) { return Psyz_KernelNowUs(); }
+
+// Mechanical delays count from the acknowledge.
+static uint64_t drive_ack_us(u_char com) {
+    return ticks_us(com == CdlReset ? DRIVE_INIT_ACK_TICKS : DRIVE_ACK_TICKS);
+}
+
+/* Emulated time spent by a call that polls the drive in a busy loop: the
+ * PS1 time of the call and its loop (Psyz_SpendTime). */
+static void drive_spend_ns(unsigned ns) {
+    if (!drive_is_instant()) {
+        Psyz_SpendTime(ns);
+    }
+}
+
+static void* drive_bell(void) {
+    static void* bell;
+    if (!bell) {
+        bell = Psyz_OsBellCreate();
+    }
+    return bell;
+}
+
+// Blocks until emulated time `until_us`, as a PS1 waiting on the drive.
+static void drive_wait_until(uint64_t until_us) {
+    if (drive_is_instant()) {
+        return;
+    }
+    uint64_t now = drive_now();
+    if (until_us <= now) {
+        return;
+    }
+    if (Psyz_KernelOfflineClock()) {
+        Psyz_AudioWaitUs(until_us - now);
+        return;
+    }
+    while (drive_now() < until_us) {
+        Psyz_KernelPoll();
+        uint64_t left = until_us - drive_now();
+        if (left > 2000) {
+            Psyz_OsBellWait(drive_bell(), (uint32_t)(left - 1000));
+        }
+    }
+}
+
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
 // param = 0x00. Equals the absolute sector where the last track's file ends.
 static int lead_out_sector(void) {
@@ -419,6 +573,16 @@ static size_t cd_buf_pos = 0;   // current read position (in frames)
 static size_t cd_buf_count = 0; // number of valid frames in buffer
 static int is_playing = 0; // pause or unpause seeking through the CD stream
 static int is_muted = 0;   // return empty samples while CD keeps streaming
+// Silence before the drive's audio starts: the seek of a play or XA read.
+static uint64_t cd_delay_frames;
+
+// Emits the silence still due before CD audio starts; returns its frames.
+static size_t cd_pull_delay(short* buf, size_t max_frames) {
+    size_t n = cd_delay_frames < max_frames ? (size_t)cd_delay_frames : max_frames;
+    memset(buf, 0, n * N_CHANNELS * SAMPLE_SIZE);
+    cd_delay_frames -= n;
+    return n;
+}
 
 static void cd_data_end(void) {
     if (CD_cbready) {
@@ -437,6 +601,7 @@ static size_t cdda_pull_samples(short* buf, size_t max_frames) {
     if (!is_playing || !track_file) {
         goto end;
     }
+    written = cd_pull_delay(buf, max_frames);
     while (written < max_frames) {
         // Refill file read buffer if consumed
         if (cd_buf_pos >= cd_buf_count) {
@@ -699,6 +864,10 @@ static size_t xa_pull_samples(short* buf, size_t max_frames) {
     if (!is_playing || (!track_file && !disk_read_cb) || !xa.active) {
         goto end;
     }
+    written = cd_pull_delay(buf, max_frames);
+    if (written == max_frames) {
+        goto end;
+    }
     // Prime Hermite ring on first call so we have y0..y2 valid.
     while (xa.rh_l[3] == 0 && xa.rh_l[2] == 0 && xa.rh_l[1] == 0 &&
            xa.decoded_pos == 0 && xa.decoded_count == 0) {
@@ -850,6 +1019,168 @@ static int read_raw_sector(int sector, u_char* out) {
     return result;
 }
 
+static int read_data_sector_into(int sector, u_char* out);
+static uint64_t drive_start_us; // sector n (from 1) arrives n periods later
+static uint64_t drive_delivered;
+
+/* Drive position and command timing (see "Drive timing" above). */
+static int drive_reading(void) {
+    return data_read_active || xa.active || is_playing;
+}
+
+// Last sector the current read or play has reached by `now`; -1 before
+// its first sector.
+static int drive_read_position(uint64_t now) {
+    if (now < drive.read_first_us) {
+        return -1;
+    }
+    uint64_t n = (now - drive.read_first_us) * drive_rate() / 1000000;
+    return drive.read_lba + (int)n;
+}
+
+static void drive_hold(int lba, int subq, int offset, uint64_t at) {
+    drive.hold_lba = lba;
+    drive.hold_subq = subq < 0 ? 0 : subq;
+    drive.hold_offset = offset;
+    drive.hold_us = at;
+}
+
+// Subchannel position of the idle head at `now`: it jumps back a track
+// whenever it passes the hold position.
+static int drive_hold_subq(uint64_t now) {
+    int spt = drive_sectors_per_track(drive.hold_lba);
+    int hold = drive.hold_lba + drive.hold_offset;
+    int tjump = hold >= spt ? hold - spt : 0;
+    int64_t passed =
+        now > drive.hold_us
+            ? (int64_t)((now - drive.hold_us) * drive_rate() / 1000000)
+            : 0;
+    int64_t offset = (int64_t)(drive.hold_subq - tjump) + passed;
+    offset %= spt;
+    if (offset < 0) {
+        offset += spt;
+    }
+    return tjump + (int)offset;
+}
+
+// Where a seek issued at `now` starts from.
+static int drive_seek_from(uint64_t now) {
+    if (!drive.motor_on) {
+        return 0;
+    }
+    if (now < drive.seek_end_us) {
+        return drive.read_lba; // seeking: from its target
+    }
+    if (drive_reading()) {
+        int lba = drive_read_position(now);
+        return lba < 0 ? drive.read_lba : lba;
+    }
+    return drive_hold_subq(now);
+}
+
+// Moves the head to `to` from the acknowledge at `ack_us`, after a speed
+// change in progress; returns when it arrives.
+static uint64_t drive_seek(uint64_t ack_us, int to) {
+    uint64_t end = ack_us;
+    if (!drive_is_instant()) {
+        end = ack_us > drive.speed_us ? ack_us : drive.speed_us;
+        end += ticks_us(drive_seek_ticks(drive_seek_from(ack_us), to));
+    }
+    drive.motor_on = 1;
+    drive.setloc_pending = 0;
+    drive.read_lba = to;
+    drive.seek_end_us = end;
+    return end;
+}
+
+// A read or play of `to`: the head seeks, the first sector arrives one
+// period after it.
+static void drive_begin_read(uint64_t ack_us, int to) {
+    uint64_t end = drive_seek(ack_us, to);
+    drive.read_first_us = end + (drive_is_instant() ? 0 : drive_sector_us());
+}
+
+// Time a Pause takes from its acknowledge.
+static uint64_t drive_pause_ticks(uint64_t ack_us) {
+    if (!drive_reading()) {
+        return 27000;
+    }
+    int lba = drive_read_position(ack_us);
+    int spt = drive_sectors_per_track(lba < 0 ? drive.read_lba : lba);
+    int64_t per_sector = (int64_t)drive_sector_ticks();
+    int64_t since = 0;
+    if (lba >= 0) {
+        uint64_t last_us = drive.read_first_us +
+                           (uint64_t)(lba - drive.read_lba) * 1000000 / drive_rate();
+        since = (int64_t)((ack_us - last_us) * DRIVE_CLOCK / 1000000);
+    }
+    int64_t reach = (spt - (data_read_active ? 2 : 0)) * per_sector - since;
+    int64_t least = drive_double_speed() ? 1000000 : 2000000;
+    return (uint64_t)(reach > least ? reach : least);
+}
+
+// The head stops reading at `ack_us`: a data read holds a track before the
+// last sector it read.
+static void drive_stop_reading(uint64_t ack_us) {
+    if (!drive_reading()) {
+        return;
+    }
+    int lba = drive_read_position(ack_us);
+    if (lba < 0) {
+        lba = drive.read_lba;
+    }
+    if (data_read_active) {
+        int spt = drive_sectors_per_track(lba);
+        drive_hold(lba, lba >= spt ? lba - spt : 0, 2, ack_us);
+    } else {
+        drive_hold(lba, lba, 0, ack_us);
+    }
+    drive.seek_end_us = 0;
+}
+
+/* The status byte follows the mechanism: Seek until a read or play reaches
+ * its first sector, then Read (data, ADPCM) or Play (CD-DA); Standby while
+ * the motor spins. */
+static void drive_update_status(uint64_t now) {
+    int st = CD_status & ~(CdlStatRead | CdlStatSeek | CdlStatPlay);
+    if (drive.motor_on && !shell_is_open) {
+        st |= CdlStatStandby;
+    }
+    if (drive_reading()) {
+        if (!drive_is_instant() && now < drive.read_first_us) {
+            st |= CdlStatSeek;
+        } else {
+            st |= (is_playing && !xa.active && !data_read_active)
+                      ? CdlStatPlay
+                      : CdlStatRead;
+        }
+    } else if (!drive_is_instant() && now < drive.seek_end_us) {
+        st |= CdlStatSeek;
+    }
+    CD_status = st;
+}
+
+// Output frames of the time from now until `at_us`, at the SPU rate.
+static uint64_t drive_frames_until(uint64_t at_us) {
+    uint64_t now = drive_now();
+    return at_us > now ? (at_us - now) * PSYZ_SPU_SAMPLE_RATE / 1000000 : 0;
+}
+
+// The first XA sector a read from `from` plays, counted from `from`.
+static int xa_first_sector_offset(int from) {
+    u_char sector[SECTOR_SIZE];
+    for (int i = 0; i < XA_MAX_SECTOR_GAP; i++) {
+        if (read_data_sector_into(from + i, sector) < 0) {
+            break;
+        }
+        if ((sector[0x12] & 0x44) == 0x44 &&
+            xa_sector_matches(sector[0x10], sector[0x11])) {
+            return i;
+        }
+    }
+    return 0;
+}
+
 static int need_cdda_rewind = 1;
 // play on CDDA mode only (not XA)
 static void psyz_play() {
@@ -903,6 +1234,7 @@ static void psyz_xa_read(void) {
 static void psyz_stop() {
     need_cdda_rewind = 1;
     Psyz_AudioLock();
+    cd_delay_frames = 0;
     is_playing = 0;
     xa.active = 0;
     Psyz_SpuFlushCdSamples();
@@ -916,6 +1248,7 @@ static void psyz_stop() {
 
 static void psyz_pause() {
     Psyz_AudioLock();
+    cd_delay_frames = 0;
     is_playing = 0;
     xa.active = 0;
     Psyz_SpuFlushCdSamples();
@@ -941,6 +1274,7 @@ static void callback(void) { NOT_IMPLEMENTED; }
 int CD_init(void) {
     u_char nop_result[8];
     CD_com = 0;
+    drive_init_was_double = (CD_mode & CdlModeSpeed) != 0;
     CD_mode = 0;
     CD_cbready = 0;
     CD_cbsync = 0;
@@ -1011,7 +1345,18 @@ int CD_initvol(void) {
     return 0;
 }
 
+/* CdSync: the state of the last command. A poll (mode 1) reports
+ * CdlNoIntr until it completes; mode 0 waits for it. */
 int CD_sync(int mode, u_char* result) {
+    if (mode == 0) {
+        drive_wait_until(drive.done_us);
+        Psyz_CdServiceDrive();
+    } else {
+        Psyz_CdPollQuery();
+        if (!drive_is_instant() && drive_now() < drive.done_us) {
+            return CdlNoIntr;
+        }
+    }
     if (result) {
         // Hand back only what the last command produced; the caller sized its
         // buffer for that command, not for last_result.
@@ -1019,13 +1364,16 @@ int CD_sync(int mode, u_char* result) {
     }
     return last_intr;
 }
-static int read_data_sector(int sector) {
+static int read_data_sector_into(int sector, u_char* out) {
     if (disk_read_cb) {
-        struct PsyzCdRead read = {
-            (unsigned int)sector, SECTOR_SIZE, data_sector};
+        struct PsyzCdRead read = {(unsigned int)sector, SECTOR_SIZE, out};
         return disk_read_cb(&read) < 0 ? -1 : 0;
     }
-    return read_raw_sector(sector, data_sector);
+    return read_raw_sector(sector, out);
+}
+
+static int read_data_sector(int sector) {
+    return read_data_sector_into(sector, data_sector);
 }
 
 // XA audio sectors that the drive plays itself in CdlModeRT never reach
@@ -1037,12 +1385,22 @@ static int is_played_audio_sector(void) {
 // Polled reads (CdReady). A ready callback receives the sectors instead,
 // and polled ADPCM playback (CdlModeRT) keeps this data path idle.
 int CD_ready(int mode, u_char* result) {
-    (void)mode;
     if (!data_read_active || CD_cbready || (CD_mode & CdlModeRT))
         return CdlNoIntr;
     if (!data_sector_valid) {
+        // The next sector arrives one period after the previous one.
+        uint64_t at = drive_start_us +
+                      (drive_delivered + 1) * 1000000 / drive_rate();
+        if (mode == 0) {
+            drive_wait_until(at);
+        } else {
+            Psyz_CdPollQuery();
+            if (!drive_is_instant() && drive_now() < at)
+                return CdlNoIntr;
+        }
         if (read_data_sector(data_sector_number) < 0)
             return CdlDiskError;
+        drive_delivered++;
         data_sector_valid = 1;
         data_getsector_count = 0;
     }
@@ -1061,31 +1419,45 @@ static struct {
     int slot, next, count;
 } st_frame;
 
-/* Callback-driven reads (a CdReadyCallback installed during CdlReadN/ReadS,
- * as CdRead2 streaming does): the drive delivers sectors at its rate, 75 or
- * 150 per second, measured on the emulated clock (Psyz_KernelNowUs: the
- * root counters' time, which follows the offline sample clock, pauses and
- * game speed) from the read command, so the data sectors stay in step with
- * the XA audio the mixer plays from the same stream. Each one
- * raises DataReady on the ready callback, which fetches it with
- * CdGetSector; a sector it does not take is lost, as on hardware. Sectors
- * are delivered when the game services the drive: every VSync and while it
- * polls the stream ring (StGetNext), so a busy wait sees them arrive. On
- * the offline clock no time passes while the game spins, so such a poll
- * that finds nothing new waits for the drive's next sector itself. */
+/* Reads deliver sectors at the drive's rate, 75 or 150 per second, on the
+ * emulated clock (Psyz_KernelNowUs: the root counters' time, which follows
+ * the offline sample clock, pauses and game speed): the first one sector
+ * period after the seek (drive.read_first_us), so the data sectors stay in
+ * step with the XA audio the mixer plays from the same stream. With a
+ * ready callback (CdRead, CdRead2 streaming) each one raises DataReady on
+ * it, which fetches it with CdGetSector; a sector it does not take is
+ * lost, as on hardware. Sectors are delivered when the game services the
+ * drive: every VSync and whenever it polls it (StGetNext, CdReadSync,
+ * CdSync, CdReady), and each poll spends its PS1 time (drive_spend_ns), so
+ * a busy wait sees them arrive as time passes. */
 #define DRIVE_MAX_BURST 600 // sectors; older ones of a long stall are skipped
-static uint64_t drive_start_us;
-static uint64_t drive_delivered;
 static unsigned drive_generation; // counts read commands
 static int drive_servicing;
 static int drive_ready_sector = -1; // sector the ready callback may fetch
+
+/* PS1 time of one poll of the drive in a busy loop: StGetNext and its retry
+ * loop in a movie player (Ridge Racer Type 4 spins 4,000,000 polls on an
+ * empty ring before its first read: 291 fields, 5.85 s, on DuckStation),
+ * and the other drive queries. */
+#define ST_POLL_NS 1462
+#define CD_POLL_NS 2000
+
+// Sectors the current read has reached by `now` (0 while seeking).
+static uint64_t drive_sectors_due(uint64_t now) {
+    if (now < drive_start_us) {
+        return 0;
+    }
+    return (now - drive_start_us) * drive_rate() / 1000000;
+}
 
 static void start_data_read(void) {
     data_sector_number = CdPosToInt(&CD_pos);
     data_sector_valid = 0;
     data_getsector_count = 0;
     data_read_active = 1;
-    drive_start_us = Psyz_KernelNowUs();
+    drive_start_us = drive.read_first_us > drive_sector_us()
+                         ? drive.read_first_us - drive_sector_us()
+                         : 0;
     drive_delivered = 0;
     drive_generation++;
     memset(&st_frame, 0, sizeof(st_frame));
@@ -1123,43 +1495,77 @@ static void deliver_data_sector(void) {
     }
 }
 
+// A command's completion raises CdSyncCallback once its time has come.
+static void service_sync_callback(void) {
+    if (!drive.sync_cb_due || drive_now() < drive.done_us) {
+        return;
+    }
+    drive.sync_cb_due = 0;
+    if (CD_cbsync) {
+        u_char result[8];
+        memcpy(result, last_result, sizeof(result));
+        CD_cbsync((u_char)last_intr, result);
+    }
+}
+
+static void drive_schedule(void);
+
 void Psyz_CdServiceDrive(void) {
-    if (!data_read_active || !CD_cbready || drive_servicing) {
+    if (drive_servicing) {
         return;
     }
     drive_servicing = 1;
-    uint64_t rate = (CD_mode & CdlModeSpeed) ? 150 : 75;
-    uint64_t due = (Psyz_KernelNowUs() - drive_start_us) * rate / 1000000;
-    if (due > drive_delivered + DRIVE_MAX_BURST) {
-        uint64_t skipped = due - drive_delivered - DRIVE_MAX_BURST;
-        data_sector_number += (int)skipped;
-        drive_delivered += skipped;
-    }
-    while (data_read_active && CD_cbready && drive_delivered < due) {
-        unsigned generation = drive_generation;
-        deliver_data_sector();
-        if (generation != drive_generation) {
-            break; // the callback restarted the read
+    drive_update_status(drive_now());
+    service_sync_callback();
+    if (data_read_active && CD_cbready) {
+        uint64_t due = drive_sectors_due(drive_now());
+        if (drive_is_instant() && !(CD_mode & CdlModeRT)) {
+            due = drive_delivered + DRIVE_MAX_BURST; // as fast as polled
+        } else if (due > drive_delivered + DRIVE_MAX_BURST) {
+            uint64_t skipped = due - drive_delivered - DRIVE_MAX_BURST;
+            data_sector_number += (int)skipped;
+            drive_delivered += skipped;
+        }
+        while (data_read_active && CD_cbready && drive_delivered < due) {
+            unsigned generation = drive_generation;
+            deliver_data_sector();
+            if (generation != drive_generation) {
+                break; // the callback restarted the read
+            }
         }
     }
     drive_servicing = 0;
+    drive_schedule();
 }
 
-void Psyz_CdPollDrive(void) {
-    uint64_t delivered = drive_delivered;
-    Psyz_CdServiceDrive();
-    if (!data_read_active || !CD_cbready || drive_servicing ||
-        drive_delivered != delivered) {
-        return;
+/* The drive's interrupts come at their time: the next sector of a read
+ * with a ready callback, a command's completion for CdSyncCallback. */
+static void drive_timer(void) { Psyz_CdServiceDrive(); }
+
+static void drive_schedule(void) {
+    Psyz_KernelCancel(drive_timer);
+    uint64_t next = 0;
+    if (data_read_active && CD_cbready && !drive_is_instant()) {
+        next = drive_start_us +
+               ((drive_delivered + 1) * 1000000 + drive_rate() - 1) / drive_rate();
     }
-    uint64_t rate = (CD_mode & CdlModeSpeed) ? 150 : 75;
-    uint64_t next_us =
-        drive_start_us + ((drive_delivered + 1) * 1000000 + rate - 1) / rate;
-    uint64_t now = Psyz_KernelNowUs();
-    if (next_us > now && Psyz_AudioWaitUs(next_us - now)) {
-        Psyz_CdServiceDrive();
+    if (drive.sync_cb_due && CD_cbsync &&
+        (!next || drive.done_us < next)) {
+        next = drive.done_us;
+    }
+    if (next) {
+        Psyz_KernelPostAt(next, drive_timer);
     }
 }
+
+static void drive_poll(unsigned ns) {
+    drive_spend_ns(ns);
+    Psyz_CdServiceDrive();
+}
+
+void Psyz_CdPollDrive(void) { drive_poll(ST_POLL_NS); }
+
+void Psyz_CdPollQuery(void) { drive_poll(CD_POLL_NS); }
 
 /* StCdInterrupt: the ready-callback half of LIBCD streaming. It moves the
  * current sector into the ring StSetRing installed: StRingSize 32-byte
@@ -1268,10 +1674,39 @@ void StCdInterrupt(void) {
 
 static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3);
 
+/* The acknowledge of the command being issued, which mechanical delays
+ * count from. CD_cw waits for it, as libcd does, unless arg3 asks for no
+ * wait (CdControlF). */
+static uint64_t command_ack_us;
+
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     CD_com = com; // CdLastCom
+    command_ack_us = drive_now();
+    if (!drive_is_instant()) {
+        command_ack_us += drive_ack_us(com);
+    }
+    drive.done_us = command_ack_us;
+    drive.sync_cb_due = 1;
+    drive_update_status(drive_now());
     int ret = CD_command(com, param, result, arg3);
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("PSYZ_CD_TRACE") != NULL;
+    }
+    if (trace) {
+        // emulated time, command, Setloc position, completion, read timing
+        fprintf(stderr,
+                "cd %" PRIu64 " %s pos %d ret %d done %" PRIu64
+                " seek_end %" PRIu64 " first %" PRIu64 "\n",
+                drive_now(), com < LEN(CD_comstr) ? CD_comstr[com] : "?",
+                CdPosToInt(&CD_pos), ret, drive.done_us, drive.seek_end_us,
+                drive.read_first_us);
+    }
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
+    drive_schedule();
+    if (!arg3) {
+        drive_wait_until(command_ack_us);
+    }
     return ret;
 }
 
@@ -1280,7 +1715,7 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
     int t;
     int abs_sector;
 
-    CD_sync(0, 0);
+    uint64_t ack = command_ack_us;
     switch (com) {
     case CdlNop:
         if (shell_is_open) {
@@ -1307,17 +1742,44 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             return -2;
         }
         CD_pos = *(CdlLOC*)param;
+        drive.setloc_pending = 1;
         break;
     case CdlPlay:
-        psyz_play();
+        if (!is_playing || drive.setloc_pending) {
+            int was_playing = is_playing;
+            drive_begin_read(ack, CdPosToInt(&CD_pos));
+            psyz_play();
+            if (is_playing && !was_playing) {
+                Psyz_AudioLock();
+                cd_delay_frames = drive_frames_until(drive.read_first_us);
+                Psyz_AudioUnlock();
+                CD_status |= CdlStatPlay;
+            }
+        }
         break;
     case CdlReadN:
     case CdlReadS:
         // With CdlModeRT the drive plays XA audio sectors itself and hands
         // the remaining (data) sectors to the host, as interleaved movie
         // streams need; without it every sector is data.
+        // Already reading there: the drive carries on.
+        if (data_read_active &&
+            (!drive.setloc_pending ||
+             CdPosToInt(&CD_pos) == drive_read_position(ack) + 1)) {
+            drive.setloc_pending = 0;
+            break;
+        }
+        drive_begin_read(ack, CdPosToInt(&CD_pos));
         if (CD_mode & CdlModeRT) {
+            int first = drive_is_instant()
+                            ? 0
+                            : xa_first_sector_offset(CdPosToInt(&CD_pos));
             psyz_xa_read();
+            Psyz_AudioLock();
+            cd_delay_frames = drive_frames_until(
+                drive.read_first_us +
+                (uint64_t)first * 1000000 / drive_rate());
+            Psyz_AudioUnlock();
         } else {
             Psyz_AudioLock();
             is_playing = 0;
@@ -1335,12 +1797,98 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         xa.filter_file = param[0];
         xa.filter_channel = param[1];
         break;
-    case CdlStop:
+    case CdlStop: {
+        uint64_t ticks = !drive.motor_on      ? 7000
+                         : drive_double_speed() ? 25000000
+                                                : 13000000;
+        drive_stop_reading(ack);
         psyz_stop();
+        drive.motor_on = 0;
+        drive.seek_end_us = 0;
+        CD_status &= ~(CdlStatRead | CdlStatSeek | CdlStatPlay | CdlStatStandby);
+        if (!drive_is_instant()) {
+            drive.done_us = ack + ticks_us(ticks);
+        }
         break;
-    case CdlPause:
+    }
+    case CdlPause: {
+        // The mech rejects a pause before a read or play reaches its first
+        // sector.
+        if (!drive_is_instant() && drive_reading() &&
+            ack < drive.read_first_us) {
+            u_char error[2] = {(u_char)(CD_status | CdlStatError), 0x80};
+            if (result) {
+                memcpy(result, error, sizeof(error));
+            }
+            cache_last_result(error, sizeof(error), CdlDiskError);
+            return -1;
+        }
+        uint64_t ticks = drive_pause_ticks(ack);
+        drive_stop_reading(ack);
         psyz_pause();
+        CD_status &= ~(CdlStatRead | CdlStatSeek | CdlStatPlay);
+        if (!drive_is_instant()) {
+            drive.done_us = ack + ticks_us(ticks);
+        }
         break;
+    }
+    case CdlSeekL:
+    case CdlSeekP: {
+        // The head moves to the Setloc position and holds there; logical
+        // seeks complete on a data header 2 sectors before the target.
+        int target = CdPosToInt(&CD_pos);
+        drive_stop_reading(ack);
+        psyz_pause();
+        CD_status &= ~(CdlStatRead | CdlStatPlay);
+        uint64_t end = drive_seek(ack, target);
+        drive.seek_end_us = end;
+        drive.read_first_us = end;
+        if (com == CdlSeekL) {
+            drive_hold(target, target - 2, 2, end);
+        } else {
+            drive_hold(target, target, 0, end);
+        }
+        drive.done_us = end;
+        break;
+    }
+    case CdlStandby:
+        if (!drive.motor_on && !drive_is_instant()) {
+            drive.done_us = ack + ticks_us(400000);
+            drive.speed_us = ack + ticks_us(DRIVE_CLOCK); // spin-up
+        }
+        drive.motor_on = 1;
+        CD_status |= CdlStatStandby;
+        break;
+    case CdlReset: {
+        // Init: the head returns to the start of the disc, the drive to
+        // single speed. A Setmode while it settles costs no speed change.
+        uint64_t ticks = DRIVE_INIT_TICKS;
+        if (drive.motor_on) {
+            uint64_t seek = drive_init_was_double
+                                ? (uint64_t)(0.7 * DRIVE_CLOCK)
+                                : 0;
+            if (drive_seek_from(ack) != 0) {
+                seek += drive_seek_ticks(drive_seek_from(ack), 0);
+            }
+            ticks = seek > ticks ? seek : ticks;
+        } else {
+            ticks += DRIVE_CLOCK;
+        }
+        drive_init_was_double = 0;
+        drive_stop_reading(ack);
+        psyz_pause();
+        drive.motor_on = 1;
+        drive.seek_end_us = 0;
+        drive.setloc_pending = 0;
+        CD_status &= ~(CdlStatRead | CdlStatSeek | CdlStatPlay);
+        CD_status |= CdlStatStandby;
+        if (!drive_is_instant()) {
+            drive.done_us = ack + ticks_us(ticks);
+        }
+        drive_hold(0, 0, 0, drive.done_us);
+        drive.speed_us = drive.done_us;
+        break;
+    }
     case CdlMute:
         psyz_mute();
         break;
@@ -1373,6 +1921,24 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         // CdlModeSpeed sets the data rate of callback-driven reads. The
         // CdlModeStream bits never reach the drive: CdRead2 keeps them in
         // StMode and installs the stream callbacks.
+        if (((*param ^ CD_mode) & CdlModeSpeed) && drive.motor_on &&
+            !drive_is_instant()) {
+            uint64_t change = ticks_us(
+                (uint64_t)(((*param & CdlModeSpeed) ? 0.6 : 0.7) * DRIVE_CLOCK));
+            if (drive.speed_us > ack) {
+                // a change still in progress is cancelled early on
+                if (drive.speed_us - ack >= change / 4) {
+                    drive.speed_us = 0;
+                }
+            } else if (drive_reading() || ack < drive.seek_end_us) {
+                // the read or seek in progress is delayed by the change
+                drive.seek_end_us += change;
+                drive.read_first_us += change;
+                drive_start_us += change;
+            } else {
+                drive.speed_us = ack + change;
+            }
+        }
         Psyz_AudioLock();
         CD_mode = *param;
         Psyz_AudioUnlock();
@@ -1510,67 +2076,8 @@ int CdReading() {
 
 void ExecCd() { NOT_IMPLEMENTED; }
 
-int CdRead(int sectors, u_long* buf, int mode) {
-    if (sectors <= 0 || open_track_at_cd_pos() != 0) {
-        return 0;
-    }
-
-    int sector_size;
-    switch (mode & (CdlModeSize0 | CdlModeSize1)) {
-    case 0:
-        // Normal sector user data
-        sector_size = 2048;
-        break;
-    case CdlModeSize1:
-        // Full sector except sync header
-        sector_size = 2340;
-        break;
-    default:
-        // Mode 2 form 2 user data
-        sector_size = 2328;
-        break;
-    }
-
-    long sector = CdPosToInt(&CD_pos);
-    Psyz_AudioLock();
-    for (int i = 0; i < sectors; i++) {
-        if (fseek(track_file, (sector + i) * SECTOR_SIZE, SEEK_SET) != 0) {
-            break;
-        }
-        unsigned char sector_raw[SECTOR_SIZE];
-        if (fread(sector_raw, 1, SECTOR_SIZE, track_file) != SECTOR_SIZE) {
-            break;
-        }
-        int user_offset;
-        switch (mode & (CdlModeSize0 | CdlModeSize1)) {
-        case 0:
-            // Skip Mode 1 or 2 header
-            user_offset = (sector_raw[15] == 2) ? 24 : 16;
-            break;
-        case CdlModeSize1:
-            // Skip sync bytes only
-            user_offset = 12;
-            break;
-        default:
-            // Skip Mode 2 header
-            user_offset = 24;
-            break;
-        }
-        memcpy((char*)buf + i * sector_size, sector_raw + user_offset,
-               sector_size);
-    }
-    Psyz_AudioUnlock();
-    return 1;
-}
-
-int CdReadSync(int mode, u_char* result) {
-    (void)mode;
-    if (result) {
-        memcpy(result, last_result, sizeof(last_result));
-    }
-    return 0;
-}
-
+/* CdRead, CdReadSync and CdReadCallback are LIBCD's (decomp cdread.c): a
+ * ready callback that takes each sector the drive delivers. */
 
 #if PE_NATIVE_STATE_CPU_COMPONENTS
 #include "psyz/state_audio.h"

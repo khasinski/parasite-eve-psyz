@@ -14,7 +14,46 @@ static struct {
     size_t capacity, length, cursor;
     u32 command;
     int error;
+    uint64_t start_us; // the decode of the current input began
+    int out_pending;   // an output transfer waits for its macroblocks
+    uint64_t out_us;   // and completes at this time
 } mdec;
+
+/* The decoder takes its PS1 time: a macroblock (a block in the mono
+ * depths) leaves it about every 101 us (DuckStation: 2688 cycles per
+ * macroblock and the DMA; Ridge Racer Type 4's 320x176 frames, 220
+ * macroblocks, take 22.2 ms), so an output transfer completes, and raises
+ * its DMA callback, once the decoder has produced its words.
+ * Psyz_MdecSetInstantTiming(1) completes transfers at once. */
+#define MDEC_UNIT_NS 101000
+static int mdec_instant;
+
+void Psyz_MdecSetInstantTiming(int instant) { mdec_instant = instant != 0; }
+
+static unsigned unit_bytes(void) {
+    switch ((mdec.command >> 27) & 3) {
+    case 0:
+        return 32;
+    case 1:
+        return 64;
+    case 2:
+        return 768;
+    default:
+        return 512;
+    }
+}
+
+static void out_done(void) {
+    mdec.out_pending = 0;
+    Psyz_DmaComplete(1);
+}
+
+static void cancel_out(void) {
+    if (mdec.out_pending) {
+        Psyz_KernelCancel(out_done);
+        mdec.out_pending = 0;
+    }
+}
 
 static const u8 scan[64] = {
     0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
@@ -196,6 +235,7 @@ void MDEC_reset(int mode) {
         mdec.error = -1;
         return;
     }
+    cancel_out();
     mdec.length = mdec.cursor = 0;
     mdec.command = 0;
     mdec.error = 0;
@@ -221,6 +261,7 @@ void MDEC_in(void* buf, int size) {
             break;
         }
         decode(data, data + words * 4);
+        mdec.start_us = Psyz_KernelNowUs();
         break;
     }
     case 2: {
@@ -257,12 +298,38 @@ void MDEC_out(void* buf, int size) {
         mdec.error = -1;
         return;
     }
+    cancel_out();
     memcpy(buf, mdec.output + mdec.cursor, (size_t)size * 4);
     mdec.cursor += (size_t)size * 4;
-    Psyz_DmaComplete(1);
+    uint64_t units = (mdec.cursor + unit_bytes() - 1) / unit_bytes();
+    uint64_t ready = mdec.start_us + units * MDEC_UNIT_NS / 1000;
+    if (mdec_instant || ready <= Psyz_KernelNowUs()) {
+        Psyz_DmaComplete(1);
+        return;
+    }
+    mdec.out_pending = 1;
+    mdec.out_us = ready;
+    Psyz_KernelPostAt(ready, out_done);
 }
 int MDEC_in_sync(void) { return mdec.error; }
-int MDEC_out_sync(void) { return mdec.error; }
+int MDEC_out_sync(void) {
+    // DecDCToutSync(0) waits for the transfer.
+    while (mdec.out_pending) {
+        uint64_t now = Psyz_KernelNowUs();
+        if (mdec.out_us > now && Psyz_AudioWaitUs(mdec.out_us - now) &&
+            Psyz_KernelNowUs() != now) {
+            continue;
+        }
+        if (Psyz_KernelOfflineClock() || mdec.out_us <= now) {
+            // due, or no time can pass here (inside an interrupt)
+            Psyz_KernelCancel(out_done);
+            out_done();
+        } else {
+            Psyz_KernelPoll();
+        }
+    }
+    return mdec.error;
+}
 u_long MDEC_status(void) {
     u32 status = 0x0004ffffu | ((mdec.command >> 2) & 0x07800000u);
     return status | (mdec.cursor == mdec.length ? 0x80000000u : 0x28000000u);

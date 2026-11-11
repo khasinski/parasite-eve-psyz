@@ -545,6 +545,21 @@ static bool SkipPresent(void) {
     return false;
 }
 
+/* Offline clock (PSYZ_AUDIO_CLOCK=video) without pacing: the emulated time
+ * of the last blocking VSync, from which VSync(1) counts lines. */
+static uint64_t offline_vsync_us;
+
+static double LineMicroseconds(void) {
+    return is_pal ? 1000000.0 / (VSYNC_PAL * 314) : 1000000.0 / (VSYNC_NTSC * 263);
+}
+
+void Psyz_VideoWaitBlank(void) {
+    if (vsync_mode != PSYZ_VSYNC_LIMITLESS || host_clock_pause_depth)
+        return;
+    limitless_vblank_base++;
+    Psyz_VSyncBlank();
+}
+
 int Psyz_VideoVSync(int mode) {
     Uint32 now_us;
     unsigned short ret;
@@ -562,13 +577,25 @@ int Psyz_VideoVSync(int mode) {
         return (int)(WallVblankCount() + vblank_clock_offset);
     }
     if (vsync_mode == PSYZ_VSYNC_LIMITLESS && !host_clock_pause_depth) {
-        if (mode == 1)
-            return (int)(unsigned short)++limitless_lines;
-        /* A game that waits on VSync(1) past the end of a field (e.g. a
-         * 384-line threshold for a 2-field frame) misses that blank. */
-        blanks += limitless_lines / (is_pal ? 314u : 263u);
-        limitless_vblank_base += limitless_lines / (is_pal ? 314u : 263u);
-        ret = (unsigned short)limitless_lines;
+        /* On the offline clock each query spends a line of emulated time, as
+         * a polling loop would: blanks it crosses happen in that wait
+         * (Psyz_VideoWaitBlank). The count runs from the last VSync(0). */
+        int offline = Psyz_AudioWaitUs(mode == 1 ? 64 : 0);
+        if (offline) {
+            ret = (unsigned short)(
+                (double)(Psyz_KernelNowUs() - offline_vsync_us) /
+                LineMicroseconds());
+            if (mode == 1)
+                return ret;
+        } else {
+            if (mode == 1)
+                return (int)(unsigned short)++limitless_lines;
+            /* A game that waits on VSync(1) past the end of a field (e.g.
+             * a 384-line threshold for a 2-field frame) misses that blank. */
+            blanks += limitless_lines / (is_pal ? 314u : 263u);
+            limitless_vblank_base += limitless_lines / (is_pal ? 314u : 263u);
+            ret = (unsigned short)limitless_lines;
+        }
         limitless_lines = 0;
     } else {
         // a line is approximated as 64 us of emulated (speed-scaled) time
@@ -587,6 +614,7 @@ int Psyz_VideoVSync(int mode) {
          * (a 2-field frame). */
         while (blanks--)
             Sdl3Audio_VBlank(is_pal);
+        offline_vsync_us = Psyz_KernelNowUs();
         last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
     }
     return ret;

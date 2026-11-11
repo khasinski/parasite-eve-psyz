@@ -31,6 +31,9 @@ int Psyz_AudioIsPaused(void);
 
 // Emulated time (us) shared by the root counters and the CD drive.
 uint64_t Psyz_KernelNowUs(void);
+// 1 when that time is the offline sample clock (PSYZ_AUDIO_CLOCK=video):
+// it advances only as samples are mixed, never by itself.
+int Psyz_KernelOfflineClock(void);
 
 // Offline sample clock and root-counter deadlines; no host-time advancement.
 unsigned Psyz_KernelAudioBatch(unsigned maximum);
@@ -49,6 +52,11 @@ void Psyz_KernelRaise(unsigned int desc, unsigned int spec);
 // the audio thread can use it.
 void Psyz_KernelPost(void (*fn)(void));
 
+// Runs fn as an interrupt once the emulated clock reaches at_us (a device
+// completing after its PS1 time); Psyz_KernelCancel drops a pending one.
+void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void));
+void Psyz_KernelCancel(void (*fn)(void));
+
 // Completes a native synchronous DMA transfer without recursive callbacks.
 void Psyz_DmaComplete(unsigned channel);
 
@@ -57,14 +65,21 @@ void Psyz_KernelVBlank(void);
 
 // Delivers the sectors a callback-driven CD read has reached (libcd.c).
 void Psyz_CdServiceDrive(void);
-// The same for a game polling the drive in a busy wait: on the offline clock
-// a poll that finds no new sector waits for the next one.
+// The same for a game polling the drive in a busy wait: each poll spends
+// the PS1 time of the call (StGetNext's ring poll, or another query).
 void Psyz_CdPollDrive(void);
+void Psyz_CdPollQuery(void);
 
 // Offline clock only: mixes `us` of emulated time without a VBlank, for a
 // native busy wait on a device that runs on that clock. Returns 0 (and does
 // nothing) on a real-time clock, where the time passes by itself.
 int Psyz_AudioWaitUs(uint64_t us);
+// A blank that came due during such a wait (offline clock, SDL platform):
+// counts it in VSync(-1) and runs its VSync work (Psyz_VSyncBlank).
+void Psyz_VideoWaitBlank(void);
+// The work of one blank (libapi.c): pad refresh, the VSync hook, the
+// vblank interrupt.
+void Psyz_VSyncBlank(void);
 
 // Services due timers when the host has no thread to run them.
 void Psyz_KernelPoll(void);

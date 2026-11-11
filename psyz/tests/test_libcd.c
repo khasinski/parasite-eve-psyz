@@ -257,6 +257,8 @@ ZTEST_SETUP(libcd) {
     zassert_s32_eq(0, ret);
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
+    // Drive timing has its own tests (libcd_timing).
+    Psyz_CdSetInstantTiming(1);
 }
 
 ZTEST_TEARDOWN(libcd) {
@@ -652,6 +654,99 @@ ZTEST(libcd, readn_in_rt_mode_leaves_the_data_path_idle) {
     CdControlB(CdlSetmode, &mode, NULL);
 }
 
+/* Drive timing (the libcd suite otherwise runs with instant timing). These
+ * run on the host clock; a frozen offline clock skips them. */
+static uint64_t timing_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
+// Polls CdReady(1) for the next sector; returns 0 after 3 s without (a
+// stopped motor spins up for 1 s, a speed change takes 0.6 s).
+static int timing_wait_sector(void) {
+    uint64_t start = timing_now_us();
+    while (CdReady(1, NULL) != CdlDataReady) {
+        if (timing_now_us() - start > 3000000) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+ZTEST(libcd, timing_read_delivers_a_sector_per_period) {
+    u_char mode = CdlModeSpeed;
+    u_char payload[2048];
+    load_cue_data(40);
+    Psyz_CdSetInstantTiming(0);
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdlLOC loc;
+    CdIntToPos(30, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    uint64_t start = timing_now_us();
+    CdControl(CdlReadN, NULL, NULL);
+    zprintf("the first sector waits for the seek\n");
+    zexpect_s32_eq(CdlNoIntr, CdReady(1, NULL));
+    if (!timing_wait_sector()) {
+        zskip("the emulated clock does not run here");
+    }
+    uint64_t first = timing_now_us();
+    zprintf("seek and one sector period: at least 6.6 ms\n");
+    zexpect_s32_ne(0, first - start >= 6600);
+    CdGetSector(payload, 3);
+    CdGetSector(payload, sizeof(payload) / 4);
+    zassert_s32_ne(0, timing_wait_sector());
+    CdGetSector(payload, 3);
+    CdGetSector(payload, sizeof(payload) / 4);
+    zassert_s32_ne(0, timing_wait_sector());
+    uint64_t third = timing_now_us();
+    zprintf("double speed: 150 sectors per second\n");
+    zexpect_s32_ne(0, third - first >= 2 * 6600);
+    zexpect_s32_ne(0, third - first < 2 * 6667 + 20000);
+    CdControlB(CdlPause, NULL, NULL);
+    mode = 0;
+    CdControlB(CdlSetmode, &mode, NULL);
+}
+
+ZTEST(libcd, timing_sync_reports_a_pending_pause) {
+    u_char mode = CdlModeSpeed;
+    load_cue_data(40);
+    Psyz_CdSetInstantTiming(0);
+    CdControlB(CdlSetmode, &mode, NULL);
+    start_read_at(10);
+    if (!timing_wait_sector()) {
+        zskip("the emulated clock does not run here");
+    }
+    uint64_t start = timing_now_us();
+    zassert_s32_ne(0, CdControl(CdlPause, NULL, NULL));
+    zprintf("a pause of a read takes at least 29.5 ms\n");
+    zexpect_s32_eq(CdlNoIntr, CdSync(1, NULL));
+    zexpect_s32_eq(CdlComplete, CdSync(0, NULL));
+    zexpect_s32_ne(0, timing_now_us() - start >= 29000);
+    zprintf("an ack-only command completes on its acknowledge\n");
+    zassert_s32_ne(0, CdControl(CdlNop, NULL, NULL));
+    zexpect_s32_eq(CdlComplete, CdSync(1, NULL));
+    mode = 0;
+    CdControlB(CdlSetmode, &mode, NULL);
+}
+
+ZTEST(libcd, timing_instant_completes_at_once) {
+    u_char mode = CdlModeSpeed;
+    load_cue_data(8);
+    Psyz_CdSetInstantTiming(1);
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdlLOC loc;
+    CdIntToPos(4, &loc);
+    zassert_s32_ne(0, CdControlF(CdlSeekL, (u_char*)&loc));
+    zexpect_s32_eq(CdlComplete, CdSync(1, NULL));
+    start_read_at(2);
+    zexpect_s32_eq(CdlDataReady, CdReady(1, NULL));
+    CdControlB(CdlPause, NULL, NULL);
+    zexpect_s32_eq(CdlComplete, CdSync(1, NULL));
+    mode = 0;
+    CdControlB(CdlSetmode, &mode, NULL);
+}
+
 static void mount_bin_cue_pair(
     const unsigned short* data, size_t count, const char* track_type) {
     char cdda_path[PATH_LEN];
@@ -760,6 +855,7 @@ ZTEST_SETUP(libcd_playback) {
     }
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
+    Psyz_CdSetInstantTiming(1);
 }
 
 ZTEST_TEARDOWN(libcd_playback) {
