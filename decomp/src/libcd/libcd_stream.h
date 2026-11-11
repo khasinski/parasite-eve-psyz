@@ -17,4 +17,9 @@ void data_ready_callback(void);
 void StCdInterrupt(void);
 int DsDataCallback(void (*callback)(void));
 int DsReadyCallback(void (*callback)(u_char, u_char*));
+#ifdef __psyz
+/* Delivers the sectors the emulated drive has read since the last call to
+ * the ready callback (StCdInterrupt while streaming). */
+void Psyz_CdServiceDrive(void);
+#endif
 #endif

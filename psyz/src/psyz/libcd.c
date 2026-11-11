@@ -11,6 +11,8 @@
 #include <math.h>
 #include <kernel.h>
 #include "../internal.h"
+#include "os.h"
+#include "../../../decomp/src/libcd/libcd_stream.h"
 #include "../../decomp/src/libspu/libspu_private.h"
 
 #define SECTOR_SIZE 2352
@@ -403,6 +405,8 @@ void Psyz_CdSetReadCB(PsyzCdReadCB cb) { disk_read_cb = cb; }
 static FILE* track_file;
 static const TrackEntry* track_file_track;
 
+static int read_sector_unlocked(int sector, u_char* out);
+
 static void close_track_file(void) {
     if (track_file) {
         fclose(track_file);
@@ -593,11 +597,15 @@ static int xa_read_and_decode_sector(void) {
         goto silence;
     }
     while (!xa.stream_ended || silent_sectors-- > 0) {
+        // Seek every sector: data reads of the same image (streaming) share
+        // track_file with this decoder.
         const size_t n =
             disk_read_cb ? (size_t)disk_read_cb(&(struct PsyzCdRead){
                                (unsigned int)(xa.cur_abs_sector + 1),
                                SECTOR_SIZE, sector})
-                         : fread(sector, 1, SECTOR_SIZE, track_file);
+            : read_sector_unlocked(xa.cur_abs_sector + 1, sector) == 0
+                ? SECTOR_SIZE
+                : 0;
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
         }
@@ -811,29 +819,33 @@ static int open_track_at_cd_pos(void) {
     return 0;
 }
 
-static int read_raw_sector(int sector, u_char* out) {
+// Reads one raw sector through track_file. The caller holds the audio lock.
+static int read_sector_unlocked(int sector, u_char* out) {
     TrackEntry* track = find_track_for_sector(sector);
     if (!track) {
         return -1;
     }
-    Psyz_AudioLock();
     if (track != track_file_track || !track_file) {
         close_track_file();
         track_file = fopen(track->file_path, "rb");
         if (!track_file) {
             ERRORF("failed to open data file: %s", track->file_path);
-            Psyz_AudioUnlock();
             return -1;
         }
         track_file_track = track;
     }
     long offset =
         (long)(sector - track->abs_sector + track->start_sector) * SECTOR_SIZE;
-    int result = -1;
     if (fseek(track_file, offset, SEEK_SET) == 0 &&
         fread(out, 1, SECTOR_SIZE, track_file) == SECTOR_SIZE) {
-        result = 0;
+        return 0;
     }
+    return -1;
+}
+
+static int read_raw_sector(int sector, u_char* out) {
+    Psyz_AudioLock();
+    int result = read_sector_unlocked(sector, out);
     Psyz_AudioUnlock();
     return result;
 }
@@ -1007,19 +1019,30 @@ int CD_sync(int mode, u_char* result) {
     }
     return last_intr;
 }
+static int read_data_sector(int sector) {
+    if (disk_read_cb) {
+        struct PsyzCdRead read = {
+            (unsigned int)sector, SECTOR_SIZE, data_sector};
+        return disk_read_cb(&read) < 0 ? -1 : 0;
+    }
+    return read_raw_sector(sector, data_sector);
+}
+
+// XA audio sectors that the drive plays itself in CdlModeRT never reach
+// the host. Subheader submode bit 2 marks an audio sector.
+static int is_played_audio_sector(void) {
+    return (CD_mode & CdlModeRT) && (data_sector[0x12] & 0x04);
+}
+
+// Polled reads (CdReady). A ready callback receives the sectors instead,
+// and polled ADPCM playback (CdlModeRT) keeps this data path idle.
 int CD_ready(int mode, u_char* result) {
     (void)mode;
-    if (!data_read_active)
+    if (!data_read_active || CD_cbready || (CD_mode & CdlModeRT))
         return CdlNoIntr;
     if (!data_sector_valid) {
-        if (disk_read_cb) {
-            struct PsyzCdRead read = {
-                (unsigned int)data_sector_number, SECTOR_SIZE, data_sector};
-            if (disk_read_cb(&read) < 0)
-                return CdlDiskError;
-        } else if (read_raw_sector(data_sector_number, data_sector) < 0) {
+        if (read_data_sector(data_sector_number) < 0)
             return CdlDiskError;
-        }
         data_sector_valid = 1;
         data_getsector_count = 0;
     }
@@ -1028,6 +1051,200 @@ int CD_ready(int mode, u_char* result) {
     }
     return CdlDataReady;
 }
+
+// Frame being assembled by StCdInterrupt (below).
+#define ST_SLOT_FILLING 3
+#define ST_SLOT_BYTES 2016
+static struct {
+    int active;
+    u32 frame;
+    int slot, next, count;
+} st_frame;
+
+/* Callback-driven reads (a CdReadyCallback installed during CdlReadN/ReadS,
+ * as CdRead2 streaming does): the drive delivers sectors at its rate, 75 or
+ * 150 per second, measured on the host clock from the read command. Each one
+ * raises DataReady on the ready callback, which fetches it with
+ * CdGetSector; a sector it does not take is lost, as on hardware. Sectors
+ * are delivered when the game services the drive: every VSync and while it
+ * polls the stream ring (StGetNext), so a busy wait sees them arrive. */
+#define DRIVE_MAX_BURST 600 // sectors; older ones of a long stall are skipped
+static uint64_t drive_start_us;
+static uint64_t drive_delivered;
+static unsigned drive_generation; // counts read commands
+static int drive_servicing;
+static int drive_ready_sector = -1; // sector the ready callback may fetch
+
+static void start_data_read(void) {
+    data_sector_number = CdPosToInt(&CD_pos);
+    data_sector_valid = 0;
+    data_getsector_count = 0;
+    data_read_active = 1;
+    drive_start_us = Psyz_OsNowUs();
+    drive_delivered = 0;
+    drive_generation++;
+    memset(&st_frame, 0, sizeof(st_frame));
+    CD_status |= CdlStatRead;
+}
+
+static void deliver_data_sector(void) {
+    int sector = data_sector_number;
+    drive_delivered++;
+    if (read_data_sector(sector) < 0) {
+        data_read_active = 0;
+        CD_status &= ~CdlStatRead;
+        if (CD_cbready) {
+            CD_cbready(CdlDataEnd, NULL);
+        }
+        return;
+    }
+    data_sector_number = sector + 1;
+    if (is_played_audio_sector() || !CD_cbready) {
+        return;
+    }
+    u_char result[8] = {(u_char)CD_status};
+    // CdGetSector inside the callback reads this sector.
+    data_sector_number = sector;
+    data_sector_valid = 1;
+    data_getsector_count = 0;
+    drive_ready_sector = sector;
+    unsigned generation = drive_generation;
+    CD_cbready(CdlDataReady, result);
+    drive_ready_sector = -1;
+    if (generation == drive_generation) { // the callback issued no new read
+        data_sector_valid = 0;
+        data_getsector_count = 0;
+        data_sector_number = sector + 1;
+    }
+}
+
+void Psyz_CdServiceDrive(void) {
+    if (!data_read_active || !CD_cbready || drive_servicing) {
+        return;
+    }
+    drive_servicing = 1;
+    uint64_t rate = (CD_mode & CdlModeSpeed) ? 150 : 75;
+    uint64_t due = (Psyz_OsNowUs() - drive_start_us) * rate / 1000000;
+    if (due > drive_delivered + DRIVE_MAX_BURST) {
+        uint64_t skipped = due - drive_delivered - DRIVE_MAX_BURST;
+        data_sector_number += (int)skipped;
+        drive_delivered += skipped;
+    }
+    while (data_read_active && CD_cbready && drive_delivered < due) {
+        unsigned generation = drive_generation;
+        deliver_data_sector();
+        if (generation != drive_generation) {
+            break; // the callback restarted the read
+        }
+    }
+    drive_servicing = 0;
+}
+
+/* StCdInterrupt: the ready-callback half of LIBCD streaming. It moves the
+ * current sector into the ring StSetRing installed: StRingSize 32-byte
+ * StHEADERs followed by as many 2016-byte (504 word) payload slots. A sector
+ * of a movie frame carries its StHEADER in the first 32 bytes of the Mode 2
+ * user data and 2016 bytes of frame data after it; the nSectors sectors of a
+ * frame fill consecutive slots so the frame is contiguous. Slot ids: 0 free,
+ * 1 wrap to slot 0, 2 frame ready, 4 frame held by StGetNext (StFreeRing
+ * clears it), ST_SLOT_FILLING while a frame is assembled. When the last
+ * sector of a frame lands, the CD DMA completion callback (CdRead2 installs
+ * data_ready_callback) publishes it. A frame that does not fit in the free
+ * slots, or misses a sector, is dropped, as on hardware. */
+
+static int st_slots_free(int start, int count) {
+    for (int i = start; i < start + count; i++) {
+        if (StRingAddr[i].id != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void st_drop_frame(void) {
+    if (st_frame.active) {
+        for (int i = 0; i < st_frame.next; i++) {
+            StRingAddr[st_frame.slot + i].id = 0;
+        }
+    }
+    st_frame.active = 0;
+}
+
+// A new frame starts: reserve its slots, wrapping to slot 0 when the rest
+// of the ring cannot hold it. Leaves a free slot at the end of the ring, so
+// the read index never passes the last header.
+static int st_begin_frame(const StHEADER* h) {
+    int count = h->nSectors;
+    if (count <= 0 || count >= StRingSize) {
+        return 0;
+    }
+    if (StSTART_FLAG && (h->frameCount < (u32)StStartFrame ||
+                         h->frameCount > (u32)StEndFrame)) {
+        return 0;
+    }
+    int pos = StRingIdx2;
+    if (pos < 0 || pos >= StRingSize) {
+        pos = 0;
+    }
+    int wrap = pos + count >= StRingSize;
+    int start = wrap ? 0 : pos;
+    if ((wrap && StRingAddr[pos].id != 0) || !st_slots_free(start, count)) {
+        return 0; // ring full: the decoder is behind, skip this frame
+    }
+    if (wrap && pos != 0) {
+        StRingAddr[pos].id = 1;
+    }
+    StRingIdx2 = start;
+    st_frame.active = 1;
+    st_frame.frame = h->frameCount;
+    st_frame.slot = start;
+    st_frame.next = 0;
+    st_frame.count = count;
+    return 1;
+}
+
+void StCdInterrupt(void) {
+    StHEADER h;
+    if (drive_ready_sector < 0 || !StRingAddr || StRingSize < 2) {
+        return; // DataEnd/DiskError or no ring: nothing to store
+    }
+    StCdIntrFlag = 0;
+    if (data_sector[0x12] & 0x04) {
+        return; // XA audio interleaved with the frames
+    }
+    memcpy(&h, data_sector + 24, sizeof(h));
+    if (h.secCount == 0) {
+        st_drop_frame(); // previous frame lost a sector
+        if (!st_begin_frame(&h)) {
+            return;
+        }
+    } else if (!st_frame.active || h.frameCount != st_frame.frame ||
+               h.secCount != st_frame.next || h.nSectors != st_frame.count) {
+        st_drop_frame();
+        return;
+    }
+    int slot = st_frame.slot + h.secCount;
+    StHEADER* dst = &StRingAddr[slot];
+    u_char* payload =
+        (u_char*)&StRingAddr[StRingSize] + (size_t)slot * ST_SLOT_BYTES;
+    memcpy(payload, data_sector + 24 + sizeof(StHEADER), ST_SLOT_BYTES);
+    *dst = h;
+    dst->id = ST_SLOT_FILLING;
+    CdIntToPos(drive_ready_sector, &dst->loc);
+    Stsector_offset = (s16)h.secCount;
+    if (++st_frame.next < st_frame.count) {
+        return;
+    }
+    st_frame.active = 0;
+    Stframe_no = (s32)h.frameCount;
+    StRingIdx1 = st_frame.slot + st_frame.count;
+    StFinalSector = 1;
+    Psyz_DmaComplete(3); // data_ready_callback publishes the frame
+    if (StFunc2 && StEndFrame && h.frameCount >= (u32)StEndFrame) {
+        StFunc2();
+    }
+}
+
 static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3);
 
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
@@ -1074,6 +1291,9 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         break;
     case CdlReadN:
     case CdlReadS:
+        // With CdlModeRT the drive plays XA audio sectors itself and hands
+        // the remaining (data) sectors to the host, as interleaved movie
+        // streams need; without it every sector is data.
         if (CD_mode & CdlModeRT) {
             psyz_xa_read();
         } else {
@@ -1082,12 +1302,8 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             xa.active = 0;
             need_cdda_rewind = 1;
             Psyz_AudioUnlock();
-            data_sector_number = CdPosToInt(&CD_pos);
-            data_sector_valid = 0;
-            data_getsector_count = 0;
-            data_read_active = 1;
-            CD_status |= CdlStatRead;
         }
+        start_data_read();
         break;
     case CdlSetfilter:
         if (!param) {
@@ -1132,15 +1348,9 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         if (*param & CdlModeSize1) {
             LOG_ONCE("%s does not support CdlModeSize1", CD_comstr[com]);
         }
-        if (*param & CdlModeSpeed) {
-            LOG_ONCE("%s does not support CdlModeSpeed", CD_comstr[com]);
-        }
-        if (*param & CdlModeStream2) {
-            LOG_ONCE("%s does not support CdlModeStream2", CD_comstr[com]);
-        }
-        if (*param & CdlModeStream) {
-            LOG_ONCE("%s does not support CdlModeStream", CD_comstr[com]);
-        }
+        // CdlModeSpeed sets the data rate of callback-driven reads. The
+        // CdlModeStream bits never reach the drive: CdRead2 keeps them in
+        // StMode and installs the stream callbacks.
         Psyz_AudioLock();
         CD_mode = *param;
         Psyz_AudioUnlock();
@@ -1310,7 +1520,6 @@ int CdReadSync(int mode, u_char* result) {
     return 0;
 }
 
-void StCdInterrupt(void) { NOT_IMPLEMENTED; }
 
 #if PE_NATIVE_STATE_CPU_COMPONENTS
 #include "psyz/state_audio.h"

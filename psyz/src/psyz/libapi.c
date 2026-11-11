@@ -78,6 +78,7 @@ int VSync(int mode) {
             Psyz_KernelVBlank();
         }
     } while ((int32_t)(now - target) < 0);
+    Psyz_CdServiceDrive();
     /* Keep periodic waits on their scheduled blank. Native presentation can
      * return just after it; using that late return as the next origin adds a
      * blank repeatedly and lets FMV pictures drift behind device audio.

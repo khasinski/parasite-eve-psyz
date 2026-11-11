@@ -50,6 +50,9 @@ void Psyz_DmaComplete(unsigned channel);
 // Raises the vblank interrupt; VSync calls it once per emulated frame.
 void Psyz_KernelVBlank(void);
 
+// Delivers the sectors a callback-driven CD read has reached (libcd.c).
+void Psyz_CdServiceDrive(void);
+
 // Services due timers when the host has no thread to run them.
 void Psyz_KernelPoll(void);
 

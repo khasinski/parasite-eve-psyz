@@ -3320,7 +3320,12 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     display_double_height = mode->vertical_resolution;
     display_size.y = set_disp_vert * (display_double_height ? 2 : 1);
     if (UseSoftwareBackend()) {
-        UpdateTargetFramerate(mode->pal ? VSYNC_PAL : VSYNC_NTSC);
+        // Games rewrite the display mode every frame (PutDispEnv); only a
+        // change of video standard may reset the frame limiter.
+        double fps = mode->pal ? VSYNC_PAL : VSYNC_NTSC;
+        if (fps != target_frame_rate) {
+            UpdateTargetFramerate(fps);
+        }
         return;
     }
     ApplyDisplayPendingChanges();
