@@ -198,10 +198,13 @@ void _spu_DmaDone(void) {
 
 /* SPU RAM DMA takes its PS1 time: the SPU moves a halfword per 16 system
  * clocks (DuckStation spu.cpp TRANSFER_TICKS_PER_HALFWORD), so a 276 KiB
- * sound bank takes over three fields. The data lands in SPU RAM at once;
- * the end of the transfer (callback, HwSPU/EvSpCOMP, SpuIsTransferCompleted)
- * comes when the DMA would have finished, on the emulated clock.
- * PSYZ_SPU_TIMING=instant ends transfers at once. */
+ * sound bank takes over three fields (Ridge Racer Type 4's VAB uploads of
+ * 54256 and 282848 bytes wait 262 and 1096 lines on DuckStation, about 60
+ * of them the frame's own work before the upload). The data lands in SPU
+ * RAM at once; the end of the transfer (callback, HwSPU/EvSpCOMP,
+ * SpuIsTransferCompleted) comes when the DMA would have finished, on the
+ * emulated clock. PSYZ_SPU_TIMING=instant ends transfers at once. */
+enum { SPU_DMA_CLOCKS_PER_BYTE = 8 };
 static volatile int spu_dma_busy;
 
 static int spu_dma_instant(void) {
@@ -230,7 +233,7 @@ static void spu_dma_start(unsigned size) {
         return;
     }
     spu_dma_busy = 1;
-    uint64_t us = ((uint64_t)size * 8 * 1000000 + 33868800 / 2) / 33868800;
+    uint64_t us = ((uint64_t)size * SPU_DMA_CLOCKS_PER_BYTE * 1000000 + 33868800 / 2) / 33868800;
     Psyz_KernelPostAt(Psyz_KernelNowUs() + us, spu_dma_end);
 }
 
