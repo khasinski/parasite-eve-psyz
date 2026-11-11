@@ -109,29 +109,148 @@ void StartTAP(void) {
     StartPAD();
 }
 
-int PadGetState(int port) {
-    // from PSY-Q 4.2
-    NOT_IMPLEMENTED;
-    return 0;
+/* PSY-Q 4.2 direct-connection pad library (libpad). The receive buffers are
+ * the InitPAD ones, refreshed every VSync with the PS1 frame for the kind
+ * Psyz_PadsSetKind selects. A PSYZ_CTRL_ANALOG_PAD port is a DUAL SHOCK:
+ * mode table {digital 0x4, analog 0x7}, two actuators, ready (stable) state.
+ * Every other pad-like kind is a controller without vibration. */
+enum {
+    PAD_STATE_DISCON = 0,
+    PAD_STATE_FIND_CTP1 = 2,
+    PAD_STATE_STABLE = 6,
+};
+
+static struct {
+    int dualshock;          // port reached the stable DUAL SHOCK state
+    PsyzControllerKind cur; // mode selected on the DUAL SHOCK
+} pad_direct[2];
+
+static int PadDirectPort(int port) {
+    if (port & ~0x10) {
+        return -1; // Multi Tap channels B-D are never connected
+    }
+    return port >> 4;
 }
 
-void PadSetAct(int port, u_char* data, int len) {
-    // from PSY-Q 4.2
-    NOT_IMPLEMENTED;
+static int PadDirectState(int port) {
+    int p = PadDirectPort(port);
+    if (p < 0) {
+        return PAD_STATE_DISCON;
+    }
+    char frame[PSYZ_PAD_BUF_LEN];
+    Psyz_PadsGet(p, frame, sizeof(frame));
+    unsigned char kind = (unsigned char)frame[1];
+    if (frame[0] != 0 || kind == PSYZ_CTRL_DISCONNECTED) {
+        pad_direct[p].dualshock = 0;
+        return PAD_STATE_DISCON;
+    }
+    if (pad_direct[p].dualshock &&
+        (kind == PSYZ_CTRL_DIGITAL_PAD || kind == PSYZ_CTRL_ANALOG_PAD)) {
+        return PAD_STATE_STABLE; // DUAL SHOCK, possibly in digital mode
+    }
+    if (kind == PSYZ_CTRL_ANALOG_PAD) {
+        pad_direct[p].dualshock = 1;
+        pad_direct[p].cur = PSYZ_CTRL_ANALOG_PAD;
+        return PAD_STATE_STABLE;
+    }
+    pad_direct[p].dualshock = 0;
+    return PAD_STATE_FIND_CTP1;
 }
 
-int PadSetActAlign(int port, char* data) {
-    // from PSY-Q 4.2
-    NOT_IMPLEMENTED;
-    return 0;
-}
-
-void PadInitMtap(u_char* pad1, u_char* pad2) {
-    // from PSY-Q 4.2
-    NOT_IMPLEMENTED;
+void PadInitDirect(u_char* pad1, u_char* pad2) {
+    memset(pad_direct, 0, sizeof(pad_direct));
+    InitPAD((char*)pad1, PSYZ_PAD_BUF_LEN, (char*)pad2, PSYZ_PAD_BUF_LEN);
 }
 
 void PadStartCom(void) {
+    // receive buffers are already refreshed on every VSync
+}
+
+int PadGetState(int port) { return PadDirectState(port); }
+
+int PadInfoMode(int port, int term, int offs) {
+    int state = PadDirectState(port);
+    if (state == PAD_STATE_DISCON) {
+        return 0;
+    }
+    int p = PadDirectPort(port);
+    char frame[PSYZ_PAD_BUF_LEN];
+    Psyz_PadsGet(p, frame, sizeof(frame));
+    int cur_id = ((unsigned char)frame[1] >> 4) & 0xF;
+    if (state != PAD_STATE_STABLE) {
+        return term == 1 ? cur_id : 0; // InfoModeCurID only
+    }
+    switch (term) {
+    case 1: // InfoModeCurID
+        return cur_id;
+    case 2: // InfoModeCurExID: DUAL SHOCK reports controller type 1
+        return 0x100 | cur_id;
+    case 3: // InfoModeCurExOffs
+        return pad_direct[p].cur == PSYZ_CTRL_ANALOG_PAD;
+    case 4: // InfoModeIdTable
+        if (offs == -1)
+            return 2;
+        if (offs == 0)
+            return PSYZ_CTRL_DIGITAL_PAD >> 4;
+        if (offs == 1)
+            return PSYZ_CTRL_ANALOG_PAD >> 4;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+int PadInfoAct(int port, int actno, int term) {
+    // DUAL SHOCK: 0 = small motor (on/off), 1 = large motor (variable)
+    static const unsigned char act_info[2][4] = {
+        {1, 1, 1, 10},
+        {1, 2, 1, 20},
+    };
+    if (PadDirectState(port) != PAD_STATE_STABLE) {
+        return 0;
+    }
+    if (actno == -1) {
+        return LEN(act_info);
+    }
+    if (actno < 0 || actno >= LEN(act_info) || term < 1 || term > 4) {
+        return 0;
+    }
+    return act_info[actno][term - 1];
+}
+
+int PadInfoComb(int port, int listno, int offs) {
+    (void)port;
+    (void)listno;
+    (void)offs;
+    return 0; // DUAL SHOCK motors have no combination restrictions
+}
+
+void PadSetAct(int port, u_char* data, int len) {
+    // the host has no force feedback output; the buffer is not transmitted
+    (void)port;
+    (void)data;
+    (void)len;
+}
+
+int PadSetActAlign(int port, char* data) {
+    (void)data;
+    return PadDirectState(port) == PAD_STATE_STABLE;
+}
+
+int PadSetMainMode(int port, int offs, int lock) {
+    (void)lock; // the host has no mode selector button to lock
+    if (PadDirectState(port) != PAD_STATE_STABLE || offs < 0 || offs > 1) {
+        return 0;
+    }
+    int p = PadDirectPort(port);
+    PsyzControllerKind kind =
+        offs ? PSYZ_CTRL_ANALOG_PAD : PSYZ_CTRL_DIGITAL_PAD;
+    pad_direct[p].cur = kind;
+    Psyz_PadsSetKind(p, 0, kind);
+    return 1;
+}
+
+void PadInitMtap(u_char* pad1, u_char* pad2) {
     // from PSY-Q 4.2
     NOT_IMPLEMENTED;
 }

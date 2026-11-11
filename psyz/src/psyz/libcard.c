@@ -61,6 +61,16 @@ long _card_load(long chan) { return card_op(SwCARD, chan); }
 
 void _new_card(void) {}
 
+// A card is a host directory; formatting empties it. There is no multi-tap.
+long _card_format(long chan) {
+    char fs[] = "bu00:";
+    if (!validate_chan(chan) || (chan & 15)) {
+        return 0;
+    }
+    fs[2] = (char)('0' + (chan >> 4));
+    return format(fs);
+}
+
 long _card_status(long drv) {
     (void)drv;
     return 1;

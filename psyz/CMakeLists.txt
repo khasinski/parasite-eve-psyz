@@ -61,6 +61,7 @@ set(PSYZ_SOURCES
     ../decomp/src/libcd/toc.c
     ../decomp/src/libcd/type.c
     src/psyz/libcard.c
+    src/psyz/libcomb.c
     ../decomp/src/libspu/s_cb.c
     ../decomp/src/libspu/s_crwa.c
     ../decomp/src/libspu/s_dcb.c
@@ -140,8 +141,10 @@ set(PSYZ_SOURCES
     ../decomp/src/libsnd/ssopenpj.c
     ../decomp/src/libsnd/ssopenq.c
     ../decomp/src/libsnd/ssopenqj.c
+    ../decomp/src/libsnd/sspause.c
     ../decomp/src/libsnd/ssplay.c
     ../decomp/src/libsnd/ssquit.c
+    ../decomp/src/libsnd/ssreplay.c
     ../decomp/src/libsnd/sssattr.c
     ../decomp/src/libsnd/sssmv.c
     ../decomp/src/libsnd/ssstart.c
@@ -154,6 +157,7 @@ set(PSYZ_SOURCES
     ../decomp/src/libsnd/ut_ako.c
     ../decomp/src/libsnd/ut_autop.c
     ../decomp/src/libsnd/ut_cadsr.c
+    ../decomp/src/libsnd/ut_cp.c
     ../decomp/src/libsnd/ut_gpa.c
     ../decomp/src/libsnd/ut_gva.c
     ../decomp/src/libsnd/ut_key.c

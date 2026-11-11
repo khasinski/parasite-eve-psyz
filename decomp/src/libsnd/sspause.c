@@ -1,8 +1,13 @@
-#include <common.h>
-#include <libsnd.h>
+#include "libsnd_private.h"
 
-INCLUDE_ASM("asm/nonmatchings/libsnd/sspause", _SsSndSetPauseMode);
+void _SsSndSetPauseMode(short sep_access_num, short seq_num) {
+    _ss_score[sep_access_num][seq_num].flags |= SEQ_FLAG_2;
+}
 
-INCLUDE_ASM("asm/nonmatchings/libsnd/sspause", SsSeqPause);
+void SsSeqPause(short seq_access_num) {
+    _SsSndSetPauseMode(seq_access_num, 0);
+}
 
-INCLUDE_ASM("asm/nonmatchings/libsnd/sspause", SsSepPause);
+void SsSepPause(short sep_access_num, short seq_num) {
+    _SsSndSetPauseMode(sep_access_num, seq_num);
+}
