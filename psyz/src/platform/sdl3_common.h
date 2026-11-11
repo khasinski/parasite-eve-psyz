@@ -219,6 +219,10 @@ static unsigned host_clock_pause_depth;
 static Uint32 host_clock_pause_count;
 static Uint32 limitless_vblank_base;
 static Uint64 limitless_frame_base;
+/* Without pacing no time passes between blanks, so VSync(1) counts the
+ * scanlines a polling loop would have waited: each query advances one line
+ * and a blocking VSync(0) skips the fields those lines crossed. */
+static Uint32 limitless_lines;
 
 // frame pacing state
 static double target_frame_rate = VSYNC_NTSC;
@@ -551,9 +555,20 @@ int Psyz_VideoVSync(int mode) {
                      (Uint32)(gpu_stats.total_frames - limitless_frame_base));
         return (int)(WallVblankCount() + vblank_clock_offset);
     }
-    // a line is approximated as 64 us
-    now_us = (Uint32)(SDL_GetTicksNS() / 1000);
-    ret = (unsigned short)((now_us - last_vsync_us) >> 6);
+    if (vsync_mode == PSYZ_VSYNC_LIMITLESS && !host_clock_pause_depth) {
+        if (mode == 1)
+            return (int)(unsigned short)++limitless_lines;
+        /* A game that waits on VSync(1) past the end of a field (e.g. a
+         * 384-line threshold for a 2-field frame) misses that blank. */
+        limitless_vblank_base += limitless_lines / (is_pal ? 313u : 263u);
+        ret = (unsigned short)limitless_lines;
+        limitless_lines = 0;
+    } else {
+        // a line is approximated as 64 us of emulated (speed-scaled) time
+        now_us = (Uint32)(SDL_GetTicksNS() / 1000);
+        ret = (unsigned short)(((Uint64)(Uint32)(now_us - last_vsync_us) *
+                                game_speed) >> 6);
+    }
     if (mode == 0) {
         present_skip = SkipPresent();
         PlatformBackend_Present();
