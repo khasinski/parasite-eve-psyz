@@ -189,6 +189,22 @@ void Psyz_CardFileCreate(void);
  */
 void Psyz_CardSetInstantTiming(int instant);
 
+/** Memory card slot states (Psyz_CardSlotState). */
+enum { PSYZ_CARD_NONE, PSYZ_CARD_FORMATTED, PSYZ_CARD_UNFORMATTED };
+
+/**
+ * @brief What memory card port `port` (0 or 1) holds
+ *
+ * A formatted card by default; PSYZ_CARD_UNPLUG / PSYZ_CARD_UNFORMATTED
+ * list slots (1, 2) that are empty or hold an unformatted card.
+ */
+int Psyz_CardSlotState(int port);
+
+/**
+ * @brief Plug, unplug or unformat the card in port `port` (0 or 1)
+ */
+void Psyz_CardSetSlotState(int port, int state);
+
 #ifdef __cplusplus
 }
 #endif
