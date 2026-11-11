@@ -543,6 +543,7 @@ static bool SkipPresent(void) {
 int Psyz_VideoVSync(int mode) {
     Uint32 now_us;
     unsigned short ret;
+    unsigned blanks = 1;
     Sdl3Common_ApplyPendingTimingReset();
     if (mode < 0) {
         if (host_clock_pause_depth)
@@ -560,6 +561,7 @@ int Psyz_VideoVSync(int mode) {
             return (int)(unsigned short)++limitless_lines;
         /* A game that waits on VSync(1) past the end of a field (e.g. a
          * 384-line threshold for a 2-field frame) misses that blank. */
+        blanks += limitless_lines / (is_pal ? 313u : 263u);
         limitless_vblank_base += limitless_lines / (is_pal ? 313u : 263u);
         ret = (unsigned short)limitless_lines;
         limitless_lines = 0;
@@ -575,7 +577,11 @@ int Psyz_VideoVSync(int mode) {
         present_skip = false;
         PollEvents();
         WaitForNextFrame();
-        Sdl3Audio_VBlank(is_pal);
+        /* The offline audio clock follows every blank the counter advanced
+         * by, including those a VSync(1) wait spent before this present
+         * (a 2-field frame). */
+        while (blanks--)
+            Sdl3Audio_VBlank(is_pal);
         last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
     }
     return ret;
