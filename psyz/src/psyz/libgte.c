@@ -1201,7 +1201,7 @@ void InitGeom() {
     ZSF4 = 0x100;
     H = 1000;
     DQA = -0x1062;
-    DQB = 0x140;
+    DQB = 0x1400000; /* lui 0x140 */
     OFX = 0;
     OFY = 0;
 }
@@ -1297,7 +1297,10 @@ void SetFarColor(long rfc, long gfc, long bfc) {
     L2.t[2] = (int)(bfc * 16);
 }
 
-void SetFogNear(long a, long h) { NOT_IMPLEMENTED; }
+void SetFogNear(long a, long h) {
+    DQA = (short)((int)-(a * 0x140) / (int)h);
+    DQB = 0x1400000;
+}
 
 void Psyz_GteLdRgb(CVECTOR* v) { *(unsigned int*)&RGBC = *(unsigned int*)v; }
 void Psyz_GteStRgb(CVECTOR* v) { *(unsigned int*)v = RGB2; }
