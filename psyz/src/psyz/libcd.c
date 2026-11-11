@@ -1248,6 +1248,7 @@ void StCdInterrupt(void) {
 static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3);
 
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
+    CD_com = com; // CdLastCom
     int ret = CD_command(com, param, result, arg3);
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
     return ret;
@@ -1380,9 +1381,38 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         Psyz_AudioUnlock();
         break;
     }
-    case CdlGetlocP:
-        LOG_ONCE("com %s not implemented", CD_comstr[com]);
+    case CdlGetlocP: {
+        // Subchannel Q position: track, index, position within the track and
+        // absolute position (MSF, BCD). The result may be fetched later with
+        // CdSync, so a NULL buffer is allowed.
+        u_char loc_result[8];
+        Psyz_AudioLock();
+        int cur = xa.active          ? xa.cur_abs_sector
+                  : data_read_active ? data_sector_number
+                                     : CdPosToInt(&CD_pos);
+        Psyz_AudioUnlock();
+        if (cur < 0) {
+            cur = 0;
+        }
+        TrackEntry* track = find_track_for_sector(cur);
+        int rel = track ? cur - track->abs_sector : cur;
+        int track_num = track ? track->track_num : 1;
+        CdlLOC abs_loc;
+        CdIntToPos(cur, &abs_loc);
+        loc_result[0] = (u_char)(((track_num / 10) << 4) | (track_num % 10));
+        loc_result[1] = 0x01;
+        loc_result[2] = (u_char)((((rel / 4500) / 10) << 4) | ((rel / 4500) % 10));
+        loc_result[3] = (u_char)(((((rel / 75) % 60) / 10) << 4) | ((rel / 75) % 60 % 10));
+        loc_result[4] = (u_char)((((rel % 75) / 10) << 4) | (rel % 75 % 10));
+        loc_result[5] = abs_loc.minute;
+        loc_result[6] = abs_loc.second;
+        loc_result[7] = abs_loc.sector;
+        if (result) {
+            memcpy(result, loc_result, sizeof(loc_result));
+        }
+        cache_last_result(loc_result, sizeof(loc_result), CdlComplete);
         break;
+    }
     case CdlGetTN:
         if (!result) {
             ERRORF("%s got NULL result", CD_comstr[com]);
