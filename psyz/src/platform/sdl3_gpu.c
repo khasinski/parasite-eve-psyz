@@ -264,6 +264,9 @@ typedef struct {
      * of it in the same frame: 0 none, 1 at out */
     unsigned out_mode;
     float out[6][3];
+    /* the pose at position was drawn into the midpoint only (a
+     * PSYZ_INTERP_MIDPOINT_ONLY packet): not a pose the game drew */
+    bool midpoint_pose;
     unsigned motion_frame; /* frame of motion: its last paired move */
     float motion[6][2];
     uint64_t signature;
@@ -625,6 +628,11 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
         return;
     }
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&(any_texture||p->signature==signature);
+    /* A midpoint-only packet is geometry the game leaves out of the frame
+     * (nearer than the projection plane): its pose there is no projection
+     * the game would draw, often far off the view. It pairs only with a
+     * pose the game drew in the frame before. */
+    if(midpoint_only&&p->midpoint_pose)valid=false;
     for(unsigned i=0;i<count;++i){
         /* a tagged identity is the same face: it may move as far as the
          * view reaches (vertices past the GTE's limit are handled below) */
@@ -642,21 +650,13 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     bool clamped=midpoint_only&&!valid;
     if(!valid&&!camera_fallback&&p->tagged)
         for(unsigned i=0;i<count;++i)clamped|=v[i].x<=-1024||v[i].x>=1023||v[i].y<=-1024||v[i].y>=1023;
-    const bool extrapolated=clamped&&p->frame&&p->frame+1==interp_frame&&p->motion_frame==p->frame&&
+    const bool extrapolated=clamped&&!p->midpoint_pose&&p->frame&&p->frame+1==interp_frame&&p->motion_frame==p->frame&&
         p->count==count&&(any_texture||p->signature==signature);
     if(p->tagged)++interp_stat[1];
     if(valid||extrapolated)++interp_stat[2];
     if(debug>0&&!valid&&!extrapolated&&p->tagged)
         for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->r=255;out->g=0;out->b=255;}
     if((valid||camera_fallback||extrapolated)&&!frame_only)++interp_matches;
-    if(SDL_getenv("STRIPES_DBG")){float mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9;
-        for(unsigned i=0;i<count;++i){float x=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0],y=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1];
-            if(extrapolated){x=p->position[i][0]+p->motion[i][0]*0.5f;y=p->position[i][1]+p->motion[i][1]*0.5f;}
-            mnx=SDL_min(mnx,x);mxx=SDL_max(mxx,x);mny=SDL_min(mny,y);mxy=SDL_max(mxy,y);}
-        if((valid||extrapolated||camera_fallback)&&(mxx-mnx)*(mxy-mny)>40000){
-            fprintf(stderr,"BIG f%u v%d e%d c%d fl%u n%u:",interp_frame,valid,extrapolated,camera_fallback,flags,count);
-            for(unsigned i=0;i<count;++i)fprintf(stderr," [%d,%d|%.1f,%.1f,%.1f prev %.1f,%.1f,%.1f mot %.1f,%.1f]",v[i].x,v[i].y,position[i][0],position[i][1],position[i][2],p->position[i][0],p->position[i][1],p->position[i][2],p->motion[i][0],p->motion[i][1]);
-            fprintf(stderr,"\n");}}
     p->out_mode=0;
     for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
         if(valid){
@@ -676,11 +676,12 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
         }
         if(valid||extrapolated){p->out[i][0]=out->pgxp_pos[0];p->out[i][1]=out->pgxp_pos[1];p->out[i][2]=out->pgxp_pos[2];p->out_mode=1;}
     }
-    if(valid){
+    if(valid&&!midpoint_only){
         for(unsigned i=0;i<count;++i){p->motion[i][0]=position[i][0]-p->position[i][0];p->motion[i][1]=position[i][1]-p->position[i][1];}
         p->motion_frame=interp_frame;
     }else p->motion_frame=0;
     memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
+    p->midpoint_pose=midpoint_only;
     if(frame_only)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048;out->pgxp_pos[2]=-1;}
     if(midpoint_only)for(unsigned i=0;i<count;++i){
         v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
