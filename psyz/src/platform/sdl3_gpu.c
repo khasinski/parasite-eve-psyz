@@ -4723,6 +4723,69 @@ void Draw_ResetBuffer(void) {
     clut_cache_loads = 0;
 }
 
+/* The target pixels the primitives at indices [start, end) can touch,
+ * clipped to the drawing area; false when they touch none. */
+typedef struct SemiBox {
+    int x0, y0, x1, y1;
+} SemiBox;
+/* Primitives of one draw within a render pass (Draw_FlushBuffer). */
+typedef struct DrawSegment {
+    int start, end;
+    bool semi;
+} DrawSegment;
+#define DRAW_SEGMENTS_MAX 32
+static bool PrimitiveBox(int start, int end, bool midpoint,
+                         bool scaled_target, unsigned target_scale,
+                         float sub_x, float sub_y, float target_centre,
+                         float ws_squeeze, SDL_Rect clip, SemiBox* box) {
+    float min_x = 1e9f, min_y = 1e9f, max_x = -1e9f, max_y = -1e9f;
+    /* Sprites and rectangles on whole target pixels cover exactly
+     * [min, max); anything else may round to one more pixel each side. */
+    bool rectangle = true;
+    for (int i = start; i < end; ++i) {
+        const Vertex* v = midpoint ? &interpolated_vertices[index_buf[i]]
+                                   : &vertex_buf[index_buf[i]];
+        float bias =
+            (v->t & TPAGE_POLYGON) ? 0.5f / (float)target_scale : 0.0f;
+        bool use_pgxp =
+            (midpoint ||
+             (scaled_target &&
+              (geometry_correction || effect_geometry_correction) &&
+              (v->t & TPAGE_POLYGON))) &&
+            v->pgxp_pos[2] > 0.0f;
+        float vx = (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
+        float vy = (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
+        float x = draw_offset.x + (vx + bias) * GetDrawGridXScale();
+        x = (target_centre + (x - target_centre) * ws_squeeze) * target_scale;
+        float y = (draw_offset.y + vy + bias) * target_scale;
+        rectangle &= !(v->t & TPAGE_POLYGON) && x == SDL_floorf(x) &&
+                     y == SDL_floorf(y);
+        min_x = SDL_min(min_x, x);
+        max_x = SDL_max(max_x, x);
+        min_y = SDL_min(min_y, y);
+        max_y = SDL_max(max_y, y);
+    }
+    int widen = rectangle ? 0 : 1;
+    int x0 = (int)SDL_floorf(min_x) - widen;
+    int x1 = (int)SDL_ceilf(max_x) + widen;
+    int y0 = (int)SDL_floorf(min_y) - widen;
+    int y1 = (int)SDL_ceilf(max_y) + widen;
+    x0 = SDL_max(x0, SDL_max(0, clip.x) * (int)target_scale);
+    y0 = SDL_max(y0, SDL_max(0, clip.y) * (int)target_scale);
+    x1 = SDL_min(x1, SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale);
+    y1 = SDL_min(y1, SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale);
+    *box = (SemiBox){x0, y0, x1, y1};
+    return x1 > x0 && y1 > y0;
+}
+
+static int SharedVertices(int a, int b) {
+    int shared = 0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            shared += index_buf[a + i] == index_buf[b + j];
+    return shared;
+}
+
 void Draw_FlushBuffer(void) {
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
@@ -4831,82 +4894,98 @@ void Draw_FlushBuffer(void) {
             target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
         int start = 0;
         while (start < n_indices) {
-            bool semi = vertex_buf[index_buf[start]].a != 0xFF;
             /* A semi-transparent primitive blends with a copy of the VRAM
-             * made before it: one triangle per draw, or one bounding box
-             * (two triangles that do not overlap) of an exact polygon. */
-            int end = start + (vertex_buf[index_buf[start]].exact[0][3] ? 6 : 3);
-            if (!semi) {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF)
-                    end += 3;
-            } else {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81)
-                    end += 3;
+             * made before it: one triangle, or one bounding box (two
+             * triangles that do not overlap) of an exact polygon. Each render
+             * pass loads and stores the whole target, so one pass draws a
+             * run of segments (consecutive opaque primitives, or one
+             * semi-transparent primitive) from one copy: a semi-transparent
+             * primitive joins it while its pixels miss those of every
+             * earlier segment of the run, so the copy still holds its
+             * destination. */
+            DrawSegment segments[DRAW_SEGMENTS_MAX];
+            SemiBox boxes[DRAW_SEGMENTS_MAX];
+            int n_segments = 0, n_draws = 0;
+            int end = start;
+            while (end < n_indices && n_segments < DRAW_SEGMENTS_MAX) {
+                int seg_start = end;
+                bool semi = vertex_buf[index_buf[seg_start]].a != 0xFF;
+                int seg_end =
+                    seg_start + (vertex_buf[index_buf[seg_start]].exact[0][3] ? 6 : 3);
+                /* The two triangles of one quad (two shared vertices) cover
+                 * disjoint pixels: they read the same copy. */
+                if (semi && seg_end + 3 <= n_indices &&
+                    !vertex_buf[index_buf[seg_start]].exact[0][3] &&
+                    vertex_buf[index_buf[seg_end]].a != 0xFF &&
+                    SharedVertices(seg_start, seg_end) >= 2)
+                    seg_end += 3;
+                if (!semi) {
+                    while (seg_end < n_indices &&
+                           vertex_buf[index_buf[seg_end]].a == 0xFF)
+                        seg_end += 3;
+                }
+                if (seg_end > n_indices)
+                    seg_end = n_indices;
+                SemiBox box;
+                bool visible = PrimitiveBox(
+                    seg_start, seg_end, midpoint, target_index != 0,
+                    target_scale, sub_x, sub_y, target_centre, ws_squeeze, clip,
+                    &box);
+                if (semi && n_segments) {
+                    bool overlaps = false;
+                    for (int i = 0; visible && i < n_segments; ++i)
+                        overlaps |= boxes[i].x1 > boxes[i].x0 &&
+                                    box.x0 < boxes[i].x1 &&
+                                    boxes[i].x0 < box.x1 &&
+                                    box.y0 < boxes[i].y1 && boxes[i].y0 < box.y1;
+                    if (overlaps)
+                        break;
+                }
+                end = seg_end;
+                if (semi && !visible)
+                    continue; // outside the drawing area: draws nothing
+                if (!visible)
+                    box.x0 = box.x1 = 0;
+                boxes[n_segments] = box;
+                segments[n_segments++] = (DrawSegment){seg_start, seg_end, semi};
+                n_draws += semi ? 1 : 2;
             }
-            /* Three sampled textures, up to two draws (color and mask). Reserve
-             * both heaps' worst-case sampler use before any destination copy.
-             */
-            cmd = ReserveDrawDescriptors(6);
+            if (!n_segments) {
+                start = end;
+                continue;
+            }
+            /* Up to four sampled textures for each draw. Reserve both heaps'
+             * worst-case sampler use before any destination copy. */
+            cmd = ReserveDrawDescriptors(4u * (unsigned)n_draws);
             if (!cmd) {
                 Draw_ResetBuffer();
                 return;
             }
-            if (semi) {
-                int x0 = (clip.x + clip.w) * (int)target_scale;
-                int y0 = (clip.y + clip.h) * (int)target_scale;
-                int x1 = clip.x * (int)target_scale;
-                int y1 = clip.y * (int)target_scale;
-                for (int i = start; i < end; ++i) {
-                    const Vertex* v = midpoint ? &interpolated_vertices[index_buf[i]] : &vertex_buf[index_buf[i]];
-                    float bias = (v->t & TPAGE_POLYGON)
-                                     ? 0.5f / (float)target_scale
-                                     : 0.0f;
-                    bool use_pgxp =
-                        (midpoint ||
-                         (target_index &&
-                          (geometry_correction || effect_geometry_correction) &&
-                          (v->t & TPAGE_POLYGON))) &&
-                        v->pgxp_pos[2] > 0.0f;
-                    float vx =
-                        (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
-                    float vy =
-                        (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
-                    float x = draw_offset.x + (vx + bias) * GetDrawGridXScale();
-                    x = (target_centre + (x - target_centre) * ws_squeeze) *
-                        target_scale;
-                    float y = (draw_offset.y + vy + bias) * target_scale;
-                    x0 = SDL_min(x0, (int)SDL_floorf(x) - 1);
-                    x1 = SDL_max(x1, (int)SDL_ceilf(x) + 1);
-                    y0 = SDL_min(y0, (int)SDL_floorf(y) - 1);
-                    y1 = SDL_max(y1, (int)SDL_ceilf(y) + 1);
-                }
-                x0 = SDL_max(x0, SDL_max(0, clip.x) * (int)target_scale);
-                y0 = SDL_max(y0, SDL_max(0, clip.y) * (int)target_scale);
-                x1 = SDL_min(
-                    x1, SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale);
-                y1 = SDL_min(
-                    y1, SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale);
-                if (x1 <= x0 || y1 <= y0) {
-                    start = end;
+            SDL_GPUCopyPass* blend_copy = NULL;
+            for (int i = 0; i < n_segments; ++i) {
+                if (!segments[i].semi)
                     continue;
-                }
-                SDL_GPUCopyPass* blend_copy = SDL_BeginGPUCopyPass(cmd);
+                if (!blend_copy)
+                    blend_copy = SDL_BeginGPUCopyPass(cmd);
                 SDL_GPUTextureLocation from = {
                     .texture = render_target,
-                    .x = (Uint32)x0,
-                    .y = (Uint32)y0};
+                    .x = (Uint32)boxes[i].x0,
+                    .y = (Uint32)boxes[i].y0};
                 SDL_GPUTextureLocation to = from;
                 to.texture = destination_sample;
                 SDL_CopyGPUTextureToTexture(
-                    blend_copy, &from, &to, (Uint32)(x1 - x0),
-                    (Uint32)(y1 - y0), 1, false);
-                SDL_EndGPUCopyPass(blend_copy);
+                    blend_copy, &from, &to,
+                    (Uint32)(boxes[i].x1 - boxes[i].x0),
+                    (Uint32)(boxes[i].y1 - boxes[i].y0), 1, false);
             }
+            if (blend_copy)
+                SDL_EndGPUCopyPass(blend_copy);
             const SDL_GPUColorTargetInfo target = {
                 .texture = render_target,
                 .load_op = SDL_GPU_LOADOP_LOAD,
                 .store_op = SDL_GPU_STOREOP_STORE,
             };
+            ++frame_stats_batches;
             SDL_GPURenderPass* pass =
                 SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
             {
@@ -4964,36 +5043,39 @@ void Draw_FlushBuffer(void) {
                 (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
                 (PSX_SHADERS_CURRENT && mask_set_bit ? 8u : 0u) |
                 (PSX_SHADERS_CURRENT && mask_check_bit ? 16u : 0u);
-            /* Opaque primitives under "check mask" overlap each other in one
-             * draw: pass 3 writes colour and mask bit together, blended by
-             * the destination's mask bit (alpha), so a pixel masked by an
-             * earlier primitive of the batch is kept. */
-            const bool checked = PSX_SHADERS_CURRENT && !semi && mask_check_bit;
-            const u32 color_pass[4] = {
-                semi ? 2u : checked ? 3u : 0u, target_scale,
-                draw_grid_source_width == draw_grid_target_width, pass_flags};
-            SDL_PushGPUFragmentUniformData(
-                cmd, 0, color_pass, sizeof(color_pass));
-
-            SDL_BindGPUGraphicsPipeline(
-                pass, pipe_tri[semi      ? BLEND_DIRECT
-                               : checked ? BLEND_CHECK
-                                         : BLEND_ADD]);
-            SDL_DrawGPUIndexedPrimitives(
-                pass, (Uint32)(end - start), 1, (Uint32)start, 0, 0);
-            /* Blend factors use source alpha as an operation selector. Write
-             * the actual PS1 mask bit separately, without changing the color
-             * result. */
-            if (!semi && !checked) {
-                const u32 mask_pass[4] = {
-                    1, target_scale,
-                    draw_grid_source_width == draw_grid_target_width,
-                    pass_flags};
+            for (int s = 0; s < n_segments; ++s) {
+                const bool semi = segments[s].semi;
+                const Uint32 first = (Uint32)segments[s].start;
+                const Uint32 count = (Uint32)(segments[s].end - segments[s].start);
+                /* Opaque primitives under "check mask" overlap each other in
+                 * one draw: pass 3 writes colour and mask bit together,
+                 * blended by the destination's mask bit (alpha), so a pixel
+                 * masked by an earlier primitive of the batch is kept. */
+                const bool checked = PSX_SHADERS_CURRENT && !semi && mask_check_bit;
+                const u32 color_pass[4] = {
+                    semi ? 2u : checked ? 3u : 0u, target_scale,
+                    draw_grid_source_width == draw_grid_target_width, pass_flags};
                 SDL_PushGPUFragmentUniformData(
-                    cmd, 0, mask_pass, sizeof(mask_pass));
-                SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
-                SDL_DrawGPUIndexedPrimitives(
-                    pass, (Uint32)(end - start), 1, (Uint32)start, 0, 0);
+                    cmd, 0, color_pass, sizeof(color_pass));
+
+                SDL_BindGPUGraphicsPipeline(
+                    pass, pipe_tri[semi      ? BLEND_DIRECT
+                                   : checked ? BLEND_CHECK
+                                             : BLEND_ADD]);
+                SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
+                /* Blend factors use source alpha as an operation selector.
+                 * Write the actual PS1 mask bit separately, without changing
+                 * the color result. */
+                if (!semi && !checked) {
+                    const u32 mask_pass[4] = {
+                        1, target_scale,
+                        draw_grid_source_width == draw_grid_target_width,
+                        pass_flags};
+                    SDL_PushGPUFragmentUniformData(
+                        cmd, 0, mask_pass, sizeof(mask_pass));
+                    SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
+                    SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
+                }
             }
             SDL_EndGPURenderPass(pass);
             start = end;

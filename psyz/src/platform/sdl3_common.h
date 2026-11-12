@@ -523,6 +523,9 @@ static unsigned frame_stats_count;
 static float frame_stats_interval[FRAME_STATS_WINDOW];
 static float frame_stats_work[FRAME_STATS_WINDOW];
 static float frame_stats_present[FRAME_STATS_WINDOW];
+/* Render passes the backend drew primitives in since the last present. */
+static unsigned frame_stats_batches;
+static float frame_stats_batch[FRAME_STATS_WINDOW];
 
 static int FrameStatsCompare(const void* a, const void* b) {
     float x = *(const float*)a, y = *(const float*)b;
@@ -534,7 +537,7 @@ static void FrameStatsSummary(const char* name, float* v, unsigned n) {
     qsort(v, n, sizeof(*v), FrameStatsCompare);
     for (unsigned i = 0; i < n; i++)
         sum += v[i];
-    INFOF("[Frame stats] %-8s ms: mean %.2f p50 %.2f p90 %.2f p99 %.2f max %.2f"
+    INFOF("[Frame stats] %-10s mean %.2f p50 %.2f p90 %.2f p99 %.2f max %.2f"
           " min %.2f",
           name, sum / n, v[n / 2], v[n * 9 / 10], v[n * 99 / 100], v[n - 1],
           v[0]);
@@ -548,7 +551,7 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
         frame_stats_mode = stats && *stats && strcmp(stats, "0");
         if (log && *log && (frame_stats_log = fopen(log, "w")))
             fprintf(frame_stats_log, "# present_ms interval_ms work_ms "
-                                     "present_call_ms wait_ms\n");
+                                     "present_call_ms wait_ms passes\n");
     }
     if (!frame_stats_mode && !frame_stats_log)
         return;
@@ -564,21 +567,24 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
         float wait =
             (float)(GetElapsedMicroseconds(present_end, wait_end) / 1000.0);
         if (frame_stats_log)
-            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f\n",
+            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f %u\n",
                     GetElapsedMicroseconds(0, present_start) / 1000.0,
-                    interval, work, present, wait);
+                    interval, work, present, wait, frame_stats_batches);
         if (frame_stats_mode) {
             frame_stats_interval[frame_stats_count] = interval;
             frame_stats_work[frame_stats_count] = work;
             frame_stats_present[frame_stats_count] = present;
+            frame_stats_batch[frame_stats_count] = (float)frame_stats_batches;
             if (++frame_stats_count == FRAME_STATS_WINDOW) {
                 INFOF("[Frame stats] %u presents, target %.3f ms, driver vsync %d",
                       frame_stats_count, target_frame_time_us / game_speed / 1000.0,
                       use_driver_vsync);
-                FrameStatsSummary("interval", frame_stats_interval,
+                FrameStatsSummary("interval_ms", frame_stats_interval,
                                   frame_stats_count);
-                FrameStatsSummary("work", frame_stats_work, frame_stats_count);
-                FrameStatsSummary("present", frame_stats_present,
+                FrameStatsSummary("work_ms", frame_stats_work, frame_stats_count);
+                FrameStatsSummary("present_ms", frame_stats_present,
+                                  frame_stats_count);
+                FrameStatsSummary("passes", frame_stats_batch,
                                   frame_stats_count);
                 frame_stats_count = 0;
             }
@@ -586,6 +592,7 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
     }
     frame_stats_last_present = present_start;
     frame_stats_last_return = wait_end;
+    frame_stats_batches = 0;
 }
 
 /* Implemented by the existing SDL audio backend; no device in video-clock mode.

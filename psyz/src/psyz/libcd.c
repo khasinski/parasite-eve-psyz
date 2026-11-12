@@ -1373,7 +1373,10 @@ int CD_getsector(void* madr, int size) {
     }
     return 0;
 }
-int CD_getsector2(void) { NOT_IMPLEMENTED; }
+int CD_getsector2(void) {
+    NOT_IMPLEMENTED;
+    return 0; // LIBCD returns 0 once the DMA is started
+}
 void CD_datasync(int mode) { NOT_IMPLEMENTED; }
 
 int CD_initvol(void) {
