@@ -649,6 +649,14 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     if(debug>0&&!valid&&!extrapolated&&p->tagged)
         for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->r=255;out->g=0;out->b=255;}
     if((valid||camera_fallback||extrapolated)&&!frame_only)++interp_matches;
+    if(SDL_getenv("STRIPES_DBG")){float mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9;
+        for(unsigned i=0;i<count;++i){float x=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0],y=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1];
+            if(extrapolated){x=p->position[i][0]+p->motion[i][0]*0.5f;y=p->position[i][1]+p->motion[i][1]*0.5f;}
+            mnx=SDL_min(mnx,x);mxx=SDL_max(mxx,x);mny=SDL_min(mny,y);mxy=SDL_max(mxy,y);}
+        if((valid||extrapolated||camera_fallback)&&(mxx-mnx)*(mxy-mny)>40000){
+            fprintf(stderr,"BIG f%u v%d e%d c%d fl%u n%u:",interp_frame,valid,extrapolated,camera_fallback,flags,count);
+            for(unsigned i=0;i<count;++i)fprintf(stderr," [%d,%d|%.1f,%.1f,%.1f prev %.1f,%.1f,%.1f mot %.1f,%.1f]",v[i].x,v[i].y,position[i][0],position[i][1],position[i][2],p->position[i][0],p->position[i][1],p->position[i][2],p->motion[i][0],p->motion[i][1]);
+            fprintf(stderr,"\n");}}
     p->out_mode=0;
     for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
         if(valid){
@@ -747,6 +755,9 @@ static struct {
 } ws_picture[2] = {{-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0, false, WS_SQUEEZE_DEFAULT},
                    {-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0, false, WS_SQUEEZE_DEFAULT}};
 static float ws_mid_shift[2],ws_mid_qx[2],ws_mid_qy[2],ws_mid_ex[2],ws_mid_ey[2],ws_mid_left[2],ws_mid_right[2];
+/* Psyz_VideoSetWidescreenNativeAspect: the aspect mode frames shown
+ * without widescreen are presented at, or -1 to follow aspect_mode. */
+static int ws_native_aspect = -1;
 /* Psyz_VideoSetWidescreenCentred: drawing ignores the view's shift. */
 static bool ws_centred;
 /* Psyz_VideoSetWidescreenField: drawing is the room, it follows ex, ey. */
@@ -867,6 +878,16 @@ static bool WidescreenNativeBuffer(int y) {
         if (ws_picture[i].y == y)
             return ws_picture[i].native;
     return false;
+}
+/* The aspect a frame shown from the buffer at VRAM row y (or 24-bit) is
+ * presented at, before the widescreen view: a buffer shown without
+ * widescreen while widescreen is on gets Psyz_VideoSetWidescreenNativeAspect. */
+static float PresentGameAspect(int y, bool rgb24) {
+    if (widescreen && ws_native_aspect >= 0 &&
+        (rgb24 || WidescreenNativeBuffer(y)))
+        return GameAspectRatioFor((PsyzAspectMode)ws_native_aspect,
+                                  display_size.x, display_size.y);
+    return GetCurrentGameAspectRatio(display_size.x, display_size.y);
 }
 static bool WidescreenDraw(void) {
     if (!widescreen || !DisplayBufferDraw())
@@ -2777,8 +2798,8 @@ static void PlatformBackend_Present(void) {
                     src = (SDL_GPUBlitRegion){.texture = rgb24,
                                               .w = title_present_active ? title_texture_width : display_size.x,
                                               .h = title_present_active ? title_texture_height : display_size.y};
-                float game_aspect =
-                    GetCurrentGameAspectRatio(display_size.x, display_size.y);
+                float game_aspect = PresentGameAspect(
+                    interp_present_mid ? interp_next_y : display_area.y, rgb24 != NULL);
                 if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
 #ifdef PE_PS5_GPU_NATIVE
                 if(native_movie_active)game_aspect=4.0f/3.0f; /* Original PS1 video display aspect, independent of scene-wide mode. */
@@ -3684,6 +3705,20 @@ static void SetWidescreenPicture(int buffer_y, int left, int right, bool field,
                                  float dx, float dy, int camera_x);
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     SetWidescreenPicture(buffer_y, left, right, false, 0.0f, 0.0f, 0);
+}
+int Psyz_VideoSetWidescreenNativeAspect(int mode) {
+    if (mode != -1 && mode != PSYZ_ASPECT_DISPLAY && mode != PSYZ_ASPECT_SQUARE)
+        return -1;
+    ws_native_aspect = mode;
+    return 0;
+}
+int Psyz_VideoGetWidescreenNativeAspect(void) { return ws_native_aspect; }
+float Psyz_VideoGetPresentedAspect(void) {
+    if (display_size.x <= 0 || display_size.y <= 0)
+        return 0.0f;
+    if (widescreen && !display_rgb24 && !WidescreenNativeBuffer(display_area.y))
+        return 16.0f / 9.0f;
+    return PresentGameAspect(display_area.y, display_rgb24);
 }
 void Psyz_VideoSetWidescreenNative(int buffer_y) {
     SetWidescreenPicture(buffer_y, 0, 0, false, 0.0f, 0.0f, 0);

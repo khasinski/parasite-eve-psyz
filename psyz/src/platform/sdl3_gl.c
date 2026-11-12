@@ -893,6 +893,13 @@ int Psyz_VideoSetWidescreenSqueeze(float squeeze) {
 float Psyz_VideoGetWidescreenSqueeze(void) { return 0.75f; }
 int Psyz_VideoGetWidescreenBufferMargin(void) { return 0; }
 void Psyz_VideoSetWidescreenNative(int buffer_y) { (void)buffer_y; }
+int Psyz_VideoSetWidescreenNativeAspect(int mode) {
+    return mode == -1 || mode == PSYZ_ASPECT_DISPLAY || mode == PSYZ_ASPECT_SQUARE ? 0 : -1;
+}
+int Psyz_VideoGetWidescreenNativeAspect(void) { return -1; }
+float Psyz_VideoGetPresentedAspect(void) {
+    return GetCurrentGameAspectRatio(display_size.x, display_size.y);
+}
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     (void)buffer_y;
     (void)left;

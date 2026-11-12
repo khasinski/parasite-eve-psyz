@@ -553,6 +553,48 @@ ZTEST(gpu, widescreen_fitted_squeeze_holds_the_whole_view) {
 #endif
 }
 
+/* A game whose 16:9 view is at square pixels keeps the frames it shows
+ * without widescreen at the display aspect, as with widescreen off. */
+ZTEST(gpu, widescreen_native_frames_keep_their_aspect) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        zskip("requires the SDL GPU renderer");
+    const PsyzAspectMode aspect = Psyz_VideoGetAspectMode();
+    const long video_mode = GetVideoMode();
+    SetVideoMode(MODE_PAL);
+    DISPENV disp;
+    SetDefDispEnv(&disp, 0, 0, 320, 256);
+    disp.screen.h = 256;
+    PutDispEnv(&disp);
+    zassert_s32_eq(0, Psyz_VideoSetAspectMode(PSYZ_ASPECT_DISPLAY));
+    const int classic = (int)(Psyz_VideoGetPresentedAspect() * 4096.0f);
+    zassert_s32_eq(0, Psyz_VideoSetAspectMode(PSYZ_ASPECT_SQUARE));
+    zexpect_s32_eq(5120, (int)(Psyz_VideoGetPresentedAspect() * 4096.0f));
+    zexpect_s32_eq(-1, Psyz_VideoGetWidescreenNativeAspect());
+    zexpect_s32_eq(-1, Psyz_VideoSetWidescreenNativeAspect(7));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreenSqueeze(0.0f));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreen(1));
+    Psyz_VideoSetWidescreenNative(0);
+    /* by default a native frame follows the aspect mode */
+    zexpect_s32_eq(5120, (int)(Psyz_VideoGetPresentedAspect() * 4096.0f));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreenNativeAspect(PSYZ_ASPECT_DISPLAY));
+    zexpect_s32_eq(classic, (int)(Psyz_VideoGetPresentedAspect() * 4096.0f));
+    /* the view keeps its square pixels: same fitted squeeze and margin */
+    zexpect_s32_eq(2880, (int)(Psyz_VideoGetWidescreenSqueeze() * 4096.0f));
+    zexpect_s32_eq(68, Psyz_VideoGetWidescreenBufferMargin());
+    Psyz_VideoSetWidescreenPicture(0, -68, 388);
+    zexpect_s32_eq(7281, (int)(Psyz_VideoGetPresentedAspect() * 4096.0f));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreenNativeAspect(-1));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreen(0));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreenSqueeze(0.75f));
+    Psyz_VideoSetAspectMode(aspect);
+    SetVideoMode(video_mode);
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
 ZTEST(gpu, vram_copy_follows_uploads_fills_and_copies) {
 #if defined(__psyz) && !defined(__PSP__)
     const unsigned char* known = NULL;

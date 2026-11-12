@@ -368,6 +368,35 @@ void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right);
 void Psyz_VideoSetWidescreenNative(int buffer_y);
 
 /**
+ * @brief The aspect frames shown without widescreen are presented at
+ *
+ * While widescreen is on, buffers marked Psyz_VideoSetWidescreenNative and
+ * 24-bit display are presented at this aspect mode instead of
+ * Psyz_VideoSetAspectMode's, which still sets the pixel aspect of the 16:9
+ * view and the fitted squeeze. A game whose 16:9 view is at square pixels
+ * (PSYZ_ASPECT_SQUARE) keeps its 4:3 frames exactly as with widescreen off
+ * at PSYZ_ASPECT_DISPLAY, pillarboxed in a 16:9 window. Captures of those
+ * frames are the buffer as drawn either way. Takes effect at the next
+ * present.
+ *
+ * @param mode a PsyzAspectMode, or -1 to follow Psyz_VideoSetAspectMode
+ *             (the default)
+ * @return 0 on success, -1 for an unknown mode
+ */
+int Psyz_VideoSetWidescreenNativeAspect(int mode);
+/** @return the mode set with Psyz_VideoSetWidescreenNativeAspect, or -1 */
+int Psyz_VideoGetWidescreenNativeAspect(void);
+/**
+ * @brief The aspect the buffer on screen is presented at
+ *
+ * 16/9 for a frame shown through the widescreen view, otherwise the picture
+ * aspect it is fitted to the window with (Psyz_VideoSetAspectMode, or
+ * Psyz_VideoSetWidescreenNativeAspect for a frame shown without
+ * widescreen). 0 before a display mode is set.
+ */
+float Psyz_VideoGetPresentedAspect(void);
+
+/**
  * @brief Draw centred in the 16:9 view, ignoring the view's shift
  *
  * While on, drawing into a display buffer lands where it would with the view

@@ -181,8 +181,9 @@ static void SetWindowSizeInPixels(int width, int height) {
     SDL_SetWindowSize(sdl3_window, actual_width, actual_height);
 }
 
-static float GetCurrentGameAspectRatio(int disp_w, int disp_h) {
-    if (aspect_mode == PSYZ_ASPECT_DISPLAY) {
+/* The picture aspect of a disp_w x disp_h display at the given aspect mode. */
+static float GameAspectRatioFor(PsyzAspectMode mode, int disp_w, int disp_h) {
+    if (mode == PSYZ_ASPECT_DISPLAY) {
         float vref = is_pal || Psyz_GpuGetNtscPalPicture() ? 288.0f : 240.0f;
         return (4.0f / 3.0f) * ((float)set_disp_horiz / 256.0f) /
                ((float)set_disp_vert / vref);
@@ -191,6 +192,10 @@ static float GetCurrentGameAspectRatio(int disp_w, int disp_h) {
         return 4.0f / 3.0f;
     }
     return (float)disp_w / (float)disp_h;
+}
+
+static float GetCurrentGameAspectRatio(int disp_w, int disp_h) {
+    return GameAspectRatioFor(aspect_mode, disp_w, disp_h);
 }
 
 // Fit a game of the given aspect ratio into the window, centering it and
