@@ -506,9 +506,14 @@ static void drive_wait_until(uint64_t until_us) {
         Psyz_AudioWaitUs(until_us - now);
         return;
     }
-    while (drive_now() < until_us) {
+    for (;;) {
         Psyz_KernelPoll();
-        uint64_t left = until_us - drive_now();
+        /* One reading: the poll may itself pass until_us. */
+        uint64_t now_us = drive_now();
+        if (now_us >= until_us) {
+            break;
+        }
+        uint64_t left = until_us - now_us;
         if (left > 2000) {
             Psyz_OsBellWait(drive_bell(), (uint32_t)(left - 1000));
         }

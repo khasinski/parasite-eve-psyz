@@ -97,9 +97,40 @@ static unsigned LinesSinceBlank(void) {
     return (unsigned)((now_us - last_blank_us) * 1000 / LineNs());
 }
 
+/* On a real-time clock the blanks come from the wall clock, also while the
+ * application works or polls VSync(1) past one: each is serviced (pads,
+ * callbacks, the vblank interrupt) the next time VSync looks at the count,
+ * as the console's interrupt would have. The offline and unpaced clocks
+ * service their blanks where they advance them. */
+static unsigned int wall_serviced_count;
+static int wall_serviced_valid;
+
+static int WallBlanks(void) {
+    return !Psyz_KernelOfflineClock() &&
+           Psyz_VideoGetVsyncMode() != PSYZ_VSYNC_LIMITLESS;
+}
+
+static unsigned int ServiceWallBlanks(void) {
+    unsigned int now = (unsigned int)Psyz_VideoVSync(-1);
+    unsigned int missed = now - wall_serviced_count;
+    if (!wall_serviced_valid || missed > 600) {
+        missed = 0; // the first look, or a resynchronised clock
+    }
+    wall_serviced_count = now;
+    wall_serviced_valid = 1;
+    while (missed--) {
+        Psyz_VSyncBlank();
+    }
+    return now;
+}
+
 static unsigned int WaitBlank(unsigned int now) {
     unsigned int before = now;
     Psyz_VideoVSync(0);
+    if (WallBlanks()) {
+        return ServiceWallBlanks();
+    }
+    wall_serviced_valid = 0;
     now = (unsigned int)Psyz_VideoVSync(-1);
     unsigned int advanced = now - before;
     while (advanced--) {
@@ -129,6 +160,10 @@ int VSync(int mode) {
     Psyz_KernelPoll();
     if (mode < 0)
         return Psyz_VideoVSync(-1);
+    // a wait (not a query, which interrupt callbacks also make)
+    if (WallBlanks()) {
+        ServiceWallBlanks();
+    }
     if (mode == 1) {
         Psyz_KernelTakeInterruptCycles(); // a polling loop absorbs handlers
         return (unsigned short)(Psyz_VideoVSync(1) - vsync_return_lines);

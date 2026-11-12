@@ -219,6 +219,9 @@ int Psyz_VideoSetAspectMode(PsyzAspectMode mode) {
 PsyzAspectMode Psyz_VideoGetAspectMode(void) { return aspect_mode; }
 
 static Uint32 last_vsync_us = 0; // time of the last blocking Psyz_VideoVSync
+/* The blank the frame limiter waited for (WaitForNextFrame). */
+static Uint32 wall_blank_us;
+static bool wall_blank_valid;
 static Uint32 vblank_clock_offset;
 static unsigned host_clock_pause_depth;
 static Uint32 host_clock_pause_count;
@@ -473,42 +476,25 @@ static void WaitForNextFrame(void) {
     /* Above normal speed driver VSync no longer paces every frame (most are
      * not shown), so the limiter does, at the faster rate. Also fall back to
      * software pacing when no swapchain image was presented (e.g. minimized). */
-    const double frame_time_us = target_frame_time_us / game_speed;
     if ((!use_driver_vsync || !frame_presented || game_speed > 1) &&
         vsync_mode != PSYZ_VSYNC_LIMITLESS) {
-        double time_to_wait_us =
-            frame_time_us - elapsed_us + drift_compensation;
-
-        // only wait if we're ahead of schedule (not running slow)
-        if (time_to_wait_us > 100.0) { // more than 0.1ms to wait
-            // High-precision mode: sleep + busy-wait
-            if (time_to_wait_us > 1000.0) {
-                Uint64 sleep_us = (Uint64)(time_to_wait_us - 1000.0);
-                SDL_DelayNS(sleep_us * 1000);
-            }
-
-            // busy-wait for precision
-            double target_elapsed = frame_time_us + drift_compensation;
-            while (GetElapsedMicroseconds(
-                       last_frame_time, SDL_GetPerformanceCounter()) <
-                   target_elapsed) {
-            }
+        /* Wait for the next blank of the wall clock that counts the blanks
+         * (WallVblankCount), as the console waits for the next vertical
+         * blank: the fields keep one phase, a frame that overran a field
+         * waits for the following blank rather than starting at once, and
+         * VSync(1) counts lines from that blank. */
+        (void)elapsed_us;
+        const double field_ns = 1e9 / (target_frame_rate * game_speed);
+        const Uint64 now_ns = SDL_GetTicksNS();
+        const Uint64 blank_ns =
+            (Uint64)((floor((double)now_ns / field_ns) + 1.0) * field_ns);
+        if (blank_ns > now_ns + 1000000) {
+            SDL_DelayNS(blank_ns - now_ns - 1000000);
         }
-
-        // measure actual frame time and compensate drift
-        Uint64 frame_end_time = SDL_GetPerformanceCounter();
-        double actual_frame_time =
-            GetElapsedMicroseconds(last_frame_time, frame_end_time);
-        double frame_error = actual_frame_time - frame_time_us;
-
-        // apply gentle correction (10% per frame)
-        drift_compensation -= frame_error * 0.1;
-        if (drift_compensation > 5000.0) {
-            drift_compensation = 5000.0;
+        while (SDL_GetTicksNS() < blank_ns) {
         }
-        if (drift_compensation < -5000.0) {
-            drift_compensation = -5000.0;
-        }
+        wall_blank_us = (Uint32)(blank_ns / 1000);
+        wall_blank_valid = true;
     }
 #endif
 
@@ -522,6 +508,84 @@ static void WaitForNextFrame(void) {
     gpu_stats.using_driver_vsync = use_driver_vsync;
 
     last_frame_time = frame_end_time;
+}
+
+/* Frame timing statistics (PSYZ_FRAME_STATS=1 prints a summary every 500
+ * presents; PSYZ_FRAME_LOG=file writes one line per present). Each blocking
+ * VSync is split into the application's CPU time since the previous VSync
+ * returned ("work"), the present call ("present") and the pacing wait; the
+ * interval is the time between consecutive present calls. */
+#define FRAME_STATS_WINDOW 500
+static int frame_stats_mode = -1;
+static FILE* frame_stats_log;
+static Uint64 frame_stats_last_present, frame_stats_last_return;
+static unsigned frame_stats_count;
+static float frame_stats_interval[FRAME_STATS_WINDOW];
+static float frame_stats_work[FRAME_STATS_WINDOW];
+static float frame_stats_present[FRAME_STATS_WINDOW];
+
+static int FrameStatsCompare(const void* a, const void* b) {
+    float x = *(const float*)a, y = *(const float*)b;
+    return x < y ? -1 : x > y;
+}
+
+static void FrameStatsSummary(const char* name, float* v, unsigned n) {
+    double sum = 0;
+    qsort(v, n, sizeof(*v), FrameStatsCompare);
+    for (unsigned i = 0; i < n; i++)
+        sum += v[i];
+    INFOF("[Frame stats] %-8s ms: mean %.2f p50 %.2f p90 %.2f p99 %.2f max %.2f"
+          " min %.2f",
+          name, sum / n, v[n / 2], v[n * 9 / 10], v[n * 99 / 100], v[n - 1],
+          v[0]);
+}
+
+static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
+                             Uint64 wait_end) {
+    if (frame_stats_mode < 0) {
+        const char* stats = SDL_getenv("PSYZ_FRAME_STATS");
+        const char* log = SDL_getenv("PSYZ_FRAME_LOG");
+        frame_stats_mode = stats && *stats && strcmp(stats, "0");
+        if (log && *log && (frame_stats_log = fopen(log, "w")))
+            fprintf(frame_stats_log, "# present_ms interval_ms work_ms "
+                                     "present_call_ms wait_ms\n");
+    }
+    if (!frame_stats_mode && !frame_stats_log)
+        return;
+    if (frame_stats_last_present) {
+        float interval = (float)(GetElapsedMicroseconds(
+                                     frame_stats_last_present, present_start) /
+                                 1000.0);
+        float work = (float)(GetElapsedMicroseconds(frame_stats_last_return,
+                                                    present_start) /
+                             1000.0);
+        float present =
+            (float)(GetElapsedMicroseconds(present_start, present_end) / 1000.0);
+        float wait =
+            (float)(GetElapsedMicroseconds(present_end, wait_end) / 1000.0);
+        if (frame_stats_log)
+            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f\n",
+                    GetElapsedMicroseconds(0, present_start) / 1000.0,
+                    interval, work, present, wait);
+        if (frame_stats_mode) {
+            frame_stats_interval[frame_stats_count] = interval;
+            frame_stats_work[frame_stats_count] = work;
+            frame_stats_present[frame_stats_count] = present;
+            if (++frame_stats_count == FRAME_STATS_WINDOW) {
+                INFOF("[Frame stats] %u presents, target %.3f ms, driver vsync %d",
+                      frame_stats_count, target_frame_time_us / game_speed / 1000.0,
+                      use_driver_vsync);
+                FrameStatsSummary("interval", frame_stats_interval,
+                                  frame_stats_count);
+                FrameStatsSummary("work", frame_stats_work, frame_stats_count);
+                FrameStatsSummary("present", frame_stats_present,
+                                  frame_stats_count);
+                frame_stats_count = 0;
+            }
+        }
+    }
+    frame_stats_last_present = present_start;
+    frame_stats_last_return = wait_end;
 }
 
 /* Implemented by the existing SDL audio backend; no device in video-clock mode.
@@ -604,18 +668,24 @@ int Psyz_VideoVSync(int mode) {
                                 game_speed) >> 6);
     }
     if (mode == 0) {
+        Uint64 present_start = SDL_GetPerformanceCounter(), present_end;
         present_skip = SkipPresent();
         PlatformBackend_Present();
         present_skip = false;
         PollEvents();
+        present_end = SDL_GetPerformanceCounter();
         WaitForNextFrame();
+        FrameStatsRecord(present_start, present_end,
+                         SDL_GetPerformanceCounter());
         /* The offline audio clock follows every blank the counter advanced
          * by, including those a VSync(1) wait spent before this present
          * (a 2-field frame). */
         while (blanks--)
             Sdl3Audio_VBlank(is_pal);
         offline_vsync_us = Psyz_KernelNowUs();
-        last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
+        last_vsync_us = wall_blank_valid ? wall_blank_us
+                                         : (Uint32)(SDL_GetTicksNS() / 1000);
+        wall_blank_valid = false;
     }
     return ret;
 }

@@ -1494,8 +1494,11 @@ bool InitPlatform() {
     }
 
     cur_tpage = 0;
+    /* A hidden renderer has nothing to pace against; PSYZ_HEADLESS_PACED=1
+     * keeps the frame limiter to measure the interactive timing path. */
     if (hidden_gpu_renderer)
-        vsync_mode = PSYZ_VSYNC_LIMITLESS;
+        vsync_mode = SDL_getenv("PSYZ_HEADLESS_PACED") ? PSYZ_VSYNC_OFF
+                                                       : PSYZ_VSYNC_LIMITLESS;
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
