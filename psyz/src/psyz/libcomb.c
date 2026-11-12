@@ -1,6 +1,7 @@
 #include <psyz.h>
 #include <libcomb.h>
 #include <psyz/log.h>
+#include <psyz/system.h>
 
 // The host has no link cable: the serial controller is idle with nothing on
 // the other end, so DSR and CTS stay off and no data is ever received.
@@ -12,7 +13,12 @@ static struct {
     u_long wait_cb;
 } comb = {0, COMB_MODE_CHAR_8 | COMB_MODE_STOP_1, 9600, 1, 0};
 
-void AddCOMB(void) {}
+/* Installing the "sio" device takes the BIOS's AddDevice and the driver's
+ * setup: 66.1k system clocks (DuckStation, SCPH-1001 BIOS; Ridge Racer
+ * Type 4's libsio AddSIO). */
+enum { ADD_SIO_DEVICE_CYCLES = 66100 };
+
+void AddCOMB(void) { Psyz_SpendCycles(ADD_SIO_DEVICE_CYCLES); }
 
 void DelCOMB(void) {}
 

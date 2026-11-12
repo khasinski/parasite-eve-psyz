@@ -167,7 +167,12 @@ static int PadDirectState(int port) {
     return PAD_STATE_FIND_CTP1;
 }
 
+/* PSY-Q libpad clears its driver state (a 0x1E0-byte BIOS bzero) and sets
+ * up the exchange: 73.3k system clocks, PadStartCom 1.6k (DuckStation). */
+enum { PAD_INIT_DIRECT_CYCLES = 73316, PAD_START_COM_CYCLES = 1589 };
+
 void PadInitDirect(u_char* pad1, u_char* pad2) {
+    Psyz_SpendCycles(PAD_INIT_DIRECT_CYCLES);
     memset(pad_direct, 0, sizeof(pad_direct));
     InitPAD((char*)pad1, PSYZ_PAD_BUF_LEN, (char*)pad2, PSYZ_PAD_BUF_LEN);
 }
@@ -177,6 +182,7 @@ int Psyz_PadDriverRunning(void) { return pad_driver_running; }
 
 void PadStartCom(void) {
     // receive buffers are already refreshed on every VSync
+    Psyz_SpendCycles(PAD_START_COM_CYCLES);
     pad_driver_running = 1;
 }
 
