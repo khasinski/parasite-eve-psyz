@@ -468,6 +468,13 @@ bool InitPlatform() {
 static bool PlatformBackend_SetDriverVsync(bool enable) {
     return SDL_GL_SetSwapInterval(enable ? 1 : 0) && enable;
 }
+/* A synced swap blocks until the display's next refresh: unsynced swaps
+ * stay with the frame limiter. */
+static bool PlatformBackend_SetPresentSync(bool enable) {
+    (void)enable;
+    return false;
+}
+static void PlatformBackend_SubmitDrawing(void) {}
 
 static void UpdateScissor(void);
 
@@ -878,6 +885,7 @@ int Psyz_VideoSetModelFiltering(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetModelFiltering(void) { return 0; }
 int Psyz_VideoSetWidescreen(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetWidescreen(void) { return 0; }
+int Psyz_VideoGetWidescreenViewMargin(void) { return 0; }
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     (void)buffer_y;
     (void)left;
@@ -978,6 +986,7 @@ void Draw_DisplayEnable(unsigned int on) {
     if (on) {
         ApplyDisplayPendingChanges();
     }
+    PresentDue(); /* the new display, at the blank */
 }
 
 void Draw_DisplayArea(unsigned int x, unsigned int y) {
@@ -987,6 +996,7 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
     Draw_FlushBuffer();
     ApplyDisplayPendingChanges();
     BindDrawFbo();
+    PresentDue(); /* the new display, at the blank */
 }
 
 void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
@@ -1071,6 +1081,7 @@ static void Draw_InitBuffer() {
 }
 
 int Draw_PushPrim(u_long* packets, int max_len) {
+    PresentDue(); /* a paced present due at the blank goes first */
     int len = max_len;
     int code = (int)(*packets >> 24) & 0xFF;
     bool isPoly = !(code & 0x40);
@@ -1366,6 +1377,7 @@ void Draw_SetOffset(int x, int y) {
 }
 
 void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (rect->w == 0 || rect->h == 0) {
         return;
     }
@@ -1388,6 +1400,7 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     UpdateScissor();
 }
 void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (rect->w == 0 || rect->h == 0) {
         return;
     }
@@ -1408,6 +1421,7 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
 }
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (rect->w == 0 || rect->h == 0) {
         return;
     }
@@ -1458,6 +1472,7 @@ static bool EnsureScratchFbo(void) {
     return ok;
 }
 void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (rect->x == x && rect->y == y) {
         return;
     }

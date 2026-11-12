@@ -1649,6 +1649,22 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
     return enable && mode == SDL_GPU_PRESENTMODE_VSYNC;
 }
 
+/* VSYNC presents never queue up while the limiter paces them below the
+ * display's rate. */
+static bool PlatformBackend_SetPresentSync(bool enable) {
+    return PlatformBackend_SetDriverVsync(enable);
+}
+
+/* The frame's drawing runs during the blank wait; the present's command
+ * buffer then holds only the display copy (the frame fences of SubmitFrame
+ * still bound the frames in flight). */
+static void PlatformBackend_SubmitDrawing(void) {
+    if (gpu_failed || !device)
+        return;
+    Draw_FlushBuffer();
+    SubmitCmd();
+}
+
 static void UpdateScissor(void);
 
 static SDL_GPUTexture* GetRenderTarget(void) {
@@ -2283,7 +2299,7 @@ static bool RefreshWindowSwapchain(void) {
     swapchain_window_w = w;
     swapchain_window_h = h;
     swapchain_window_fullscreen = fullscreen;
-    PlatformBackend_SetDriverVsync(use_driver_vsync);
+    PlatformBackend_SetDriverVsync(use_driver_vsync || present_sync);
     return swapchain_ok;
 }
 
@@ -3318,6 +3334,13 @@ int Psyz_VideoSetWidescreen(int enabled) {
     return 0;
 }
 int Psyz_VideoGetWidescreen(void) { return widescreen; }
+int Psyz_VideoGetWidescreenViewMargin(void) {
+    if (!widescreen || display_size.x <= 0 || display_size.y <= 0)
+        return 0;
+    const float half = WidescreenViewHalf(
+        GetCurrentGameAspectRatio(display_size.x, display_size.y));
+    return SDL_max(0, (int)half - display_size.x / 2);
+}
 void Psyz_VideoSetWidescreenCentred(int enabled) {
     if ((enabled != 0) != ws_centred) {
         Draw_FlushBuffer();
@@ -3488,6 +3511,7 @@ void Draw_DisplayEnable(unsigned int on) {
     if (on) {
         ApplyDisplayPendingChanges();
     }
+    PresentDue(); /* the new display, at the blank */
 }
 
 void Draw_DisplayArea(unsigned int x, unsigned int y) {
@@ -3512,6 +3536,7 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
 
     Draw_FlushBuffer();
     ApplyDisplayPendingChanges();
+    PresentDue(); /* the new display, at the blank */
 }
 
 void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
@@ -4047,6 +4072,7 @@ static void DrawLinePixels(int x0, int y0, int r0, int g0, int b0, int x1,
 }
 
 int Draw_PushPrim(u_long* packets, int max_len) {
+    PresentDue(); /* a paced present due at the blank goes first */
     int dialogue_glyph=dialogue_next_glyph,font_context=dialogue_next_context;unsigned font_crop=dialogue_next_crop,font_width=dialogue_next_width;dialogue_next_glyph=dialogue_next_context=-1;
     if (UseSoftwareBackend()) {
 #ifdef PE_PS5
@@ -4525,6 +4551,7 @@ void Draw_SetOffset(int x, int y) {
 }
 
 void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (UseSoftwareBackend()) {
         software_rasterizer.clear_image(rect, r, g, b);
         return;
@@ -4634,6 +4661,7 @@ static bool MaskedVramWrite(PS1_RECT* rect, const u16* src, int sx, int sy) {
 }
 
 void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (UseSoftwareBackend()) {
         software_rasterizer.load_image(rect, p);
         return;
@@ -4691,6 +4719,7 @@ static void UploadVram(PS1_RECT* rect, const u16* p) {
 }
 
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (UseSoftwareBackend()) {
         software_rasterizer.store_image(rect, p);
         return;
@@ -4732,6 +4761,7 @@ int Psyz_GpuReadDialogueFont(unsigned page,unsigned clut,unsigned short *texels,
 }
 
 void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
+    PresentDue(); /* a paced present due at the blank goes first */
     if (UseSoftwareBackend()) {
         software_rasterizer.move_image(rect, x, y);
         return;

@@ -60,6 +60,12 @@ static unsigned char* Sdl3Common_ReadRgb24(int x, int y, int w, int h) {
 
 // hooks the including renderer backend must implement
 static bool PlatformBackend_SetDriverVsync(bool enable);
+/* Synced presentation (no tearing) while the frame limiter paces the
+ * presents; false when the backend keeps unsynced presents for it. */
+static bool PlatformBackend_SetPresentSync(bool enable);
+/* Starts the drawing queued for the frame on the GPU before the blank wait
+ * (paced presents). */
+static void PlatformBackend_SubmitDrawing(void);
 static void PlatformBackend_Present(void);
 static void QuitPlatform(void);
 #ifdef PLATFORM_WEB
@@ -242,6 +248,13 @@ static double drift_compensation = 0.0;
 static PsyzVsyncMode vsync_mode = PSYZ_VSYNC_AUTO;
 static PsyzDitherMode dither_mode = PSYZ_DITHER_AUTO;
 static bool use_driver_vsync = false;
+/* The frame limiter paces synced presents (a display faster than the
+ * fields, e.g. 120 Hz): no tearing, and adaptive sync in fullscreen shows
+ * each field when it is presented. */
+static bool present_sync = false;
+/* Fullscreen switches the display to a mode at the field rate (50 Hz for
+ * PAL) when it has one (Psyz_VideoSetFullscreenFieldRate). */
+static bool fullscreen_field_rate = false;
 static PsyzVideoStats gpu_stats = {0};
 
 // game speed (Psyz_VideoSetSpeed): the VSync mode is never changed for it
@@ -311,7 +324,14 @@ static double GetElapsedMicroseconds(Uint64 start, Uint64 end) {
     return ((double)(end - start) * 1000000.0) / (double)perf_frequency;
 }
 
+/* The display the window is on (the primary one before there is a window). */
+static SDL_DisplayID WindowDisplay(void) {
+    SDL_DisplayID display = sdl3_window ? SDL_GetDisplayForWindow(sdl3_window) : 0;
+    return display ? display : SDL_GetPrimaryDisplay();
+}
+
 static void ConfigureVSync(double target_fps) {
+    present_sync = false;
     if (vsync_mode == PSYZ_VSYNC_ON) {
         use_driver_vsync = PlatformBackend_SetDriverVsync(true);
         INFOF("vsync forced ON (driver VSync)");
@@ -330,7 +350,7 @@ static void ConfigureVSync(double target_fps) {
         return;
     }
 
-    SDL_DisplayID display_id = SDL_GetPrimaryDisplay();
+    SDL_DisplayID display_id = WindowDisplay();
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
     double detected_framerate = 60.0;
     if (mode && mode->refresh_rate > 0.0f) {
@@ -345,6 +365,12 @@ static void ConfigureVSync(double target_fps) {
     if (can_use_driver_vsync && PlatformBackend_SetDriverVsync(true)) {
         use_driver_vsync = true;
         INFOF("detected %.2f Hz monitor, use driver VSync", detected_framerate);
+    } else if (detected_framerate > target_fps * 1.05 &&
+               PlatformBackend_SetPresentSync(true)) {
+        use_driver_vsync = false;
+        present_sync = true;
+        INFOF("detected %.2f Hz monitor, frame limiter paces %.2f Hz synced "
+              "presents", detected_framerate, target_fps);
     } else {
         PlatformBackend_SetDriverVsync(false);
         use_driver_vsync = false;
@@ -353,11 +379,19 @@ static void ConfigureVSync(double target_fps) {
     }
 }
 
+static void ApplyFullscreenMode(void);
 static void UpdateTargetFramerate(double fps) {
+    const bool changed = fps != target_frame_rate;
     target_frame_rate = fps;
     target_frame_time_us = 1000000.0 / fps;
     drift_compensation = 0.0;
     last_frame_time = SDL_GetPerformanceCounter();
+#ifndef PLATFORM_IOS
+    if (changed && fullscreen_field_rate)
+        ApplyFullscreenMode(); /* the mode at the new field rate */
+#else
+    (void)changed;
+#endif
     ConfigureVSync(target_frame_rate);
 }
 
@@ -488,8 +522,18 @@ static void WaitForNextFrame(void) {
         const Uint64 now_ns = SDL_GetTicksNS();
         const Uint64 blank_ns =
             (Uint64)((floor((double)now_ns / field_ns) + 1.0) * field_ns);
-        if (blank_ns > now_ns + 1000000) {
-            SDL_DelayNS(blank_ns - now_ns - 1000000);
+        /* Sleep to a margin before the blank and spin the rest. The margin
+         * follows the sleeps' recent overshoot (the system's timer slack,
+         * often over 1 ms on macOS), so the wait ends at the blank. */
+        static double sleep_margin_ns = 1000000.0;
+        const Uint64 margin = (Uint64)sleep_margin_ns;
+        if (blank_ns > now_ns + margin) {
+            const Uint64 wake = blank_ns - margin;
+            SDL_DelayNS(wake - now_ns);
+            const double over = (double)(Sint64)(SDL_GetTicksNS() - wake);
+            sleep_margin_ns = SDL_clamp(
+                SDL_max(sleep_margin_ns * 0.99, over + 250000.0), 500000.0,
+                4000000.0);
         }
         while (SDL_GetTicksNS() < blank_ns) {
         }
@@ -514,7 +558,9 @@ static void WaitForNextFrame(void) {
  * presents, =n every n; PSYZ_FRAME_LOG=file writes one line per present). Each blocking
  * VSync is split into the application's CPU time since the previous VSync
  * returned ("work"), the present call ("present") and the pacing wait; the
- * interval is the time between consecutive present calls. */
+ * interval is the time between consecutive present calls. after_blank_ms is
+ * the time from the blank to a paced present (PresentDue; 0 when presents
+ * are not paced). */
 #define FRAME_STATS_WINDOW 500
 static int frame_stats_mode = -1;
 static FILE* frame_stats_log;
@@ -543,7 +589,11 @@ static void FrameStatsSummary(const char* name, float* v, unsigned n) {
           v[0]);
 }
 
-static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
+/* From the end of the blank wait to a paced present (after_blank_ms). */
+static float present_after_blank_ms;
+
+static void FrameStatsRecord(Uint64 work_end, Uint64 present_start,
+                             Uint64 present_end, Uint64 wait_start,
                              Uint64 wait_end) {
     if (frame_stats_mode < 0) {
         const char* stats = SDL_getenv("PSYZ_FRAME_STATS");
@@ -555,7 +605,8 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
             frame_stats_window = FRAME_STATS_WINDOW;
         if (log && *log && (frame_stats_log = fopen(log, "w")))
             fprintf(frame_stats_log, "# present_ms interval_ms work_ms "
-                                     "present_call_ms wait_ms passes\n");
+                                     "present_call_ms wait_ms passes "
+                                     "after_blank_ms\n");
     }
     if (!frame_stats_mode && !frame_stats_log)
         return;
@@ -564,16 +615,17 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
                                      frame_stats_last_present, present_start) /
                                  1000.0);
         float work = (float)(GetElapsedMicroseconds(frame_stats_last_return,
-                                                    present_start) /
+                                                    work_end) /
                              1000.0);
         float present =
             (float)(GetElapsedMicroseconds(present_start, present_end) / 1000.0);
         float wait =
-            (float)(GetElapsedMicroseconds(present_end, wait_end) / 1000.0);
+            (float)(GetElapsedMicroseconds(wait_start, wait_end) / 1000.0);
         if (frame_stats_log)
-            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f %u\n",
+            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f %u %.3f\n",
                     GetElapsedMicroseconds(0, present_start) / 1000.0,
-                    interval, work, present, wait, frame_stats_batches);
+                    interval, work, present, wait, frame_stats_batches,
+                    present_after_blank_ms);
         if (frame_stats_mode) {
             frame_stats_interval[frame_stats_count] = interval;
             frame_stats_work[frame_stats_count] = work;
@@ -599,6 +651,58 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
     frame_stats_batches = 0;
 }
 
+/* Paced presentation (frame limiter): VSync(0) submits the frame's drawing
+ * and waits for the blank, and the present follows at the game's next
+ * display change (PutDispEnv after the blank) or its next drawing, whatever
+ * comes first (PresentDue), else at its next VSync. The field the game shows
+ * from that blank is presented at it, as evenly spaced as the blanks,
+ * instead of whenever the frame's drawing ends: a variable refresh (adaptive
+ * sync) display shows every field for the same time, a faster fixed-rate one
+ * in a steady pattern of refreshes, and the picture changes at the blank as
+ * on the console. PSYZ_PRESENT_PACING=0 presents in VSync before the wait. */
+static int present_pacing = -1;
+static bool present_due;
+static Uint64 due_work_end, due_wait_start, due_wait_end;
+static bool SkipPresent(void);
+
+static bool PacedPresents(void) {
+    if (present_pacing < 0) {
+        const char* env = SDL_getenv("PSYZ_PRESENT_PACING");
+        present_pacing = !(env && !strcmp(env, "0"));
+    }
+#ifdef PLATFORM_WEB
+    return false;
+#else
+    return present_pacing && !use_driver_vsync && game_speed == 1 &&
+           vsync_mode != PSYZ_VSYNC_LIMITLESS && !host_clock_pause_depth;
+#endif
+}
+
+/* Presents; returns when the present call started and ended. */
+static void PresentFrame(Uint64* present_start, Uint64* present_end) {
+    *present_start = SDL_GetPerformanceCounter();
+    present_skip = SkipPresent();
+    PlatformBackend_Present();
+    present_skip = false;
+    *present_end = SDL_GetPerformanceCounter();
+}
+
+/* The backend calls this before a display change or drawing. */
+static void PresentDue(void) {
+    if (!present_due)
+        return;
+    present_due = false;
+    present_after_blank_ms = (float)(GetElapsedMicroseconds(
+                                         due_wait_end,
+                                         SDL_GetPerformanceCounter()) /
+                                     1000.0);
+    Uint64 present_start, present_end;
+    PresentFrame(&present_start, &present_end);
+    FrameStatsRecord(due_work_end, present_start, present_end, due_wait_start,
+                     due_wait_end);
+    present_after_blank_ms = 0.0f;
+}
+
 /* Implemented by the existing SDL audio backend; no device in video-clock mode.
  */
 void Sdl3Audio_VBlank(bool pal);
@@ -608,7 +712,7 @@ void Sdl3Audio_SetSpeed(unsigned speed);
  * refresh has passed since the last one shown: presents never wait on a
  * full swapchain queue and the newest frame is the one on screen. */
 static bool SkipPresent(void) {
-    if (game_speed < 2 || !use_driver_vsync) {
+    if (game_speed < 2 || (!use_driver_vsync && !present_sync)) {
         return false;
     }
     Uint64 now = SDL_GetPerformanceCounter();
@@ -679,15 +783,24 @@ int Psyz_VideoVSync(int mode) {
                                 game_speed) >> 6);
     }
     if (mode == 0) {
-        Uint64 present_start = SDL_GetPerformanceCounter(), present_end;
-        present_skip = SkipPresent();
-        PlatformBackend_Present();
-        present_skip = false;
-        PollEvents();
-        present_end = SDL_GetPerformanceCounter();
-        WaitForNextFrame();
-        FrameStatsRecord(present_start, present_end,
-                         SDL_GetPerformanceCounter());
+        const Uint64 work_end = SDL_GetPerformanceCounter();
+        PresentDue(); /* none came since the last blank */
+        if (PacedPresents()) {
+            PlatformBackend_SubmitDrawing();
+            PollEvents();
+            due_work_end = work_end;
+            due_wait_start = SDL_GetPerformanceCounter();
+            WaitForNextFrame();
+            due_wait_end = SDL_GetPerformanceCounter();
+            present_due = true;
+        } else {
+            Uint64 present_start, present_end;
+            PresentFrame(&present_start, &present_end);
+            PollEvents();
+            WaitForNextFrame();
+            FrameStatsRecord(work_end, present_start, present_end, present_end,
+                             SDL_GetPerformanceCounter());
+        }
         /* The offline audio clock follows every blank the counter advanced
          * by, including those a VSync(1) wait spent before this present
          * (a 2-field frame). */
@@ -1102,7 +1215,58 @@ void Psyz_PadsPoll(void) {
 }
 
 #ifndef PLATFORM_IOS
-// Desktop fullscreen keeps the user display mode and refresh rate unchanged.
+/* The window display's fullscreen mode at the field rate (within 1%: 50 Hz
+ * for PAL's 49.75, 59.94 or 60 Hz for NTSC's 59.82) at the desktop's size
+ * and density, or NULL when the desktop already runs at it or the display
+ * has none. */
+static const SDL_DisplayMode* FieldRateDisplayMode(void) {
+    static SDL_DisplayMode chosen;
+    const SDL_DisplayID display = WindowDisplay();
+    const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+    if (!desktop ||
+        SDL_fabs(desktop->refresh_rate - target_frame_rate) <
+            target_frame_rate * 0.01) {
+        return NULL;
+    }
+    int count = 0;
+    SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(display, &count);
+    const SDL_DisplayMode* best = NULL;
+    for (int i = 0; modes && i < count; ++i) {
+        const SDL_DisplayMode* m = modes[i];
+        const double off = SDL_fabs(m->refresh_rate - target_frame_rate);
+        if (m->w != desktop->w || m->h != desktop->h ||
+            m->pixel_density != desktop->pixel_density ||
+            off >= target_frame_rate * 0.01)
+            continue;
+        if (!best || off < SDL_fabs(best->refresh_rate - target_frame_rate))
+            best = m;
+    }
+    if (best)
+        chosen = *best;
+    SDL_free(modes);
+    return best ? &chosen : NULL;
+}
+
+/* Desktop fullscreen keeps the user display mode; with
+ * fullscreen_field_rate it switches to one at the field rate if there is. */
+static void ApplyFullscreenMode(void) {
+    if (!sdl3_window || !is_fullscreen)
+        return;
+    const SDL_DisplayMode* mode =
+        fullscreen_field_rate ? FieldRateDisplayMode() : NULL;
+    if (!SDL_SetWindowFullscreenMode(sdl3_window, mode)) {
+        WARNF("failed to select the fullscreen mode: %s", SDL_GetError());
+        if (!mode || !SDL_SetWindowFullscreenMode(sdl3_window, NULL))
+            return;
+        mode = NULL;
+    }
+    if (mode)
+        INFOF("fullscreen at %dx%d %.3f Hz", mode->w, mode->h,
+              mode->refresh_rate);
+    SDL_SyncWindow(sdl3_window);
+    SDL_SetAtomicInt(&timing_reset_requested, 1); /* the new refresh rate */
+}
+
 static void SetFullScreen(bool isFullscreen) {
     if (!sdl3_window) {
         return;
@@ -1112,21 +1276,28 @@ static void SetFullScreen(bool isFullscreen) {
     }
     is_fullscreen = isFullscreen;
     if (is_fullscreen) {
-        if (!SDL_SetWindowFullscreenMode(sdl3_window, NULL)) {
+        const SDL_DisplayMode* mode =
+            fullscreen_field_rate ? FieldRateDisplayMode() : NULL;
+        if (!SDL_SetWindowFullscreenMode(sdl3_window, mode) &&
+            (!mode || !SDL_SetWindowFullscreenMode(sdl3_window, NULL))) {
             WARNF("failed to select desktop fullscreen: %s", SDL_GetError());
             is_fullscreen = false;
             return;
         }
+        if (mode)
+            INFOF("fullscreen at %dx%d %.3f Hz", mode->w, mode->h,
+                  mode->refresh_rate);
         if (!SDL_SetWindowFullscreen(sdl3_window, true)) {
             WARNF("failed to enter fullscreen: %s", SDL_GetError());
             is_fullscreen = false;
             return;
         }
-        INFOF("entered borderless desktop fullscreen");
+        INFOF("entered fullscreen");
     } else {
         SDL_SetWindowFullscreen(sdl3_window, false);
         INFOF("returned to windowed mode");
     }
+    SDL_SetAtomicInt(&timing_reset_requested, 1); /* the refresh rate */
     SDL_SyncWindow(sdl3_window);
     SDL_GetWindowSizeInPixels(
         sdl3_window, &wnd_size_in_pixels.w, &wnd_size_in_pixels.h);
@@ -1134,6 +1305,30 @@ static void SetFullScreen(bool isFullscreen) {
 #endif
 
 SDL_Window* Psyz_GetWindow_SDL3(void) { return sdl3_window; }
+
+void Psyz_VideoSetFullscreenFieldRate(int enabled) {
+    if (fullscreen_field_rate == (enabled != 0))
+        return;
+    fullscreen_field_rate = enabled != 0;
+#ifndef PLATFORM_IOS
+    ApplyFullscreenMode();
+#endif
+}
+
+int Psyz_VideoGetFullscreenFieldRate(void) { return fullscreen_field_rate; }
+
+int Psyz_VideoFullscreenFieldRateAvailable(void) {
+#ifndef PLATFORM_IOS
+    if (!sdl3_window)
+        return 0;
+    const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(WindowDisplay());
+    return FieldRateDisplayMode() != NULL ||
+           (desktop && SDL_fabs(desktop->refresh_rate - target_frame_rate) <
+                           target_frame_rate * 0.01);
+#else
+    return 0;
+#endif
+}
 
 bool Psyz_SetFullscreen_SDL3(bool enabled) {
 #ifndef PLATFORM_IOS
@@ -1172,6 +1367,11 @@ static void PollEvents(void) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             SDL_GetWindowSizeInPixels(
                 sdl3_window, &wnd_size_in_pixels.w, &wnd_size_in_pixels.h);
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            /* another refresh rate: driver VSync or the limiter */
+            SDL_SetAtomicInt(&timing_reset_requested, 1);
             break;
         case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
 #ifdef PLATFORM_IOS

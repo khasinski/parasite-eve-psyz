@@ -251,6 +251,19 @@ int Psyz_VideoSetGeometryCorrection(int enabled);
  */
 int Psyz_VideoGetGeometryCorrection(void);
 
+/**
+ * @brief Fullscreen at the field rate
+ *
+ * When enabled, fullscreen switches the display to a mode at the console's
+ * field rate (50 Hz for PAL, 59.94/60 Hz for NTSC) at the desktop's size if
+ * the display offers one, so driver VSync shows every field for one refresh.
+ * Disabled (the default), fullscreen keeps the desktop's mode.
+ */
+void Psyz_VideoSetFullscreenFieldRate(int enabled);
+int Psyz_VideoGetFullscreenFieldRate(void);
+/** Non-zero when the window's display can run at the field rate. */
+int Psyz_VideoFullscreenFieldRateAvailable(void);
+
 /** Display-only 4x SSAA (twice each axis). Native VRAM remains unchanged. */
 int Psyz_VideoSetAntialiasing(int enabled);
 int Psyz_VideoGetAntialiasing(void);
@@ -286,6 +299,14 @@ int Psyz_VideoGetEffectGeometryCorrection(void);
  */
 int Psyz_VideoSetWidescreen(int enabled);
 int Psyz_VideoGetWidescreen(void);
+/**
+ * @brief Game pixels the 16:9 view shows past each side of the screen
+ *
+ * For the current display mode and aspect setting, unshifted (e.g. 29 for
+ * a 320x256 PAL screen at its display aspect): where a game anchors screen
+ * elements to the view's edges. 0 while widescreen is off.
+ */
+int Psyz_VideoGetWidescreenViewMargin(void);
 
 /**
  * @brief Tell the presenter where the game's picture is in one buffer
