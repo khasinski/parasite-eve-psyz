@@ -1937,6 +1937,42 @@ static inline void PgxpStoreAddr(const void* dst, PgxpSxyEntry entry) {
     };
 }
 
+/* INTPL precision (Psyz_GteSetPgxpIntpl): INTPL truncates an interpolated
+ * point to whole units, so a vertex a renderer subdivides out of an edge and
+ * then projects lies up to a unit off that edge. With geometry correction the
+ * neighbour that draws the same edge undivided then shows a hairline crack
+ * along it. The last INTPL results of the frame keep their exact value (from
+ * the exact values of their inputs, when those were INTPL results too), and a
+ * vertex projected with exactly that integer position takes it. */
+typedef struct {
+    int x, y, z;
+    unsigned int gen;
+    double exact[3];
+} PgxpIntplEntry;
+#define PGXP_INTPL_RING 64u
+static PgxpIntplEntry pgxp_intpl_ring[PGXP_INTPL_RING];
+static unsigned int pgxp_intpl_next;
+static int pgxp_intpl = 0;
+void Psyz_GteSetPgxpIntpl(int enabled) { pgxp_intpl = enabled != 0; }
+/* The exact value of the newest INTPL result (x, y, z) of this frame. */
+static int PgxpIntplFind(int x, int y, int z, double exact[3]) {
+    if (!pgxp_intpl || !pgxp_active) {
+        return 0;
+    }
+    for (unsigned int i = 1; i <= PGXP_INTPL_RING; ++i) {
+        const PgxpIntplEntry* e =
+            &pgxp_intpl_ring[(pgxp_intpl_next - i) % PGXP_INTPL_RING];
+        if (e->gen != pgxp_frame_gen) {
+            return 0; /* older entries are older still */
+        }
+        if (e->x == x && e->y == y && e->z == z) {
+            memcpy(exact, e->exact, sizeof(e->exact));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static inline PgxpSxyEntry PgxpRecordVertex(
     int sf, int lm, int vx, int vy, int vz, int sx, int sy) {
     PgxpSxyEntry out = {0};
@@ -1948,22 +1984,27 @@ static inline PgxpSxyEntry PgxpRecordVertex(
         else ++pgxp_reasons.matrix_integer;
     }
     double fx, fy, fz;
+    double v[3] = {vx, vy, vz};
+    PgxpIntplFind(vx, vy, vz, v);
     if (pgxp_matrix_valid) {
-        fx = pgxp_trans[0] + pgxp_rot[0][0] * vx + pgxp_rot[0][1] * vy +
-             pgxp_rot[0][2] * vz;
-        fy = pgxp_trans[1] + pgxp_rot[1][0] * vx + pgxp_rot[1][1] * vy +
-             pgxp_rot[1][2] * vz;
-        fz = pgxp_trans[2] + pgxp_rot[2][0] * vx + pgxp_rot[2][1] * vy +
-             pgxp_rot[2][2] * vz;
+        fx = pgxp_trans[0] + pgxp_rot[0][0] * v[0] + pgxp_rot[0][1] * v[1] +
+             pgxp_rot[0][2] * v[2];
+        fy = pgxp_trans[1] + pgxp_rot[1][0] * v[0] + pgxp_rot[1][1] * v[1] +
+             pgxp_rot[1][2] * v[2];
+        fz = pgxp_trans[2] + pgxp_rot[2][0] * v[0] + pgxp_rot[2][1] * v[1] +
+             pgxp_rot[2][2] * v[2];
     } else {
-        fx = (double)M.t[0] + ((double)M.m[0][0] * vx + (double)M.m[0][1] * vy +
-                               (double)M.m[0][2] * vz) *
+        fx = (double)M.t[0] + ((double)M.m[0][0] * v[0] +
+                               (double)M.m[0][1] * v[1] +
+                               (double)M.m[0][2] * v[2]) *
                                   (1.0 / 4096.0);
-        fy = (double)M.t[1] + ((double)M.m[1][0] * vx + (double)M.m[1][1] * vy +
-                               (double)M.m[1][2] * vz) *
+        fy = (double)M.t[1] + ((double)M.m[1][0] * v[0] +
+                               (double)M.m[1][1] * v[1] +
+                               (double)M.m[1][2] * v[2]) *
                                   (1.0 / 4096.0);
-        fz = (double)M.t[2] + ((double)M.m[2][0] * vx + (double)M.m[2][1] * vy +
-                               (double)M.m[2][2] * vz) *
+        fz = (double)M.t[2] + ((double)M.m[2][0] * v[0] +
+                               (double)M.m[2][1] * v[1] +
+                               (double)M.m[2][2] * v[2]) *
                                   (1.0 / 4096.0);
     }
     if (!sf) {
@@ -2735,10 +2776,28 @@ static void DCPL(unsigned int cmd) {
 // INTPL: interpolate IR toward FC using IR0. IR<<12 fits in s28 → s32 ok.
 static void INTPL(unsigned int cmd) {
     int sf = (cmd >> 19) & 1, lm = (cmd >> 10) & 1;
+    const int track = pgxp_intpl && pgxp_active && sf;
+    double from[3] = {IR1, IR2, IR3}, to[3] = {L2.t[0], L2.t[1], L2.t[2]};
+    const double t = IR0 / 4096.0;
+    if (track) {
+        PgxpIntplFind(IR1, IR2, IR3, from);
+        PgxpIntplFind(L2.t[0], L2.t[1], L2.t[2], to);
+    }
     FLAG = 0;
     DEPTH_CUE(sf, lm, IR1 * 4096, IR2 * 4096, IR3 * 4096);
     COLOR_FIFO_PUSH();
     FLAG_UPDATE_ERROR();
+    if (track &&
+        !(FLAG & (FLAG_IR1_SAT | FLAG_IR2_SAT | FLAG_IR3_SAT))) {
+        PgxpIntplEntry* e =
+            &pgxp_intpl_ring[pgxp_intpl_next++ % PGXP_INTPL_RING];
+        e->x = IR1;
+        e->y = IR2;
+        e->z = IR3;
+        e->gen = pgxp_frame_gen;
+        for (int i = 0; i < 3; ++i)
+            e->exact[i] = from[i] + (to[i] - from[i]) * t;
+    }
 }
 
 // GPF: general purpose interpolation (IR0 * IR -> MAC/IR, push color).
@@ -2785,13 +2844,47 @@ static void GPL(unsigned int cmd25) {
     FLAG_UPDATE_ERROR();
 }
 
+/* NCLIP of the precise vertices in SXY0..SXY2 (Psyz_GteSetPgxpNclip): while
+ * geometry correction culls, a triangle whose whole-pixel corners give area 0
+ * or the opposite sign takes the facing of its precise projection (+1 / -1,
+ * or the integer area when that agrees), as in Psyz_GtePgxpNclip3. A sliver
+ * snapped to nothing is then drawn at its real size instead of leaving a
+ * crack. Registers without a current precise vertex keep the integer area. */
+static int pgxp_gte_nclip = 0;
+void Psyz_GteSetPgxpNclip(int enabled) { pgxp_gte_nclip = enabled != 0; }
+static int PgxpFifoNclip(int int_area) {
+    const short sx[3] = {SX0, SX1, SX2}, sy[3] = {SY0, SY1, SY2};
+    if (!pgxp_gte_nclip || !pgxp_active || !pgxp_culling) {
+        return int_area;
+    }
+    for (int i = 0; i < 3; ++i) {
+        const PgxpSxyEntry* e = &pgxp_fifo[i];
+        if (e->gen != pgxp_frame_gen ||
+            e->sxy != (unsigned int)SXY(sx[i], sy[i]) ||
+            (e->is_effect && !pgxp_effect_enabled)) {
+            return int_area;
+        }
+    }
+    const float area =
+        pgxp_fifo[0].x * (pgxp_fifo[1].y - pgxp_fifo[2].y) +
+        pgxp_fifo[1].x * (pgxp_fifo[2].y - pgxp_fifo[0].y) +
+        pgxp_fifo[2].x * (pgxp_fifo[0].y - pgxp_fifo[1].y);
+    if (area > 1e-4f) {
+        return int_area > 0 ? int_area : 1;
+    }
+    if (area < -1e-4f) {
+        return int_area < 0 ? int_area : -1;
+    }
+    return int_area;
+}
+
 // Normal clipping. MAC0 = SX0*(SY1-SY2) + SX1*(SY2-SY0) + SX2*(SY0-SY1).
 #define NCLIP()                                                                \
     do {                                                                       \
         int nclip_m;                                                           \
         FLAG = 0;                                                              \
         NCLIP_CALC(nclip_m, SX0, SY0, SX1, SY1, SX2, SY2, FLAG);               \
-        MAC0 = nclip_m;                                                        \
+        MAC0 = PgxpFifoNclip(nclip_m);                                         \
         FLAG_UPDATE_ERROR();                                                   \
     } while (0)
 

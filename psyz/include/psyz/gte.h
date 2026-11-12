@@ -157,6 +157,19 @@ void Psyz_GteLoadSxyFrom(unsigned reg, const void* src);
  * output addresses while geometry correction is active (by default they do
  * only in effect mode). Default: off. */
 void Psyz_GteSetPgxpLibraryStores(int enabled);
+/* Let the NCLIP command take the facing of the precise vertices in SXY0..SXY2
+ * while geometry correction is active (as Psyz_GtePgxpNclip3 does for stored
+ * words): a triangle that snaps to zero or reversed area at whole pixels is
+ * kept when its precise projection faces the camera, and the reverse. Off,
+ * and always without geometry correction, NCLIP is the integer result.
+ * Default: off. */
+void Psyz_GteSetPgxpNclip(int enabled);
+/* Let a vertex projected right after INTPL interpolated it (the newest 64
+ * INTPL results of the frame) take the exact interpolated position instead
+ * of the whole units INTPL leaves in IR1..IR3, while geometry correction is
+ * active. Subdivided edges then stay on the straight edge of an undivided
+ * neighbour instead of opening hairline cracks. Default: off. */
+void Psyz_GteSetPgxpIntpl(int enabled);
 /* A copy of the screen word sxy from src to dst: the precise vertex
  * recorded for src (if it still holds sxy) now belongs to dst too. */
 void Psyz_GteCopyPgxpSxy(

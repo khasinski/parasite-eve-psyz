@@ -966,6 +966,79 @@ ZTEST(gpu, geometry_metadata_follows_sxy_loads_and_library_stores) {
 #endif
 }
 
+/* With geometry correction a sliver that snaps to zero area keeps the facing
+ * of its precise projection (Psyz_GteSetPgxpNclip), and a vertex INTPL
+ * interpolated keeps the fraction INTPL truncated (Psyz_GteSetPgxpIntpl). */
+ZTEST(gpu, geometry_correction_precise_nclip_and_intpl) {
+#ifdef PSYZ_TEST_SDL_GPU
+    extern void Psyz_PgxpNextFrame(void);
+    extern int Psyz_PgxpLookupVertex(
+        const void*, unsigned int, float*, float*, float*);
+    extern void Psyz_GteDataWrite(unsigned int, unsigned int);
+    extern unsigned int Psyz_GteDataRead(unsigned int);
+    extern void Psyz_GteCtrlWrite(unsigned int, unsigned int);
+    extern void Psyz_GteCommand(unsigned int);
+    extern void Psyz_GteStoreSxyTo(unsigned int, void*);
+    extern void Psyz_GteSetPgxpNclip(int);
+    extern void Psyz_GteSetPgxpIntpl(int);
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        return;
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_VideoSetGeometryCorrection(1);
+    Psyz_PgxpNextFrame();
+    for (unsigned int i = 0; i < 8; i++)
+        Psyz_GteCtrlWrite(i, i == 0 || i == 2 || i == 4 ? 4096 : 0);
+    Psyz_GteCtrlWrite(7, 700);
+    Psyz_GteCtrlWrite(24, 160u << 16);
+    Psyz_GteCtrlWrite(25, 112u << 16);
+    Psyz_GteCtrlWrite(26, 256);
+    /* (0,0), (20,0), (10,2) at 256/700: whole-pixel y 112 for all three */
+    for (int on = 0; on < 2; on++) {
+        Psyz_GteSetPgxpNclip(on);
+        Psyz_GteDataWrite(0, 0);
+        Psyz_GteDataWrite(1, 0);
+        Psyz_GteDataWrite(2, 20);
+        Psyz_GteDataWrite(3, 0);
+        Psyz_GteDataWrite(4, 10u | (2u << 16));
+        Psyz_GteDataWrite(5, 0);
+        Psyz_GteCommand(0x280030); /* RTPT */
+        Psyz_GteCommand(0x1400006); /* NCLIP */
+        zassert_s32_eq(on, (int)Psyz_GteDataRead(24));
+    }
+    Psyz_GteSetPgxpNclip(0);
+    /* INTPL 3 -> 4 at one half leaves 3 in IR1; projected, x is 3.5 */
+    for (int on = 0; on < 2; on++) {
+        unsigned int xy;
+        float x, y, w;
+        Psyz_GteSetPgxpIntpl(on);
+        Psyz_GteDataWrite(8, 0x800);
+        Psyz_GteDataWrite(9, 3);
+        Psyz_GteDataWrite(10, 0);
+        Psyz_GteDataWrite(11, 0);
+        Psyz_GteCtrlWrite(21, 4);
+        Psyz_GteCtrlWrite(22, 0);
+        Psyz_GteCtrlWrite(23, 0);
+        Psyz_GteCommand(0x0980011); /* INTPL */
+        zassert_s32_eq(3, (int)Psyz_GteDataRead(9));
+        Psyz_GteDataWrite(
+            0, Psyz_GteDataRead(9) | (Psyz_GteDataRead(10) << 16));
+        Psyz_GteDataWrite(1, Psyz_GteDataRead(11));
+        Psyz_GteCommand(0x180001); /* RTPS */
+        Psyz_GteStoreSxyTo(14, &xy);
+        zassert_s32_eq(1, Psyz_PgxpLookupVertex(&xy, xy, &x, &y, &w));
+        const float want = 160.0f + (on ? 3.5f : 3.0f) * 256.0f / 700.0f;
+        zassert_s32_eq(1, x > want - 0.001f && x < want + 0.001f);
+    }
+    Psyz_GteSetPgxpIntpl(0);
+    Psyz_GteCtrlWrite(21, 0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
 /* Keep the raw subrectangle blit as a diagnostic: its rounding varies by
  * backend. The origin-zero presentation used by the renderer must be stable. */
 ZTEST(gpu, presentation_crop_is_stable_across_field_buffers) {
