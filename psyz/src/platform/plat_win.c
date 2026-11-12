@@ -21,12 +21,11 @@
 #include <wchar.h>
 #include <errno.h>
 #include <stdio.h>
-#include <windows.h>
 #include <romio.h>
 
 /* SDL paths are UTF-8; the CRT's narrow file APIs take the ANSI code page,
  * so every host path goes through UTF-16. The path is made absolute and
- * normalised (GetFullPathNameW resolves ".", ".." and "/") and given the
+ * normalised (_wfullpath resolves ".", ".." and "/") and given the
  * extended-length prefix, so user-data directories also work beyond
  * MAX_PATH. The result is released with SDL_free. */
 static wchar_t* file_path_utf16(const char* path) {
@@ -41,33 +40,31 @@ static wchar_t* file_path_utf16(const char* path) {
             *p = L'\\';
     if (!wcsncmp(wide, L"\\\\?\\", 4) || !*wide)
         return wide;
-    DWORD needed = GetFullPathNameW(wide, 0, NULL, NULL);
-    if (!needed)
-        return wide;
-    // "\\?\UNC\" replaces the leading "\\" of a UNC path: +6 characters.
-    wchar_t* full = (wchar_t*)SDL_malloc((needed + 8) * sizeof(wchar_t));
-    if (!full) {
-        SDL_free(wide);
-        return NULL;
-    }
-    DWORD len = GetFullPathNameW(wide, needed, full + 8, NULL);
+    // windows.h is not included (its names clash with the PS1 kernel.h);
+    // _wfullpath is GetFullPathNameW through the CRT.
+    wchar_t* resolved = _wfullpath(NULL, wide, 0);
     SDL_free(wide);
-    if (!len || len >= needed) {
-        SDL_free(full);
+    if (!resolved)
+        return NULL;
+    size_t len = wcslen(resolved);
+    // "\\?\UNC\" replaces the leading "\\" of a UNC path: 8 characters at most.
+    wchar_t* full = (wchar_t*)SDL_malloc((len + 9) * sizeof(wchar_t));
+    if (!full) {
+        free(resolved);
         return NULL;
     }
-    wchar_t* body = full + 8;
-    wchar_t* out;
-    if (body[0] == L'\\' && body[1] == L'\\') {
-        if (body[2] == L'?' || body[2] == L'.')
-            return memmove(full, body, (len + 1) * sizeof(wchar_t));
-        out = body + 2 - 8; // "\\?\UNC\" + "server\share..."
-        memcpy(out, L"\\\\?\\UNC\\", 8 * sizeof(wchar_t));
+    if (resolved[0] == L'\\' && resolved[1] == L'\\') {
+        if (resolved[2] == L'?' || resolved[2] == L'.')
+            memcpy(full, resolved, (len + 1) * sizeof(wchar_t));
+        else {
+            memcpy(full, L"\\\\?\\UNC", 7 * sizeof(wchar_t));
+            memcpy(full + 7, resolved + 1, len * sizeof(wchar_t)); // "\server..."
+        }
     } else {
-        out = body - 4;
-        memcpy(out, L"\\\\?\\", 4 * sizeof(wchar_t));
+        memcpy(full, L"\\\\?\\", 4 * sizeof(wchar_t));
+        memcpy(full + 4, resolved, (len + 1) * sizeof(wchar_t));
     }
-    memmove(full, out, (wcslen(out) + 1) * sizeof(wchar_t));
+    free(resolved);
     return full;
 }
 
