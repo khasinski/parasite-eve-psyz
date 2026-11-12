@@ -573,18 +573,19 @@ static bool InterpLine(const u_long *words,int count,bool gouraud,int *mid_x,int
         at++;
         if(SDL_fabsf(position[i][0]-p->position[i][0])>160.0f||SDL_fabsf(position[i][1]-p->position[i][1])>160.0f)valid=false;
     }
-    /* A midpoint-only line (see InterpCapture) continues the last motion of
-     * a line the game drew in the frame before. */
-    const bool extrapolated=!*own&&p->frame&&p->frame+1==interp_frame&&p->count==points&&
+    /* A midpoint-only line pairs as a polygon does (see InterpCapture);
+     * one that cannot continues the last motion of a line the game drew in
+     * the frame before. */
+    if(!*own&&(p->midpoint_pose||(e->flags&PSYZ_INTERP_NO_POSE)))valid=false;
+    const bool extrapolated=!valid&&!*own&&p->frame&&p->frame+1==interp_frame&&p->count==points&&
         !p->midpoint_pose&&p->motion_frame==p->frame;
-    if(!*own)valid=false;
     for(int i=0;i<count;i++){
         if(valid){mid_x[i]=(int)SDL_floorf((position[i][0]+p->position[i][0])*0.5f+0.5f);
                   mid_y[i]=(int)SDL_floorf((position[i][1]+p->position[i][1])*0.5f+0.5f);}
         else if(extrapolated){mid_x[i]=(int)SDL_floorf(p->position[i][0]+p->motion[i][0]*0.5f+0.5f);
                   mid_y[i]=(int)SDL_floorf(p->position[i][1]+p->motion[i][1]*0.5f+0.5f);}
     }
-    if(valid){for(int i=0;i<count;i++){p->motion[i][0]=position[i][0]-p->position[i][0];p->motion[i][1]=position[i][1]-p->position[i][1];}
+    if(valid&&*own){for(int i=0;i<count;i++){p->motion[i][0]=position[i][0]-p->position[i][0];p->motion[i][1]=position[i][1]-p->position[i][1];}
         p->motion_frame=interp_frame;}
     else p->motion_frame=0;
     memcpy(p->position,position,(size_t)count*sizeof(position[0]));p->frame=interp_frame;p->count=points;p->signature=0;
@@ -642,11 +643,12 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     }
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&(any_texture||p->signature==signature);
     /* A midpoint-only packet is geometry the game leaves out of the frame
-     * (nearer than the projection plane, passing under the camera): its
-     * pose there is no projection the game would draw, often far off the
-     * view. It is never averaged with it: the midpoint continues the last
-     * motion of a pose the game drew in the frame before (below). */
-    if(midpoint_only)valid=false;
+     * (nearer than the projection plane): it pairs only with a pose the
+     * game drew in the frame before; two midpoint-only poses are no
+     * projections the game would draw (often far off the view). With
+     * PSYZ_INTERP_NO_POSE its pose this frame is none either: the midpoint
+     * continues the last motion of the drawn pose instead (below). */
+    if(midpoint_only&&(p->midpoint_pose||(flags&PSYZ_INTERP_NO_POSE)))valid=false;
     for(unsigned i=0;i<count;++i){
         /* a tagged identity is the same face: it may move as far as the
          * view reaches (vertices past the GTE's limit are handled below) */

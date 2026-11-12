@@ -131,6 +131,12 @@ void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id);
  * new level of detail whose previous one is drawn there instead); it still
  * pairs with the next frame. */
 #define PSYZ_INTERP_FRAME_ONLY 4u
+/* With PSYZ_INTERP_NO_POSE (and PSYZ_INTERP_MIDPOINT_ONLY) the packet's
+ * coordinates this frame are no projection (geometry passing behind the
+ * view): the midpoint continues the last motion of the pose drawn in the
+ * frame before instead of pairing with them, and leaves it out without
+ * one. */
+#define PSYZ_INTERP_NO_POSE 8u
 void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long id,unsigned flags);
 /* Like Psyz_GpuPrepareInterpolatedPresent, for a game that waits on VSync(1)
  * over several fields with one VSync(0) per frame: the midpoint is presented
