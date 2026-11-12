@@ -241,6 +241,19 @@ const char *Psyz_GpuHdModelsStatus(void);
 void Psyz_GpuBeginPlayerTextureSet(int bank);
 void Psyz_GpuRegisterPlayerTexturePage(unsigned page, unsigned clut);
 
+/**
+ * @brief Show a PAL game's picture whole at NTSC field timing.
+ *
+ * For a PAL game run with SetVideoMode(MODE_NTSC) (59.82 Hz fields of 263
+ * lines): PutDispEnv does not end the NTSC display range at line 258, so a
+ * screen of up to 288 lines (a PAL 256-line screen) is displayed whole, as
+ * if the field had the lines, and the display aspect counts its lines
+ * against PAL's 288 as in MODE_PAL. The fields keep their NTSC timing (the
+ * blank starts no later than line 263). No effect in MODE_PAL. Off by default.
+ */
+void Psyz_GpuSetNtscPalPicture(int enabled);
+int Psyz_GpuGetNtscPalPicture(void);
+
 /* Two independent native font alphabets/palettes. Context0 dialogue,1 menu. */
 uint64_t Psyz_GpuWatchFontContext(unsigned context,unsigned page,unsigned clut);
 uint64_t Psyz_GpuFontContextGeneration(unsigned context,unsigned page,unsigned clut);

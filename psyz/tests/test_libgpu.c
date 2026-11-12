@@ -3695,6 +3695,61 @@ ZTEST(gpu, clut_cache_reloads_on_change_or_clear) {
     zexpect_u16_eq(0x03E0, ReadPixel(33, 310));
 }
 
+#if defined(__psyz) && !defined(__PSP__)
+unsigned Psyz_GpuCrtcFieldLines(void);
+unsigned Psyz_GpuCrtcBlankLines(void);
+
+/* PutDispEnv sends the display mode and ranges only when they change. */
+static void PutDispEnvAgain(DISPENV* disp) {
+    DISPENV other = *disp;
+    other.screen.y += 1;
+    other.disp.y += 2;
+    PutDispEnv(&other);
+    PutDispEnv(disp);
+}
+#endif
+
+/* A 256-line screen: PAL shows it from line 19 (58 blank lines of 314); NTSC
+ * ends the range at line 258 (21 blank lines of 263) unless the PAL picture
+ * is kept at NTSC timing, which shows it whole and blanks only from line 263
+ * to the start at line 16. */
+ZTEST(gpu, ntsc_pal_picture_keeps_a_pal_screen_whole) {
+#if defined(__psyz) && !defined(__PSP__)
+    const long video_mode = GetVideoMode();
+    DISPENV disp;
+    SetDefDispEnv(&disp, 0, 0, 320, 256);
+    disp.screen.h = 256;
+
+    SetVideoMode(MODE_PAL);
+    PutDispEnvAgain(&disp);
+    zexpect_s32_eq(314, Psyz_GpuCrtcFieldLines());
+    zexpect_s32_eq(58, Psyz_GpuCrtcBlankLines());
+
+    SetVideoMode(MODE_NTSC);
+    PutDispEnvAgain(&disp);
+    zexpect_s32_eq(263, Psyz_GpuCrtcFieldLines());
+    zexpect_s32_eq(21, Psyz_GpuCrtcBlankLines());
+
+    Psyz_GpuSetNtscPalPicture(1);
+    zexpect_s32_eq(1, Psyz_GpuGetNtscPalPicture());
+    PutDispEnvAgain(&disp);
+    zexpect_s32_eq(263, Psyz_GpuCrtcFieldLines());
+    zexpect_s32_eq(16, Psyz_GpuCrtcBlankLines());
+
+    /* no effect on PAL */
+    SetVideoMode(MODE_PAL);
+    PutDispEnvAgain(&disp);
+    zexpect_s32_eq(314, Psyz_GpuCrtcFieldLines());
+    zexpect_s32_eq(58, Psyz_GpuCrtcBlankLines());
+
+    Psyz_GpuSetNtscPalPicture(0);
+    SetVideoMode(video_mode);
+    PutDispEnvAgain(&disp);
+#else
+    zskip("PsyZ CRTC model only");
+#endif
+}
+
 /* GP0 48h..5Fh with bit 3 are polylines of any length up to the terminator
  * (w & 0xF000F000) == 0x50005000; without bit 3 a line has two vertices and
  * no terminator, whatever bit 2. */

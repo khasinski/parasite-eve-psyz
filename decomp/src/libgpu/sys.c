@@ -6,6 +6,9 @@
 #include <libgte.h>
 #include <libgpu.h>
 #include "libgpu_private.h"
+#ifdef __psyz
+#include <psyz/gpu.h>
+#endif
 struct Debug {
     // GPU version
     // https://psx-spx.consoledev.net/graphicsprocessingunitgpu/#gpu-versions
@@ -449,7 +452,13 @@ DISPENV* PutDispEnv(DISPENV* env) {
         h_start = CLAMP(h_start, 500, 3290);
         h_end = CLAMP(h_end, h_start + 0x50, 3290);
         v_start = CLAMP(v_start, 0x10, (env->pad0 ? 310 : 256));
+#ifdef __psyz
+        /* Psyz_GpuSetNtscPalPicture: a PAL screen at NTSC field timing. */
+        v_end = CLAMP(v_end, v_start + 2,
+                      (env->pad0 || Psyz_GpuGetNtscPalPicture() ? 312 : 258));
+#else
         v_end = CLAMP(v_end, v_start + 2, (env->pad0 ? 312 : 258));
+#endif
         D_800B8920->ctl( // set horizontal display range
             ((h_end & 0xFFF) << 12) | 0x06000000 | (h_start & 0xFFF));
         D_800B8920->ctl( // set vertical display range

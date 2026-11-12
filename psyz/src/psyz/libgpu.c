@@ -600,6 +600,10 @@ int Psyz_GpuCrtcInterlaced480(void) { return (crtc_mode & 0x24) == 0x24; }
 
 unsigned Psyz_GpuCrtcFieldLines(void) { return crtc_mode & 8 ? 314 : 263; }
 
+static int ntsc_pal_picture;
+void Psyz_GpuSetNtscPalPicture(int enabled) { ntsc_pal_picture = enabled != 0; }
+int Psyz_GpuGetNtscPalPicture(void) { return ntsc_pal_picture; }
+
 unsigned Psyz_GpuCrtcBlankLines(void) {
     unsigned total = Psyz_GpuCrtcFieldLines();
     unsigned y1 = crtc_y1 < total ? crtc_y1 : total;
