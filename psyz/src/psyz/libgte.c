@@ -1847,6 +1847,10 @@ static int pgxp_active = 0;
 static int pgxp_culling = 1;
 static int pgxp_effect_enabled = 0;
 static int pgxp_effect_mode = 0;
+static int pgxp_library_stores = 0;
+void Psyz_GteSetPgxpLibraryStores(int enabled) {
+    pgxp_library_stores = enabled != 0;
+}
 void Psyz_PgxpSetCulling(int enabled) { pgxp_culling = enabled != 0; }
 void Psyz_PgxpSetEffectEnabled(int enabled) { pgxp_effect_enabled = enabled != 0; }
 void Psyz_GteSetPgxpEffectMode(int enabled) { pgxp_effect_mode = enabled != 0; }
@@ -3103,6 +3107,9 @@ long RotTransPers(SVECTOR* v0, int* sxy, int* p, int* flag) {
     ir0 = IR0;
     z = SZ3 >> 2;
     *(unsigned int*)sxy = s;
+    if (pgxp_active && pgxp_library_stores) {
+        PgxpStoreAddr(sxy, pgxp_fifo[2]);
+    }
     *p = ir0;
     *flag = (int)fl;
     return z;
@@ -3123,7 +3130,7 @@ long RotTransPers3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0, int* sxy1,
     *(unsigned int*)sxy0 = s0;
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
-    if (pgxp_active && pgxp_effect_mode) {
+    if (pgxp_active && (pgxp_effect_mode || pgxp_library_stores)) {
         PgxpStoreAddr(sxy0, pgxp_fifo[0]);
         PgxpStoreAddr(sxy1, pgxp_fifo[1]);
         PgxpStoreAddr(sxy2, pgxp_fifo[2]);
@@ -3139,7 +3146,7 @@ long RotTransPers4(
     int flag1, flag2;
     RotTransPers3(v0, v1, v2, sxy0, sxy1, sxy2, p, &flag1);
     RotTransPers(v3, sxy3, p, &flag2);
-    if (pgxp_active && pgxp_effect_mode) {
+    if (pgxp_active && (pgxp_effect_mode || pgxp_library_stores)) {
         PgxpStoreAddr(sxy3, pgxp_fifo[2]);
     }
     *flag = flag1 | flag2;
@@ -3162,7 +3169,7 @@ long RotAverage3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0, int* sxy1,
     *(unsigned int*)sxy0 = s0;
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
-    if (pgxp_active && pgxp_effect_mode) {
+    if (pgxp_active && (pgxp_effect_mode || pgxp_library_stores)) {
         PgxpStoreAddr(sxy0, pgxp_fifo[0]);
         PgxpStoreAddr(sxy1, pgxp_fifo[1]);
         PgxpStoreAddr(sxy2, pgxp_fifo[2]);
@@ -3196,7 +3203,7 @@ long RotAverage4(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, SVECTOR* v3, int* sxy0,
     *(unsigned int*)sxy1 = s1;
     *(unsigned int*)sxy2 = s2;
     *(unsigned int*)sxy3 = s3;
-    if (pgxp_active && pgxp_effect_mode) {
+    if (pgxp_active && (pgxp_effect_mode || pgxp_library_stores)) {
         PgxpStoreAddr(sxy0, f0);
         PgxpStoreAddr(sxy1, f1);
         PgxpStoreAddr(sxy2, f2);
@@ -3224,7 +3231,7 @@ long RotAverageNclip3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, int* sxy0,
         *(unsigned int*)sxy0 = s0;
         *(unsigned int*)sxy1 = s1;
         *(unsigned int*)sxy2 = s2;
-        if (pgxp_active && pgxp_effect_mode) {
+        if (pgxp_active && (pgxp_effect_mode || pgxp_library_stores)) {
             PgxpStoreAddr(sxy0, pgxp_fifo[0]);
             PgxpStoreAddr(sxy1, pgxp_fifo[1]);
             PgxpStoreAddr(sxy2, pgxp_fifo[2]);
@@ -3263,7 +3270,7 @@ long RotAverageNclip4(
         *(unsigned int*)sxy1 = s1;
         *(unsigned int*)sxy2 = s2;
         *(unsigned int*)sxy3 = s3;
-        if (pgxp_active && pgxp_effect_mode) {
+        if (pgxp_active && (pgxp_effect_mode || pgxp_library_stores)) {
             PgxpStoreAddr(sxy0, f0);
             PgxpStoreAddr(sxy1, f1);
             PgxpStoreAddr(sxy2, f2);
@@ -3440,6 +3447,29 @@ void Psyz_GteStoreSxyTo(unsigned reg, void* dst) {
         if (entry.gen == pgxp_frame_gen && entry.sxy == word) {
             PgxpStoreAddr(dst, entry);
         }
+    }
+}
+
+void Psyz_GteLoadSxyFrom(unsigned reg, const void* src) {
+    unsigned int word;
+    memcpy(&word, src, 4);
+    Psyz_GteDataWrite(reg, word);
+    if (pgxp_active && reg >= 12u && reg <= 15u) {
+        unsigned int fifo_idx = reg == 15u ? 2u : (reg - 12u);
+        PgxpSxyEntry entry = {0};
+        float x, y, w;
+        int kind = Psyz_PgxpLookupVertex(src, word, &x, &y, &w);
+        if (kind) {
+            entry = (PgxpSxyEntry){
+                .sxy = word,
+                .gen = pgxp_frame_gen,
+                .is_effect = (unsigned int)(kind == 2),
+                .x = x,
+                .y = y,
+                .w = w,
+            };
+        }
+        pgxp_fifo[fifo_idx] = entry;
     }
 }
 

@@ -145,7 +145,20 @@ void Psyz_GteSetPgxpMatrix(const double rot[3][3], const double trans[3]);
  * game has already built but has not yet submitted. */
 void Psyz_PgxpNextFrame(void);
 void Psyz_GteClearPgxpMatrix(void);
+/* Store GTE SXY0..SXY2 / SXYP (reg 12..15) to dst. While geometry correction
+ * is active the precise projection of that vertex (subpixel x/y and depth)
+ * follows the word to dst, so a packet vertex read from dst is drawn there. */
 void Psyz_GteStoreSxyTo(unsigned reg, void* dst);
+/* Load the word at src into SXY0..SXY2 / SXYP (reg 12..15); the precise
+ * vertex recorded for src comes with it (back to the GTE for NCLIP and a
+ * later Psyz_GteStoreSxyTo). */
+void Psyz_GteLoadSxyFrom(unsigned reg, const void* src);
+/* Let RotTransPers* and RotAverage* record the precise vertices at their
+ * output addresses while geometry correction is active (by default they do
+ * only in effect mode). Default: off. */
+void Psyz_GteSetPgxpLibraryStores(int enabled);
+/* A copy of the screen word sxy from src to dst: the precise vertex
+ * recorded for src (if it still holds sxy) now belongs to dst too. */
 void Psyz_GteCopyPgxpSxy(
     const void* src, const void* dst, unsigned int sxy);
 int Psyz_GtePgxpNclip3(

@@ -902,6 +902,70 @@ ZTEST(gpu, geometry_metadata_survives_present_before_submission) {
 #endif
 }
 
+/* A precise vertex follows its screen word back into the GTE and out again
+ * (a projected-vertex cache), and library stores tag RotTransPers outputs. */
+ZTEST(gpu, geometry_metadata_follows_sxy_loads_and_library_stores) {
+#ifdef PSYZ_TEST_SDL_GPU
+    extern void Psyz_PgxpNextFrame(void);
+    extern int Psyz_PgxpLookupVertex(
+        const void*, unsigned int, float*, float*, float*);
+    extern void Psyz_GteDataWrite(unsigned int, unsigned int);
+    extern void Psyz_GteCtrlWrite(unsigned int, unsigned int);
+    extern void Psyz_GteCommand(unsigned int);
+    extern void Psyz_GteStoreSxyTo(unsigned int, void*);
+    extern void Psyz_GteLoadSxyFrom(unsigned int, const void*);
+    extern void Psyz_GteSetPgxpLibraryStores(int);
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        return;
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_VideoSetGeometryCorrection(1);
+    Psyz_PgxpNextFrame();
+    Psyz_GteCtrlWrite(0, 4096);
+    Psyz_GteCtrlWrite(1, 0);
+    Psyz_GteCtrlWrite(2, 4096);
+    Psyz_GteCtrlWrite(3, 0);
+    Psyz_GteCtrlWrite(4, 4096);
+    Psyz_GteCtrlWrite(5, 0);
+    Psyz_GteCtrlWrite(6, 0);
+    Psyz_GteCtrlWrite(7, 700);
+    Psyz_GteCtrlWrite(24, 160u << 16);
+    Psyz_GteCtrlWrite(25, 112u << 16);
+    Psyz_GteCtrlWrite(26, 256);
+    Psyz_GteDataWrite(0, 3u | (5u << 16));
+    Psyz_GteDataWrite(1, 0);
+    Psyz_GteCommand(0x180001);
+    unsigned int cache, reloaded, other = 0;
+    float x, y, w, x2, y2, w2;
+    Psyz_GteStoreSxyTo(14, &cache);
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&cache, cache, &x, &y, &w));
+    /* 3 * 256 / 700 is not a whole pixel: the precise x keeps the fraction */
+    zassert_s32_ne(1, x == (float)(short)cache + 0.5f);
+    Psyz_GteDataWrite(13, 0x00100010);
+    Psyz_GteLoadSxyFrom(13, &cache);
+    Psyz_GteStoreSxyTo(13, &reloaded);
+    zassert_s32_eq((int)cache, (int)reloaded);
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&reloaded, reloaded, &x2, &y2, &w2));
+    zassert_s32_eq(1, x == x2 && y == y2 && w == w2);
+    /* a word loaded from a plain location carries nothing */
+    Psyz_GteLoadSxyFrom(13, &other);
+    Psyz_GteStoreSxyTo(13, &reloaded);
+    zassert_s32_eq(0, Psyz_PgxpLookupVertex(&reloaded, reloaded, &x2, &y2, &w2));
+    SVECTOR v = {7, -3, 0, 0};
+    int sxy = 0, p, flag;
+    RotTransPers(&v, &sxy, &p, &flag);
+    zassert_s32_eq(0, Psyz_PgxpLookupVertex(&sxy, (unsigned)sxy, &x2, &y2, &w2));
+    Psyz_GteSetPgxpLibraryStores(1);
+    RotTransPers(&v, &sxy, &p, &flag);
+    zassert_s32_eq(1, Psyz_PgxpLookupVertex(&sxy, (unsigned)sxy, &x2, &y2, &w2));
+    Psyz_GteSetPgxpLibraryStores(0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
 /* Keep the raw subrectangle blit as a diagnostic: its rounding varies by
  * backend. The origin-zero presentation used by the renderer must be stable. */
 ZTEST(gpu, presentation_crop_is_stable_across_field_buffers) {

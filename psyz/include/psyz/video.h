@@ -74,7 +74,10 @@ typedef enum {
 
 typedef enum {
     PSYZ_DITHER_AUTO, /**< let the game decide whether to dither (default) */
-    PSYZ_DITHER_OFF,  /**< disable dithering and RGB555 shading quantization on desktop GPUs */
+    PSYZ_DITHER_OFF,  /**< disable dithering and RGB555 shading quantization on desktop GPUs
+                           (the SDL GPU rasterizer draws shading in full colour; the
+                           native CPU rasterizer is left for it, see
+                           Psyz_VideoSetNativeRasterizer) */
 } PsyzDitherMode;
 
 typedef enum {
@@ -208,7 +211,8 @@ unsigned Psyz_VideoGetInternalResolution(void);
  *
  * When enabled, the internal resolution is 1 and no enhancement that needs
  * the GPU rasterizer is on (antialiasing, geometry correction, model or
- * sprite filtering, widescreen, frame interpolation, loaded sprite atlases),
+ * sprite filtering, widescreen, frame interpolation, loaded sprite atlases,
+ * PSYZ_DITHER_OFF full-colour shading),
  * primitives and VRAM transfers are processed by the CPU rasterizer, which
  * reproduces the PS1 GPU pixel for pixel (fill convention, attribute
  * stepping, dithering, blending, mask bit, VRAM wrapping). The GPU device

@@ -5245,6 +5245,7 @@ static bool NativeRasterizerWanted(void) {
            !set_antialiasing && !set_geometry_correction &&
            !set_effect_geometry_correction && !set_model_filtering &&
            !set_sprite_filtering && !widescreen && !interpolation_enabled &&
+           dither_mode != PSYZ_DITHER_OFF &&
            !(sprite_atlases_enabled && sprite_atlas_count);
 #endif
 }

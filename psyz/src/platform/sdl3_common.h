@@ -781,8 +781,10 @@ int Psyz_VideoSetDitheringMode(PsyzDitherMode mode) {
         return 0;
     }
     /* Off also changes color precision, even when the draw env disables dither.
-     */
-    Draw_FlushBuffer();
+     * Before the platform is up nothing is queued, and flushing would start
+     * it early. */
+    if (is_platform_init_successful)
+        Draw_FlushBuffer();
     dither_mode = mode;
     return 0;
 }
