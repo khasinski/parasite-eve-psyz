@@ -23,7 +23,7 @@ void SsSetTableSize(char* table, short s_max, short t_max) {
      * without a score. */
     for (i = s_max; i < LEN(_ss_score); i++) {
         _ss_score[i] = NULL;
-        _snd_openflag |= 1 << i;
+        _snd_openflag |= 1u << i;
     }
 #endif
     for (i = 0; i < _snd_seq_s_max; i++) {

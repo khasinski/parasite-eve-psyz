@@ -22,6 +22,7 @@ long StartCARD(void) {
     StartCARD2();
     ChangeClearPAD(0);
     ExitCriticalSection();
+    return 1;
 }
 
 void StopCARD2(void);
@@ -29,4 +30,5 @@ void _ExitCard(void);
 long StopCARD(void) {
     StopCARD2();
     _ExitCard();
+    return 1;
 }

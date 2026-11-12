@@ -159,7 +159,7 @@ s32 CD_newmedia(void) {
             if (pathTablePtr[0] == 0) {
                 break;
             }
-            dire_[i].lba.i = ((LBA*)(&pathTablePtr[2]))->i;
+            memcpy(&dire_[i].lba, &pathTablePtr[2], sizeof(LBA)); // unaligned
             dire_[i].parentNum = pathTablePtr[6];
             dire_[i].num = i + 1;
             memcpy(dire_[i].name, &pathTablePtr[8], pathTablePtr[0]);
@@ -212,7 +212,7 @@ s32 CD_cachefile(s32 dirNum) {
         return 1;
     }
 
-    if (cd_read(1, (dire_ - 1)[dirNum].lba.addr, load_buf_) != 1) {
+    if (cd_read(1, dire_[dirNum - 1].lba.addr, load_buf_) != 1) {
         if (CD_debug > 0) {
             printf("CD_cachefile: dir not found\n");
         }
@@ -227,9 +227,9 @@ s32 CD_cachefile(s32 dirNum) {
         if (entry[0] == 0) {
             break;
         }
-        entryLba.i = ((LBA*)&entry[2])->i;
+        memcpy(&entryLba, &entry[2], sizeof(LBA)); // unaligned
         CdIntToPos(entryLba.addr, &file_[i].pos);
-        ((LBA*)&file_[i].size)->i = ((LBA*)&entry[0xA])->i;
+        memcpy(&file_[i].size, &entry[0xA], sizeof(LBA));
         switch (i) {
         case 0:
             namePtr = (short*)file_[i].name;

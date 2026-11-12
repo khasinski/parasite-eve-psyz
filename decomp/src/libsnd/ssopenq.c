@@ -24,13 +24,13 @@ short SsSeqOpen(u_long* addr, short vab_id) {
     bit = 0;
     exit_loop = 0;
     while (!exit_loop) {
-        if ((_snd_openflag & (1 << bit)) == 0U) {
+        if ((_snd_openflag & (1u << bit)) == 0U) {
             flag = bit;
             exit_loop = 1;
         }
         bit++;
     }
-    _snd_openflag |= 1 << flag;
+    _snd_openflag |= 1u << flag;
     ret = _SsInitSoundSeq(flag, vab_id, seq);
     SsFCALL.noteon = (sCb)_SsNoteOn;
     SsFCALL.programchange = (sCb)_SsSetProgramChange;

@@ -16,7 +16,7 @@ static void DmaSpu(unsigned offset, u_long value) {
     case 2: // chcr
         memAddr = _addr;
         spuAddr = (unsigned)Psyz_SpuRead(0x1A6) << 3;
-        if (!(value & 0x300) != 0x200) {
+        if (((value >> 9) & 3) != 1) { // SPU DMA uses block sync (mode 1)
             WARNF("SyncMode %d is invalid for SPU", (value >> 9) & 3);
             return;
         }

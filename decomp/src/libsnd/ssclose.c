@@ -19,7 +19,7 @@ void _SsClose(s16 seq_sep_num) {
 #endif
     _SsVmSetSeqVol(seq_sep_num, 0, 0, 1);
     _SsVmSeqKeyOff(seq_sep_num);
-    _snd_openflag &= ~(1 << seq_sep_num);
+    _snd_openflag &= ~(1u << seq_sep_num);
     for (seq_num = 0; seq_num < _snd_seq_t_max; seq_num++) {
         _ss_score[seq_sep_num][seq_num].flags = 0;
         _ss_score[seq_sep_num][seq_num].unk22 = 0xFF;

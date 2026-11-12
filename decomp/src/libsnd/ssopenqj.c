@@ -23,13 +23,13 @@ short SsSeqOpenJ(u_long* addr, short vab_id) {
     bit = 0;
     exit_loop = 0;
     while (!exit_loop) {
-        if ((_snd_openflag & (1 << bit)) == 0U) {
+        if ((_snd_openflag & (1u << bit)) == 0U) {
             flag = bit;
             exit_loop = 1;
         }
         bit++;
     }
-    _snd_openflag |= 1 << flag;
+    _snd_openflag |= 1u << flag;
     if (_SsInitSoundSeq(flag, vab_id, seq) == -1) {
         return -1;
     }

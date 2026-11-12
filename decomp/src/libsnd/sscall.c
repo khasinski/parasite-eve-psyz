@@ -20,7 +20,7 @@ void SsSeqCalledTbyT(void) {
     _SsVmFlush();
 
     for (seq_index = 0; seq_index < _snd_seq_s_max; seq_index++) {
-        bit = 1 << seq_index;
+        bit = 1u << seq_index;
         if (!(_snd_openflag & bit)) {
             continue;
         }
