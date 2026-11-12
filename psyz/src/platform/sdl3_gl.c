@@ -305,6 +305,7 @@ static GLuint Init_SetupShader() {
 }
 
 static PsyzOverlayInitCB_SDL3GL overlay_init_cb;
+static bool hidden_gpu_renderer;
 PsyzOverlayInitCB_SDL3GL Psyz_OverlayInit_SDL3GL(PsyzOverlayInitCB_SDL3GL cb) {
     const PsyzOverlayInitCB_SDL3GL prev = overlay_init_cb;
     overlay_init_cb = cb;
@@ -456,6 +457,10 @@ bool InitPlatform() {
     glViewport(0, 0, VRAM_W, VRAM_H);
 
     cur_tpage = 0;
+    const char* headless = SDL_getenv("PSYZ_HEADLESS");
+    hidden_gpu_renderer = headless && SDL_strcmp(headless, "gpu") == 0;
+    if (hidden_gpu_renderer)
+        vsync_mode = PSYZ_VSYNC_LIMITLESS;
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
@@ -854,6 +859,7 @@ int Psyz_VideoSetModelFiltering(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetModelFiltering(void) { return 0; }
 int Psyz_VideoSetWidescreen(int enabled) { return enabled ? -1 : 0; }
 void Psyz_VideoSetWidescreenDisplayOnly(int enabled) { (void)enabled; }
+void Psyz_VideoSetWidescreenNativePolygons(int enabled) { (void)enabled; }
 int Psyz_VideoGetWidescreen(void) { return 0; }
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     (void)buffer_y;
@@ -933,7 +939,8 @@ static void ApplyDisplayPendingChanges() {
         BindDrawFbo();
     }
     if (!is_window_visible) {
-        SDL_ShowWindow(sdl3_window);
+        if (!hidden_gpu_renderer)
+            SDL_ShowWindow(sdl3_window);
         is_window_visible = true;
 #ifdef __APPLE__
         SDL_Event event;

@@ -260,6 +260,11 @@ int Psyz_VideoGetWidescreen(void);
 /* Opt-in: with a scaled display target, preserve native VRAM coordinates
  * for readback/feedback while widening only the presented image. */
 void Psyz_VideoSetWidescreenDisplayOnly(int enabled);
+/* Opt-in for side artwork without validated extra actor/occlusion space:
+ * clip native polygon geometry to the original display rectangle. Sprite
+ * extensions remain wide; native VRAM, projection and simulation are unchanged.
+ * Defaults off for other games. */
+void Psyz_VideoSetWidescreenNativePolygons(int enabled);
 
 /**
  * @brief Tell the presenter where the game's picture is in one buffer

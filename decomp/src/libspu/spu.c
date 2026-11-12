@@ -1,6 +1,9 @@
 #include <libapi.h>
 #include <stdarg.h>
 #include "libspu_private.h"
+#ifdef __psyz
+#include <psyz/audio.h>
+#endif
 
 #ifndef __psyz
 union SpuUnion* _spu_RXX = (union SpuUnion*)0x1F801C00;
@@ -34,6 +37,12 @@ int _spu_init(int bHot) {
     unsigned dmaTimer;
     int i;
 
+#ifdef __psyz
+    /* Start the native mixer before any register/sample writes. Waiting for
+     * an XA movie leaves SPU-only games silent and lets the first audio init
+     * erase sample banks uploaded before it. The backend init is idempotent. */
+    Psyz_AudioInit();
+#endif
     *dma_dpcr |= DMA_DPCR_SPU_PRIORITY_HIGH | DMA_DPCR_MASK_DMA4_ENABLE;
     SPUW(main_vol.left, 0);
     SPUW(main_vol.right, 0);

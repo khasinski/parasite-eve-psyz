@@ -323,6 +323,7 @@ static float ws_mid_shift[2],ws_mid_qx[2],ws_mid_qy[2],ws_mid_ex[2],ws_mid_ey[2]
 /* Psyz_VideoSetWidescreenCentred: drawing ignores the view's shift. */
 static bool ws_centred;
 static bool ws_display_only;
+static bool ws_native_polygons;
 /* Psyz_VideoSetWidescreenField: drawing is the room, it follows ex, ey. */
 static bool ws_field;
 
@@ -2383,6 +2384,12 @@ void Psyz_VideoSetWidescreenDisplayOnly(int enabled) {
         ws_display_only=enabled!=0;
     }
 }
+void Psyz_VideoSetWidescreenNativePolygons(int enabled) {
+    if(ws_native_polygons!=(enabled!=0)) {
+        if(is_platform_initialized)Draw_FlushBuffer();
+        ws_native_polygons=enabled!=0;
+    }
+}
 void Psyz_VideoSetWidescreenCentred(int enabled) {
     if ((enabled != 0) != ws_centred) {
         Draw_FlushBuffer();
@@ -3363,11 +3370,11 @@ void Draw_FlushBuffer(void) {
          * requested. Scissor and blend-copy bounds must use that same space. */
         const bool preserve_native=ws_display_only && scaled_vram_render && target_index==0;
         const float ws_squeeze=WidescreenDraw() && !preserve_native ? WS_SQUEEZE : 1.0f;
-        SDL_Rect clip=scissor_rect;
-        if(ws_squeeze<1.0f && clip.w<display_size.x) {
-            float x0=ws_centre+((float)clip.x-ws_centre)*ws_squeeze;
-            float x1=ws_centre+((float)(clip.x+clip.w)-ws_centre)*ws_squeeze;
-            clip.x=(int)SDL_floorf(x0);clip.w=(int)SDL_ceilf(x1)-clip.x;
+        SDL_Rect viewport_clip=scissor_rect;
+        if(ws_squeeze<1.0f && viewport_clip.w<display_size.x) {
+            float x0=ws_centre+((float)viewport_clip.x-ws_centre)*ws_squeeze;
+            float x1=ws_centre+((float)(viewport_clip.x+viewport_clip.w)-ws_centre)*ws_squeeze;
+            viewport_clip.x=(int)SDL_floorf(x0);viewport_clip.w=(int)SDL_ceilf(x1)-viewport_clip.x;
         }
         bool midpoint=interpolation_enabled&&interpolated_vram&&target_index==(scaled_vram_render?2u:1u);
         SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
@@ -3391,13 +3398,27 @@ void Draw_FlushBuffer(void) {
             target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
         int start = 0;
         while (start < n_indices) {
+            SDL_Rect clip=viewport_clip;
+            const bool restrict_polygons=ws_native_polygons && ws_squeeze<1.0f;
+            const bool native_polygon=restrict_polygons &&
+                (vertex_buf[index_buf[start]].t&TPAGE_POLYGON)!=0;
+            if(native_polygon) {
+                /* Map the original display edges through the same squeeze as
+                 * the vertices; never shrink the unscaled native VRAM target. */
+                int x0=(int)SDL_ceilf(target_centre+((float)display_area.x-target_centre)*ws_squeeze);
+                int x1=(int)SDL_floorf(target_centre+((float)(display_area.x+display_size.x)-target_centre)*ws_squeeze);
+                int right=SDL_min(clip.x+clip.w,x1);
+                clip.x=SDL_max(clip.x,x0);clip.w=SDL_max(0,right-clip.x);
+            }
             bool semi = vertex_buf[index_buf[start]].a != 0xFF;
             int end = start + 3;
             if (!semi) {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF)
+                while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF &&
+                       (!restrict_polygons || ((vertex_buf[index_buf[end]].t&TPAGE_POLYGON)!=0)==native_polygon))
                     end += 3;
             } else {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81)
+                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81 &&
+                       (!restrict_polygons || ((vertex_buf[index_buf[end]].t&TPAGE_POLYGON)!=0)==native_polygon))
                     end += 3;
             }
             /* Three sampled textures, up to two draws (color and mask). Reserve
