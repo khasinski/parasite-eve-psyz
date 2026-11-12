@@ -282,13 +282,15 @@ int Psyz_VideoGetEffectGeometryCorrection(void);
  *
  * While on, everything drawn into the display buffers (drawing areas inside
  * the display's VRAM columns and the first two display heights of VRAM rows,
- * where double buffers are stacked) is squeezed to 3/4 of its width around
- * the buffer's centre. What the game draws from -1/6 to 7/6 of its screen
- * width then fills the buffer, and the buffer is presented 4/3 wider, so
- * everything keeps its shape. Untextured fills that cover the whole screen
- * width are widened by the margin on both sides. The game has to draw the
- * extra picture itself (wider culling: a sixth of the screen width past each
- * side, plus the view's shift, see Psyz_VideoSetWidescreenPicture).
+ * where double buffers are stacked) is squeezed to 3/4 of its width (or the
+ * squeeze set with Psyz_VideoSetWidescreenSqueeze) around the buffer's
+ * centre. What the game draws from -1/6 to 7/6 of its screen width then
+ * fills the buffer, and the buffer is presented 4/3 wider, so everything
+ * keeps its shape. Untextured fills that cover the whole screen width are
+ * widened by the margin on both sides. The game has to draw the extra
+ * picture itself (wider culling: a sixth of the screen width past each
+ * side, Psyz_VideoGetWidescreenBufferMargin, plus the view's shift, see
+ * Psyz_VideoSetWidescreenPicture).
  * 24-bit (movie) display stays 4:3. A drawing area clip narrower than the
  * screen is squeezed with what it clips. Native VRAM is squeezed too, so
  * read-backs of the display buffers see the presented picture.
@@ -299,6 +301,34 @@ int Psyz_VideoGetEffectGeometryCorrection(void);
  */
 int Psyz_VideoSetWidescreen(int enabled);
 int Psyz_VideoGetWidescreen(void);
+/**
+ * @brief How much widescreen squeezes the display buffers (default 3/4)
+ *
+ * The buffer holds 1 / squeeze of the screen's width and is presented that
+ * much wider. 3/4 keeps game pixels whole render pixels wide at 4x and 8x;
+ * at a display aspect other than 4:3 the 16:9 view is then cut to what the
+ * buffer holds (320x256 at square pixels: 426.67 of the 455 game pixels a
+ * 16:9 view needs, stretched to fill it). 0 fits the squeeze to the display
+ * mode instead: the buffer holds exactly the 16:9 view of the screen's
+ * picture aspect (Psyz_VideoSetAspectMode), e.g. 45/64 for 320x256 at
+ * square pixels and 3/4 for 320x240, followed as the display mode changes.
+ * Each buffer keeps the squeeze it was marked with
+ * (Psyz_VideoSetWidescreenPicture*), so it is presented as it was drawn.
+ *
+ * @param squeeze 0 to fit, or 0.5 to 0.95
+ * @return 0 on success, -1 when out of range or not supported
+ */
+int Psyz_VideoSetWidescreenSqueeze(float squeeze);
+/** @return the squeeze a buffer marked now gets (0.75 by default) */
+float Psyz_VideoGetWidescreenSqueeze(void);
+/**
+ * @brief Game pixels the squeezed buffer holds past each side of the screen
+ *
+ * For the current display mode, rounded up (54 for 320 pixels at 3/4, 68
+ * for 320x256 fitted at square pixels): how far past the screen's sides a
+ * game draws its picture. 0 while widescreen is off.
+ */
+int Psyz_VideoGetWidescreenBufferMargin(void);
 /**
  * @brief Game pixels the 16:9 view shows past each side of the screen
  *

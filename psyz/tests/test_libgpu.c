@@ -474,6 +474,85 @@ ZTEST(gpu, widescreen_squeezes_display_buffer_drawing) {
 #endif
 }
 
+/* A fitted squeeze (0) makes the buffer hold exactly the 16:9 view: 320x256
+ * at square pixels needs 455.11 game pixels, a squeeze of 45/64 and a
+ * margin of 68; each buffer keeps the squeeze it was marked with. */
+ZTEST(gpu, widescreen_fitted_squeeze_holds_the_whole_view) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        zskip("requires the SDL GPU renderer");
+    const PsyzAspectMode aspect = Psyz_VideoGetAspectMode();
+    const long video_mode = GetVideoMode();
+    SetVideoMode(MODE_PAL);
+    DISPENV disp;
+    SetDefDispEnv(&disp, 0, 0, 320, 256);
+    disp.screen.h = 256;
+    PutDispEnv(&disp);
+    DRAWENV draw;
+    SetDefDrawEnv(&draw, 0, 0, 320, 256);
+    draw.dtd = 0;
+    PutDrawEnv(&draw);
+    RECT clear = {0, 0, 320, 256}, line = {0, 100, 320, 1};
+    u16 row[320];
+    zassert_s32_eq(0, Psyz_VideoSetAspectMode(PSYZ_ASPECT_SQUARE));
+    zexpect_s32_eq(3072, (int)(Psyz_VideoGetWidescreenSqueeze() * 4096.0f));
+    zassert_s32_eq(-1, Psyz_VideoSetWidescreenSqueeze(0.25f));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreenSqueeze(0.0f));
+    zassert_s32_eq(0, Psyz_VideoSetWidescreen(1));
+    zexpect_s32_eq(2880, (int)(Psyz_VideoGetWidescreenSqueeze() * 4096.0f));
+    zexpect_s32_eq(68, Psyz_VideoGetWidescreenBufferMargin());
+    zexpect_s32_eq(67, Psyz_VideoGetWidescreenViewMargin());
+    Psyz_VideoSetWidescreenPicture(0, -68, 388);
+    /* back to 3/4 for buffers marked from now on: this one keeps 45/64 */
+    zassert_s32_eq(0, Psyz_VideoSetWidescreenSqueeze(0.75f));
+    zexpect_s32_eq(54, Psyz_VideoGetWidescreenBufferMargin());
+
+    /* x -68..-60 lands on -0.31..5.31, 380..388 on 314.69..320.31 */
+    ClearImage(&clear, 0, 0, 0);
+    TILE left = {0};
+    setTile(&left);
+    setRGB0(&left, 255, 0, 0);
+    setXY0(&left, -68, 90);
+    setWH(&left, 8, 20);
+    DrawPrim(&left);
+    TILE right = left;
+    setRGB0(&right, 0, 255, 0);
+    setXY0(&right, 380, 90);
+    DrawPrim(&right);
+    DrawSync(0);
+    StoreImage(&line, (u_long*)row);
+    DrawSync(0);
+    zexpect_s32_eq(0x001F, row[0] & 0x7FFF);
+    zexpect_s32_eq(0x001F, row[4] & 0x7FFF);
+    zexpect_s32_eq(0, row[6] & 0x7FFF);
+    zexpect_s32_eq(0, row[313] & 0x7FFF);
+    zexpect_s32_eq(0x03E0, row[315] & 0x7FFF);
+    zexpect_s32_eq(0x03E0, row[319] & 0x7FFF);
+
+    /* a fill across the screen is widened to the fitted margins */
+    ClearImage(&clear, 0, 0, 0);
+    TILE fill = {0};
+    setTile(&fill);
+    setRGB0(&fill, 0, 0, 255);
+    setXY0(&fill, 0, 90);
+    setWH(&fill, 320, 20);
+    DrawPrim(&fill);
+    DrawSync(0);
+    StoreImage(&line, (u_long*)row);
+    DrawSync(0);
+    zexpect_s32_eq(0x7C00, row[0] & 0x7FFF);
+    zexpect_s32_eq(0x7C00, row[319] & 0x7FFF);
+
+    zassert_s32_eq(0, Psyz_VideoSetWidescreen(0));
+    zexpect_s32_eq(0, Psyz_VideoGetWidescreenBufferMargin());
+    Psyz_VideoSetAspectMode(aspect);
+    SetVideoMode(video_mode);
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
 ZTEST(gpu, vram_copy_follows_uploads_fills_and_copies) {
 #if defined(__psyz) && !defined(__PSP__)
     const unsigned char* known = NULL;

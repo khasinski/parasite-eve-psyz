@@ -887,6 +887,11 @@ int Psyz_VideoGetModelFiltering(void) { return 0; }
 int Psyz_VideoSetWidescreen(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetWidescreen(void) { return 0; }
 int Psyz_VideoGetWidescreenViewMargin(void) { return 0; }
+int Psyz_VideoSetWidescreenSqueeze(float squeeze) {
+    return squeeze == 0.75f ? 0 : -1;
+}
+float Psyz_VideoGetWidescreenSqueeze(void) { return 0.75f; }
+int Psyz_VideoGetWidescreenBufferMargin(void) { return 0; }
 void Psyz_VideoSetWidescreenNative(int buffer_y) { (void)buffer_y; }
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     (void)buffer_y;

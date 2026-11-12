@@ -712,13 +712,19 @@ static Posi draw_area_start = {0, 0};
 static Posi draw_area_end = {0x10000, 0x10000};
 static SDL_Rect scissor_rect = {0, 0, VRAM_W, VRAM_H};
 
-/* Widescreen (Psyz_VideoSetWidescreen). 3/4 keeps every game pixel a whole
- * number of render pixels wide at 4x and 8x (3 and 6), so scrolling
- * backgrounds do not shimmer. ws_picture holds the game's picture span per
- * display buffer, keyed by the buffer's VRAM row, and the shift (game
- * pixels) of the 16:9 view from the screen's centre chosen for it. */
-#define WS_SQUEEZE 0.75f
+/* Widescreen (Psyz_VideoSetWidescreen). The default squeeze, 3/4, keeps
+ * every game pixel a whole number of render pixels wide at 4x and 8x (3 and
+ * 6), so scrolling backgrounds do not shimmer. Psyz_VideoSetWidescreenSqueeze
+ * sets another one, or 0 to fit the buffer to the 16:9 view of the display
+ * mode. ws_picture holds the game's picture span per display buffer, keyed
+ * by the buffer's VRAM row, the shift (game pixels) of the 16:9 view from
+ * the screen's centre chosen for it and the squeeze it is drawn with. */
+#define WS_SQUEEZE_DEFAULT 0.75f
+#define WS_SQUEEZE_MIN 0.5f
+#define WS_SQUEEZE_MAX 0.95f
 static bool widescreen;
+/* Psyz_VideoSetWidescreenSqueeze: 0 fits the display mode's 16:9 view */
+static float ws_squeeze_setting = WS_SQUEEZE_DEFAULT;
 /* Rendered-frame capture uses the same final widescreen crop and scaling as
  * presentation, into an offscreen texture even when the window is hidden. */
 static SDL_GPUTexture* ws_capture;
@@ -736,8 +742,10 @@ static struct {
     int camera_x;
     /* Psyz_VideoSetWidescreenNative: drawn and shown as without widescreen */
     bool native;
-} ws_picture[2] = {{-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0},
-                   {-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0}};
+    /* the squeeze the buffer is drawn and presented with */
+    float squeeze;
+} ws_picture[2] = {{-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0, false, WS_SQUEEZE_DEFAULT},
+                   {-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0, false, WS_SQUEEZE_DEFAULT}};
 static float ws_mid_shift[2],ws_mid_qx[2],ws_mid_qy[2],ws_mid_ex[2],ws_mid_ey[2],ws_mid_left[2],ws_mid_right[2];
 /* Psyz_VideoSetWidescreenCentred: drawing ignores the view's shift. */
 static bool ws_centred;
@@ -765,14 +773,48 @@ void Psyz_GpuTraceAspectOnce(const char *phase) {
     resolution_before_horiz=set_disp_horiz;resolution_before_vert=set_disp_vert;resolution_before_rgb=display_rgb24;
     resolution_room[0].y=resolution_room[1].y=-1;
 }
+/* The squeeze a buffer drawn now gets: the fixed one, or the one that makes
+ * the buffer hold exactly the 16:9 view of the display mode's picture
+ * aspect (45/64 for 320x256 at square pixels, 3/4 for 320x240). */
+static float WidescreenCurrentSqueeze(void) {
+    if (ws_squeeze_setting > 0.0f)
+        return ws_squeeze_setting;
+    const float game_aspect =
+        GetCurrentGameAspectRatio(display_size.x, display_size.y);
+    if (!(game_aspect > 0.0f))
+        return WS_SQUEEZE_DEFAULT;
+    return SDL_clamp(game_aspect * (9.0f / 16.0f), WS_SQUEEZE_MIN,
+                     WS_SQUEEZE_MAX);
+}
+
+/* The squeeze of a picture (ws_picture index), or the current one. */
+static float WidescreenPictureSqueeze(int picture) {
+    return picture >= 0 && ws_picture[picture].y >= 0
+               ? ws_picture[picture].squeeze
+               : WidescreenCurrentSqueeze();
+}
+
+/* Half the 16:9 view's width in whole game pixels, for the screen's pixel
+ * aspect (199 for 320x224), so its edges meet the picture's ends exactly;
+ * never wider than the squeezed buffer. A buffer fitted to the view
+ * (Psyz_VideoSetWidescreenSqueeze 0) shows all of it, to the fraction. */
+static float WidescreenViewHalf(float game_aspect, float squeeze) {
+    const float w = (float)display_size.x;
+    const float view = w * (16.0f / 9.0f) / game_aspect;
+    if (ws_squeeze_setting <= 0.0f)
+        return SDL_min(view, w / squeeze) * 0.5f;
+    return SDL_floorf(SDL_min(view, w / squeeze) * 0.5f);
+}
+
 static void TraceAspectViewport(SDL_Rect dst, WndSize win, bool rgb24, bool wide_view) {
     if(resolution_trace_budget) {
         int p=-1,m=-1;
         for(int i=0;i<2;++i){if(ws_picture[i].y==display_area.y)p=i;if(resolution_room[i].y==display_area.y)m=i;}
         float ga=GetCurrentGameAspectRatio(display_size.x,display_size.y);
-        float half=ga>0?SDL_floorf(SDL_min(display_size.x*(16.0f/9.0f)/ga,display_size.x/WS_SQUEEZE)*.5f):0;
+        float squeeze=WidescreenPictureSqueeze(p);
+        float half=ga>0?WidescreenViewHalf(ga,squeeze):0;
         float centre=display_size.x*.5f,shift=p>=0?ws_picture[p].shift:0;
-        float available_l=centre+shift-centre/WS_SQUEEZE,available_r=centre+shift+centre/WS_SQUEEZE;
+        float available_l=centre+shift-centre/squeeze,available_r=centre+shift+centre/squeeze;
         if(p>=0 && ws_picture[p].left<ws_picture[p].right) {
             float ends=(ws_picture[p].field&&ws_picture[p].ends_move)?ws_picture[p].ex:0;
             available_l=SDL_max(available_l,ws_picture[p].left+ends);available_r=SDL_min(available_r,ws_picture[p].right+ends);
@@ -833,15 +875,6 @@ static bool WidescreenDraw(void) {
     return picture < 0 || !ws_picture[picture].native;
 }
 
-/* Half the 16:9 view's width in whole game pixels, for the screen's pixel
- * aspect (199 for 320x224), so its edges meet the picture's ends exactly;
- * never wider than the squeezed buffer. */
-static float WidescreenViewHalf(float game_aspect) {
-    const float w = (float)display_size.x;
-    return SDL_floorf(
-        SDL_min(w * (16.0f / 9.0f) / game_aspect, w / WS_SQUEEZE) * 0.5f);
-}
-
 /* The picture of the buffer the drawing area is in, or -1. */
 static int WidescreenDrawPicture(void) {
     for (int i = 0; i < 2; ++i) {
@@ -862,32 +895,45 @@ static int WidescreenDrawShift(void) {
  * squeezed room moves by whole buffer pixels from frame to frame, so its
  * texels keep their shape, and the presenter shows the rest (under half a
  * buffer pixel). The room's grid is at whole game pixels from the camera,
- * and the view's shift moves it 3/4 pixel per pixel in the buffer. */
+ * and the view's shift moves it by the squeeze per pixel in the buffer. */
 static void WidescreenFieldStep(int picture, float n, float* qx, float* qy) {
     *qx = *qy = 0.0f;
     if (picture < 0 || !ws_picture[picture].field)
         return;
-    const float sx = WS_SQUEEZE * n;
+    const float sx = WidescreenPictureSqueeze(picture) * n;
     const float base =
         (float)(ws_picture[picture].camera_x + ws_picture[picture].shift);
     *qx = SDL_roundf((ws_picture[picture].ex - base) * sx) / sx + base;
     *qy = SDL_roundf(ws_picture[picture].ey * n) / n;
 }
 
-/* The squeeze's fixed point. It moves 3 pixels against each pixel of view
- * shift, so the buffer holds the shifted view around its own centre: game x
- * centre + shift lands on the buffer's centre. */
-static float WidescreenPivot(float shift) {
+/* The squeeze's fixed point. It moves s / (1 - s) pixels (3 at 3/4) against
+ * each pixel of view shift, so the buffer holds the shifted view around its
+ * own centre: game x centre + shift lands on the buffer's centre. */
+static float WidescreenPivot(float shift, float squeeze) {
     return (float)display_size.x * 0.5f -
-           (float)shift * WS_SQUEEZE / (1.0f - WS_SQUEEZE);
+           (float)shift * squeeze / (1.0f - squeeze);
 }
 
 static float WidescreenCentre(void) {
     return (float)display_area.x +
-           WidescreenPivot(ws_centred ? 0 : WidescreenDrawShift());
+           WidescreenPivot(ws_centred ? 0 : WidescreenDrawShift(),
+                           WidescreenPictureSqueeze(WidescreenDrawPicture()));
 }
 
-static int WidescreenMargin(void) { return (display_size.x + 5) / 6; }
+/* Game pixels the squeezed buffer holds past each side of the screen,
+ * rounded up (a sixth of the width at 3/4). */
+static int WidescreenBufferMargin(float squeeze) {
+    if (squeeze == WS_SQUEEZE_DEFAULT)
+        return (display_size.x + 5) / 6;
+    return (int)SDL_ceilf(
+        (float)display_size.x * (1.0f / squeeze - 1.0f) * 0.5f - 0.001f);
+}
+
+static int WidescreenMargin(void) {
+    return WidescreenBufferMargin(
+        WidescreenPictureSqueeze(WidescreenDrawPicture()));
+}
 
 /* An untextured fill across the whole screen width (fades, flashes, dimmed
  * backdrops) is stretched by the margin on both sides, so it covers the
@@ -2468,7 +2514,7 @@ static bool CpuWideRects(int scale,int sw,int sh,SDL_Surface *dst,SDL_Rect *src,
  if(picture<0)return false;
  float aspect=GetCurrentGameAspectRatio(display_size.x,display_size.y);
  if(!(aspect>0))return false;
- float half=WidescreenViewHalf(aspect),centre=display_size.x*0.5f;
+ float half=WidescreenViewHalf(aspect,WidescreenPictureSqueeze(picture)),centre=display_size.x*0.5f;
  float qx,qy;CpuWideStep(picture,scale,&qx,&qy);
  float rx=ws_picture[picture].field?ws_picture[picture].ex-qx:0;
  float ry=ws_picture[picture].field?ws_picture[picture].ey-qy:0;
@@ -2758,7 +2804,7 @@ static void PlatformBackend_Present(void) {
                 Uint32 fsr_kx=1,fsr_ky=1;
 #endif
 
-                /* Widescreen: the buffer holds 4/3 of the screen's width,
+                /* Widescreen: the buffer holds 1 / squeeze of the screen's width,
                  * around the screen's centre plus the view's shift (see
                  * Psyz_VideoSetWidescreenPicture). A 16:9 window of it (for
                  * the screen's pixel aspect) is shown around that point. Past
@@ -2771,15 +2817,16 @@ static void PlatformBackend_Present(void) {
 #endif
                     game_aspect > 0.0f) {
                     const float w = (float)display_size.x, centre = w * 0.5f;
-                    const float buffer_half = centre / WS_SQUEEZE;
-                    const float half = WidescreenViewHalf(game_aspect);
                     int picture = -1;
                     for (int i = 0; i < 2; ++i) {
                         if (ws_picture[i].y == (interp_present_mid?interp_next_y:display_area.y))
                             picture = i;
                     }
+                    const float squeeze = WidescreenPictureSqueeze(picture);
+                    const float buffer_half = centre / squeeze;
+                    const float half = WidescreenViewHalf(game_aspect, squeeze);
                     const float shift=picture>=0 ? (interp_present_mid?ws_mid_shift[picture]:(float)ws_picture[picture].shift) : 0;
-                    const float pivot = WidescreenPivot(shift);
+                    const float pivot = WidescreenPivot(shift, squeeze);
                     /* the room is shown where it belongs: the rest of its
                      * shift past the step drawn (WidescreenFieldStep) */
                     float rest_x = 0.0f, rest_y = 0.0f, ends_x = 0.0f;
@@ -2810,14 +2857,14 @@ static void PlatformBackend_Present(void) {
                         SDL_max(shown_l, SDL_min(view_r, right));
                     /* game x -> fraction of the squeezed buffer */
                     const float f0 =
-                        (pivot + (shown_l - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (shown_l - rest_x - pivot) * squeeze) / w;
                     const float f1 =
-                        (pivot + (shown_r - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (shown_r - rest_x - pivot) * squeeze) / w;
                     dst = FitGameToWindow(16.0f / 9.0f, win);
                     /* whole prescale factors from the view's size, so they
                      * hold while a picture end moves through the view */
                     const float view_w =
-                        2.0f * half * WS_SQUEEZE / w * (float)src.w;
+                        2.0f * half * squeeze / w * (float)src.w;
                     const Uint32 kx = (Uint32)SDL_max(
                         1.0f, SDL_ceilf((float)dst.w / view_w - 0.001f));
                     const Uint32 ky =
@@ -2897,7 +2944,7 @@ static void PlatformBackend_Present(void) {
 #endif
                         SDL_GPU_LOADOP_CLEAR,
                     .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
-                    // the widescreen stretch is 4/3 per game pixel: nearest
+                    // the widescreen stretch is 1 / squeeze per game pixel: nearest
                     // would make every third column wider, so the view is
                     // prescaled and only this last step is linear
                     .filter = ws_view ? SDL_GPU_FILTER_LINEAR
@@ -3588,11 +3635,37 @@ int Psyz_VideoSetWidescreen(int enabled) {
     return 0;
 }
 int Psyz_VideoGetWidescreen(void) { return widescreen; }
+int Psyz_VideoSetWidescreenSqueeze(float squeeze) {
+    if (squeeze != 0.0f &&
+        !(squeeze >= WS_SQUEEZE_MIN && squeeze <= WS_SQUEEZE_MAX))
+        return -1;
+#ifdef PE_PS5
+    /* the CPU wide pages are laid out for 3/4 (cpu-widescreen.h) */
+    if (squeeze != WS_SQUEEZE_DEFAULT) return -1;
+#endif
+    if (squeeze != ws_squeeze_setting) {
+        Draw_FlushBuffer();
+        ws_squeeze_setting = squeeze;
+    }
+    return 0;
+}
+float Psyz_VideoGetWidescreenSqueeze(void) {
+    if (display_size.x <= 0 || display_size.y <= 0)
+        return ws_squeeze_setting > 0.0f ? ws_squeeze_setting
+                                         : WS_SQUEEZE_DEFAULT;
+    return WidescreenCurrentSqueeze();
+}
+int Psyz_VideoGetWidescreenBufferMargin(void) {
+    if (!widescreen || display_size.x <= 0 || display_size.y <= 0)
+        return 0;
+    return WidescreenBufferMargin(WidescreenCurrentSqueeze());
+}
 int Psyz_VideoGetWidescreenViewMargin(void) {
     if (!widescreen || display_size.x <= 0 || display_size.y <= 0)
         return 0;
     const float half = WidescreenViewHalf(
-        GetCurrentGameAspectRatio(display_size.x, display_size.y));
+        GetCurrentGameAspectRatio(display_size.x, display_size.y),
+        WidescreenCurrentSqueeze());
     return SDL_max(0, (int)half - display_size.x / 2);
 }
 void Psyz_VideoSetWidescreenCentred(int enabled) {
@@ -3647,8 +3720,9 @@ static void SetWidescreenPicture(int buffer_y, int left, int right, bool field,
     ws_centred = false;
     ws_field = false;
     const float centre = (float)display_size.x * 0.5f;
+    const float squeeze = WidescreenCurrentSqueeze();
     const float half = WidescreenViewHalf(
-        GetCurrentGameAspectRatio(display_size.x, display_size.y));
+        GetCurrentGameAspectRatio(display_size.x, display_size.y), squeeze);
     const float max_shift = SDL_max(0.0f, half - centre);
     float shift = 0.0f;
     /* the view as it would be for the room where it belongs */
@@ -3684,6 +3758,7 @@ static void SetWidescreenPicture(int buffer_y, int left, int right, bool field,
     /* A view that follows the picture's end to the fraction keeps the room
      * still on screen: only the room's shift past that is left to show. */
     ws_picture[slot].native = false;
+    ws_picture[slot].squeeze = squeeze;
     ws_picture[slot].field = field;
     ws_picture[slot].ends_move = ends_move;
     ws_picture[slot].ex = field ? dx - (exact_shift - shift) : 0.0f;
@@ -5254,7 +5329,9 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
      * narrower than the screen (a menu list) is squeezed with its contents;
      * the full-width one is kept, so what lies past the screen's edges stays.
      */
-    const float ws_squeeze = WidescreenDraw() ? WS_SQUEEZE : 1.0f;
+    const float ws_squeeze =
+        WidescreenDraw() ? WidescreenPictureSqueeze(WidescreenDrawPicture())
+                         : 1.0f;
     const float ws_centre = WidescreenCentre();
     SDL_Rect clip = scissor_rect;
     if (ws_squeeze < 1.0f && clip.w < display_size.x) {
@@ -5270,7 +5347,7 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
     const int field_picture =
         ws_field && WidescreenDraw() ? WidescreenDrawPicture() : -1;
     const float target_centre=midpoint&&!ws_centred&&WidescreenDrawPicture()>=0 ?
-        (float)display_area.x+WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()]) : ws_centre;
+        (float)display_area.x+WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()],WidescreenPictureSqueeze(WidescreenDrawPicture())) : ws_centre;
     float sub_x = 0.0f, sub_y = 0.0f;
     if (target_index || !scaled_vram_render)
         WidescreenFieldStep(
