@@ -57,9 +57,14 @@ void SsSeqCalledTbyT(void) {
 
 #ifdef __psyz
 #undef SsSeqCalledTbyT
+/* A tick's PS1 time, mostly _SsVmFlush's pass over the 24 voices
+ * (DuckStation: 6.3k system clocks with no sequence playing). */
+enum { SS_TICK_CYCLES = 6335 };
+void Psyz_SpendCycles(unsigned cycles);
 void SsSeqCalledTbyT(void) {
     Psyz_KernelLockInterrupts();
     SsSeqCalledTbyT_Unlocked();
+    Psyz_SpendCycles(SS_TICK_CYCLES);
     Psyz_KernelUnlockInterrupts();
 }
 #endif

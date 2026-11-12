@@ -50,7 +50,20 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
     return prev;
 }
 
+/* The vblank handler's PS1 time besides the kernel's: libetc's VSync
+ * handler and callbacks dispatch, the BIOS card driver's turn (2.4k clocks
+ * on DuckStation), and libpad's controller exchange once PadStartCom ran
+ * (16.1k: its SIO busy waits for a digital pad in port 1, port 2 empty). */
+enum { VBLANK_HANDLER_CYCLES = 2387, LIBPAD_VBLANK_CYCLES = 16084 };
+
+static uint64_t last_blank_us; // emulated time of the latest blank
+
 void Psyz_VSyncBlank(void) {
+    last_blank_us = Psyz_KernelNowUs();
+    Psyz_GpuCrtcBlank();
+    Psyz_KernelInterruptCycles(
+        VBLANK_HANDLER_CYCLES +
+        (Psyz_PadDriverRunning() ? LIBPAD_VBLANK_CYCLES : 0));
     ReadPadsOnVsync();
     Psyz_CardVBlank();
     if (g_PsyzVsyncCb)
@@ -61,28 +74,98 @@ void Psyz_VSyncBlank(void) {
 /* SDK VSync(n) waits for the interval since the previous blocking call,
  * then at least the next blank. Queries do not reset that interval. */
 static unsigned int last_vsync_count;
+
+/* In 480-line interlace libetc's VSync also waits, after the blank, until
+ * GPUSTAT bit 31 differs from its value before the blank wait: at once when
+ * the field read was odd, else at the start of the display range (about 48
+ * lines into the next field for a PAL 256-line screen), so every other
+ * VSync(0) returns late (DuckStation's frames alternate 266 and 362 lines);
+ * a read in the blank of an overrun frame can wait a further field. VSync(1)
+ * counts lines from that return, as the PS1's Hcount latch does (the
+ * platform counts from the blank of its last VSync(0)). */
+static unsigned int vsync_return_lines;
+
+static unsigned LineNs(void) {
+    return Psyz_GpuCrtcFieldLines() == 314 ? 64017 : 63563;
+}
+
+static unsigned LinesSinceBlank(void) {
+    uint64_t now_us = Psyz_KernelNowUs();
+    if (now_us <= last_blank_us) {
+        return 0;
+    }
+    return (unsigned)((now_us - last_blank_us) * 1000 / LineNs());
+}
+
+static unsigned int WaitBlank(unsigned int now) {
+    unsigned int before = now;
+    Psyz_VideoVSync(0);
+    now = (unsigned int)Psyz_VideoVSync(-1);
+    unsigned int advanced = now - before;
+    while (advanced--) {
+        Psyz_VSyncBlank();
+    }
+    return now;
+}
+
+/* The lines after the blank until GPUSTAT bit 31 differs from `odd_read`;
+ * whole fields it stays the same are waited here. */
+static unsigned InterlaceWait(int odd_read, unsigned int* now) {
+    for (int fields = 0; fields < 3; fields++) {
+        if (Psyz_GpuCrtcOddLine(0) != odd_read) {
+            return 0; // flipped at the blank
+        }
+        unsigned blank = Psyz_GpuCrtcBlankLines();
+        if (Psyz_GpuCrtcOddLine(blank) != odd_read) {
+            return blank;
+        }
+        Psyz_KernelTakeInterruptCycles(); // the poll loop runs meanwhile
+        *now = WaitBlank(*now);
+    }
+    return 0;
+}
+
 int VSync(int mode) {
     Psyz_KernelPoll();
     if (mode < 0)
         return Psyz_VideoVSync(-1);
-    if (mode == 1)
-        return Psyz_VideoVSync(1);
+    if (mode == 1) {
+        Psyz_KernelTakeInterruptCycles(); // a polling loop absorbs handlers
+        return (unsigned short)(Psyz_VideoVSync(1) - vsync_return_lines);
+    }
 
-    int elapsed = Psyz_VideoVSync(1);
+    int raw = Psyz_VideoVSync(1);
+    int elapsed = (unsigned short)(raw - vsync_return_lines);
     unsigned int now = (unsigned int)Psyz_VideoVSync(-1);
     unsigned int target =
         mode > 1 ? last_vsync_count + (unsigned int)mode : now + 1;
     if ((int32_t)(target - now) < 1)
         target = now + 1;
+    // GPUSTAT as libetc reads it: now, or at the blank before the target
+    // offline clock only: real-time presentation paces the fields itself
+    int interlace = Psyz_GpuCrtcInterlaced480() && Psyz_KernelOfflineClock();
+    int odd_read = 0;
+    if (interlace) {
+        odd_read = Psyz_GpuCrtcOddLine(
+            (int32_t)(target - 1 - now) > 0 ? 0 : LinesSinceBlank());
+    }
+    Psyz_KernelTakeInterruptCycles(); // the wait loop absorbs earlier handlers
     do {
-        unsigned int before = now;
-        Psyz_VideoVSync(0);
-        now = (unsigned int)Psyz_VideoVSync(-1);
-        unsigned int advanced = now - before;
-        while (advanced--) {
-            Psyz_VSyncBlank();
-        }
+        now = WaitBlank(now);
     } while ((int32_t)(now - target) < 0);
+    unsigned wait_lines = interlace ? InterlaceWait(odd_read, &now) : 0;
+    /* The loop sees the blank once the vblank handler is done: VSync returns
+     * after it, or at the interlace field change if that is later. */
+    uint64_t handler_ns = (uint64_t)Psyz_KernelTakeInterruptCycles() *
+                          1000000000u / 33868800u;
+    uint64_t wait_ns = (uint64_t)wait_lines * LineNs();
+    if (handler_ns > wait_ns) {
+        wait_ns = handler_ns;
+    }
+    if (wait_ns) {
+        Psyz_SpendTime((unsigned)wait_ns);
+    }
+    vsync_return_lines = (unsigned)((wait_ns + LineNs() / 2) / LineNs());
     Psyz_CdServiceDrive();
     /* Keep periodic waits on their scheduled blank. Native presentation can
      * return just after it; using that late return as the next origin adds a
@@ -218,4 +301,50 @@ long format(char* fs) { return my_format(fs); }
 int psyz_get_errno(void) {
     NOT_IMPLEMENTED;
     return 0;
+}
+
+/* BIOS A(28h)/A(2Ah)/A(2Bh), with the time of the ROM byte loops (system.h). */
+enum {
+    BIOS_FILL_CYCLES = 328,
+    BIOS_FILL_BYTE_CYCLES = 132,
+    BIOS_COPY_CYCLES = 258,
+    BIOS_COPY_BYTE_CYCLES = 204,
+};
+
+static void BiosByteLoopTime(unsigned base, unsigned per_byte, int len) {
+    uint64_t cycles = base + (len > 0 ? (uint64_t)len * per_byte : 0);
+    while (cycles > UINT32_MAX) {
+        Psyz_SpendCycles(UINT32_MAX);
+        cycles -= UINT32_MAX;
+    }
+    Psyz_SpendCycles((unsigned)cycles);
+}
+
+void Psyz_BiosBzero(void* dst, int len) {
+    if (dst && len > 0) {
+        memset(dst, 0, (size_t)len);
+    }
+    BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, dst ? len : 0);
+}
+
+void* Psyz_BiosMemset(void* dst, int c, int len) {
+    if (dst && len > 0) {
+        memset(dst, c & 0xFF, (size_t)len);
+    }
+    BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, dst ? len : 0);
+    return dst;
+}
+
+void* Psyz_BiosMemcpy(void* dst, const void* src, int len) {
+    if (dst && src && len > 0) {
+        // the ROM copies forwards byte by byte, overlapping or not
+        unsigned char* d = dst;
+        const unsigned char* s = src;
+        for (int i = 0; i < len; i++) {
+            d[i] = s[i];
+        }
+    }
+    BiosByteLoopTime(BIOS_COPY_CYCLES, BIOS_COPY_BYTE_CYCLES,
+                     dst && src ? len : 0);
+    return dst;
 }

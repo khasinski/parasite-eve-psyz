@@ -316,6 +316,18 @@ void Psyz_AudioDisplayRangeChanged(
     field_frames_left = field_frames_total = frames;
 }
 
+/* The display mode's PAL bit changed (GP1(08h), a GPU reset): fields from
+ * the next one on have that length, also those a busy wait crosses before
+ * the next VSync(0). Offline clock only. */
+void Psyz_AudioVideoModeChanged(int pal) {
+    StartOfflineClock();
+    if (!is_audio_init || !video_clock)
+        return;
+    if ((bool)pal != video_pal)
+        video_remainder = 0;
+    video_pal = pal;
+}
+
 /* A blank VSync(0) waited for: the rest of the current field. */
 void Sdl3Audio_VBlank(bool pal) {
     StartOfflineClock();

@@ -12,11 +12,17 @@
  * 0x24040001 with the SCPH-1001 BIOS (as on DuckStation), so a game that
  * never seeds draws the same numbers as there. */
 static uint32_t biosRandomState = UINT32_C(0x24040001);
+/* The ROM routines with the A0 stub, in system clocks (DuckStation). */
+enum { BIOS_RAND_CYCLES = 433, BIOS_SRAND_CYCLES = 119 };
 int Psyz_Rand(void) {
     biosRandomState = biosRandomState * UINT32_C(0x41c64e6d) + UINT32_C(0x3039);
+    Psyz_SpendCycles(BIOS_RAND_CYCLES);
     return (int)((biosRandomState >> 16) & 0x7fff);
 }
-void Psyz_Srand(unsigned int seed) { biosRandomState = (uint32_t)seed; }
+void Psyz_Srand(unsigned int seed) {
+    biosRandomState = (uint32_t)seed;
+    Psyz_SpendCycles(BIOS_SRAND_CYCLES);
+}
 unsigned int Psyz_RandState(void) { return biosRandomState; }
 
 void MyPadInit(int mode);
@@ -66,6 +72,7 @@ long GetVideoMode() { return video_mode; }
 long SetVideoMode(long mode) {
     long prev = video_mode;
     video_mode = mode;
+    Psyz_GpuConsoleVideoMode(mode == MODE_PAL);
     return prev;
 }
 
@@ -165,8 +172,12 @@ void PadInitDirect(u_char* pad1, u_char* pad2) {
     InitPAD((char*)pad1, PSYZ_PAD_BUF_LEN, (char*)pad2, PSYZ_PAD_BUF_LEN);
 }
 
+static int pad_driver_running;
+int Psyz_PadDriverRunning(void) { return pad_driver_running; }
+
 void PadStartCom(void) {
     // receive buffers are already refreshed on every VSync
+    pad_driver_running = 1;
 }
 
 int PadGetState(int port) { return PadDirectState(port); }

@@ -199,9 +199,43 @@ uint64_t Psyz_KernelNowUs(void) { return KernelNowUs(); }
 
 int Psyz_KernelOfflineClock(void) { return UsesAudioClock(); }
 
+/* PS1 time of interrupt handlers (system clocks) not yet taken from the
+ * main thread (Psyz_KernelInterruptCycles). */
+static AtomicWord interrupt_debt;
+
+static unsigned TakeInterruptDebt(void) {
+    long debt = AtomicLoad(&interrupt_debt);
+    while (debt && !AtomicCas(&interrupt_debt, debt, 0)) {
+        debt = AtomicLoad(&interrupt_debt);
+    }
+    return (unsigned)debt;
+}
+
+void Psyz_KernelInterruptCycles(unsigned cycles) {
+    if (!UsesAudioClock()) {
+        return;
+    }
+    AtomicAdd(&interrupt_debt, (long)cycles);
+}
+
+unsigned Psyz_KernelTakeInterruptCycles(void) { return TakeInterruptDebt(); }
+
+static int OwnsKernel(void);
+static void SpendNs(unsigned ns);
+
+void Psyz_SpendTime(unsigned ns) {
+    // a span measured on the PS1 includes the interrupts within it
+    unsigned before = TakeInterruptDebt();
+    SpendNs(ns);
+    TakeInterruptDebt();
+    if (before) {
+        Psyz_KernelInterruptCycles(before);
+    }
+}
+
 static uint64_t spend_carry_ns;
 static uint64_t spend_deadline_ns;
-void Psyz_SpendTime(unsigned ns) {
+static void SpendNs(unsigned ns) {
     if (UsesAudioClock()) {
         spend_carry_ns += ns;
         if (spend_carry_ns >= 1000) {
@@ -220,6 +254,26 @@ void Psyz_SpendTime(unsigned ns) {
     while (KernelNowUs() * 1000 < spend_deadline_ns) {
         Psyz_KernelPoll();
     }
+}
+
+/* CPU work: the interrupts that come meanwhile (and those owed by native
+ * work before it) make it last longer. Inside a handler it lengthens the
+ * handler. Offline clock only: on a real-time clock the native work takes
+ * host time of its own and a busy wait would only lower the frame rate. */
+void Psyz_SpendCycles(unsigned cycles) {
+    static uint64_t carry; // clocks * 1e9 not yet spent, below one ns
+    if (!UsesAudioClock()) {
+        return; // the host's own time stands for it on a real-time clock
+    }
+    if (OwnsKernel()) {
+        Psyz_KernelInterruptCycles(cycles);
+        return;
+    }
+    do {
+        uint64_t scaled = (uint64_t)cycles * 1000000000u + carry;
+        carry = scaled % SYSTEM_CLOCK_HZ;
+        SpendNs((unsigned)(scaled / SYSTEM_CLOCK_HZ));
+    } while ((cycles = TakeInterruptDebt()) != 0);
 }
 
 static void KernelInit(void) {
@@ -281,8 +335,13 @@ static void DeliverLocked(unsigned int desc, unsigned int spec) {
     }
 }
 
+/* The BIOS exception handler and libetc's dispatcher around a callback
+ * (DuckStation: 2.9k clocks for an RCnt interrupt with an empty callback). */
+enum { KERNEL_IRQ_CYCLES = 2850 };
+
 static void ServiceLine(int line) {
     irq_latched &= ~(1u << line);
+    Psyz_KernelInterruptCycles(KERNEL_IRQ_CYCLES);
     switch (line) {
     case IRQ_VBLANK:
         DeliverLocked(RCntCNT3, EvSpINT);

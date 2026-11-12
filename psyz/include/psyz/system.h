@@ -21,10 +21,22 @@ extern "C" {
 #endif
 
 /* BIOS random generator, separate from the host C library. The state getter
- * plus Psyz_Srand allow deterministic save/restore without consuming a value. */
+ * plus Psyz_Srand allow deterministic save/restore without consuming a value.
+ * Psyz_Rand and Psyz_Srand take the PS1 time of the ROM routines. */
 int Psyz_Rand(void);
 void Psyz_Srand(unsigned int seed);
 unsigned int Psyz_RandState(void);
+
+/* BIOS A(28h) bzero, A(2Ah) memcpy and A(2Bh) memset, the routines a PSY-Q
+ * game reaches through LIBC's A0 stubs. They run from the uncached 8-bit BIOS
+ * ROM, so they are slow: bzero/memset take 328 + 132 clocks per byte and
+ * memcpy 258 + 204 (DuckStation, SCPH-1001 BIOS: bzero(0x620) = 207300,
+ * memcpy(0x5C) = 19019, memset(8) = 1384 system clocks). The work is done at
+ * once and the time is spent with Psyz_SpendCycles. A length below one does
+ * nothing (but the call); memcpy and memset return dst, as the BIOS does. */
+void Psyz_BiosBzero(void* dst, int len);
+void* Psyz_BiosMemcpy(void* dst, const void* src, int len);
+void* Psyz_BiosMemset(void* dst, int c, int len);
 
 // A native PS1 build uses PSY-Q's own file I/O.
 #ifndef __psx__
@@ -154,6 +166,16 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb);
  * @param ns Nanoseconds of PS1 time
  */
 void Psyz_SpendTime(unsigned ns);
+
+/**
+ * @brief Spend PS1 CPU time given in system clocks (33.8688 MHz)
+ *
+ * Psyz_SpendTime for a cost measured in clocks, e.g. a routine timed on an
+ * emulator; the fraction of a nanosecond is carried to the next call.
+ *
+ * @param cycles PS1 system clocks
+ */
+void Psyz_SpendCycles(unsigned cycles);
 
 /**
  * @brief Complete MDEC output transfers at once

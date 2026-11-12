@@ -2,6 +2,15 @@
 #include <libgte.h>
 #include <libgpu.h>
 
+#ifdef __psyz
+/* The PS1 time of a call (DuckStation, system clocks): AddPrim 38,
+ * SetSemiTrans 13, SetSprt 5; the other setters are the same few stores. */
+void Psyz_SpendCycles(unsigned cycles);
+#define PRIM_TIME(cycles) Psyz_SpendCycles(cycles)
+#else
+#define PRIM_TIME(cycles)
+#endif
+
 u_short GetTPage(int tp, int abr, int x, int y) {
     return getTPage(tp, abr, x, y);
 }
@@ -21,33 +30,108 @@ void DumpClut(u_short clut) {
 
 void* NextPrim(void* p) { return nextPrim(p); }
 int IsEndPrim(void* p) { return isendprim(p); }
-void AddPrim(void* ot, void* p) { addPrim(ot, p); }
-void AddPrims(void* ot, void* p0, void* p1) { addPrims(ot, p0, p1); }
+void AddPrim(void* ot, void* p) {
+    PRIM_TIME(38);
+    addPrim(ot, p);
+}
+void AddPrims(void* ot, void* p0, void* p1) {
+    PRIM_TIME(38);
+    addPrims(ot, p0, p1);
+}
 void CatPrim(void* p0, void* p1) { catPrim(p0, p1); }
 void TermPrim(void* p) { termPrim(p); }
-void SetSemiTrans(void* p, int abe) { setSemiTrans(p, abe); }
-void SetShadeTex(void* p, int tge) { setShadeTex(p, tge); }
-void SetPolyF3(POLY_F3* p) { setPolyF3(p); }
-void SetPolyFT3(POLY_FT3* p) { setPolyFT3(p); }
-void SetPolyG3(POLY_G3* p) { setPolyG3(p); }
-void SetPolyGT3(POLY_GT3* p) { setPolyGT3(p); }
-void SetPolyF4(POLY_F4* p) { setPolyF4(p); }
-void SetPolyFT4(POLY_FT4* p) { setPolyFT4(p); }
-void SetPolyG4(POLY_G4* p) { setPolyG4(p); }
-void SetPolyGT4(POLY_GT4* p) { setPolyGT4(p); }
-void SetSprt8(SPRT_8* p) { setSprt8(p); }
-void SetSprt16(SPRT_16* p) { setSprt16(p); }
-void SetSprt(SPRT* p) { setSprt(p); }
-void SetTile1(TILE_1* p) { setTile1(p); }
-void SetTile8(TILE_8* p) { setTile8(p); }
-void SetTile16(TILE_16* p) { setTile16(p); }
-void SetTile(TILE* p) { setTile(p); }
-void SetLineF2(LINE_F2* p) { setLineF2(p); }
-void SetLineG2(LINE_G2* p) { setLineG2(p); }
-void SetLineF3(LINE_F3* p) { setLineF3(p); }
-void SetLineG3(LINE_G3* p) { setLineG3(p); }
-void SetLineF4(LINE_F4* p) { setLineF4(p); }
-void SetLineG4(LINE_G4* p) { setLineG4(p); }
+void SetSemiTrans(void* p, int abe) {
+    PRIM_TIME(13);
+    setSemiTrans(p, abe);
+}
+void SetShadeTex(void* p, int tge) {
+    PRIM_TIME(13);
+    setShadeTex(p, tge);
+}
+void SetPolyF3(POLY_F3* p) {
+    PRIM_TIME(5);
+    setPolyF3(p);
+}
+void SetPolyFT3(POLY_FT3* p) {
+    PRIM_TIME(5);
+    setPolyFT3(p);
+}
+void SetPolyG3(POLY_G3* p) {
+    PRIM_TIME(5);
+    setPolyG3(p);
+}
+void SetPolyGT3(POLY_GT3* p) {
+    PRIM_TIME(5);
+    setPolyGT3(p);
+}
+void SetPolyF4(POLY_F4* p) {
+    PRIM_TIME(5);
+    setPolyF4(p);
+}
+void SetPolyFT4(POLY_FT4* p) {
+    PRIM_TIME(5);
+    setPolyFT4(p);
+}
+void SetPolyG4(POLY_G4* p) {
+    PRIM_TIME(5);
+    setPolyG4(p);
+}
+void SetPolyGT4(POLY_GT4* p) {
+    PRIM_TIME(5);
+    setPolyGT4(p);
+}
+void SetSprt8(SPRT_8* p) {
+    PRIM_TIME(5);
+    setSprt8(p);
+}
+void SetSprt16(SPRT_16* p) {
+    PRIM_TIME(5);
+    setSprt16(p);
+}
+void SetSprt(SPRT* p) {
+    PRIM_TIME(5);
+    setSprt(p);
+}
+void SetTile1(TILE_1* p) {
+    PRIM_TIME(5);
+    setTile1(p);
+}
+void SetTile8(TILE_8* p) {
+    PRIM_TIME(5);
+    setTile8(p);
+}
+void SetTile16(TILE_16* p) {
+    PRIM_TIME(5);
+    setTile16(p);
+}
+void SetTile(TILE* p) {
+    PRIM_TIME(5);
+    setTile(p);
+}
+void SetLineF2(LINE_F2* p) {
+    PRIM_TIME(5);
+    setLineF2(p);
+}
+void SetLineG2(LINE_G2* p) {
+    PRIM_TIME(5);
+    setLineG2(p);
+}
+void SetLineF3(LINE_F3* p) {
+    PRIM_TIME(5);
+    setLineF3(p);
+}
+void SetLineG3(LINE_G3* p) {
+    PRIM_TIME(5);
+    setLineG3(p);
+}
+void SetLineF4(LINE_F4* p) {
+    PRIM_TIME(5);
+    setLineF4(p);
+}
+void SetLineG4(LINE_G4* p) {
+    PRIM_TIME(5);
+    setLineG4(p);
+}
 
 void SetDrawTPage(DR_TPAGE* p, int dfe, int dtd, int tpage) {
     setDrawTPage(p, dfe, dtd, tpage);

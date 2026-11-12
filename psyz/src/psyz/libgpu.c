@@ -575,12 +575,86 @@ static int psyz_clr(RECT* rect, u32 color) {
     return 0;
 }
 
+/* The CRTC's vertical display range, which places the vblank interrupt
+ * (Psyz_AudioDisplayRangeChanged). A GPU reset sets lines 16..255. */
+enum { CRTC_RESET_Y1 = 0x10, CRTC_RESET_Y2 = 0xFF };
+static unsigned crtc_y1 = CRTC_RESET_Y1, crtc_y2 = CRTC_RESET_Y2;
+
+static void CrtcVerticalRange(unsigned y1, unsigned y2) {
+    if (y1 == crtc_y1 && y2 == crtc_y2) {
+        return;
+    }
+    Psyz_AudioDisplayRangeChanged(crtc_y1, crtc_y2, y1, y2);
+    crtc_y1 = y1;
+    crtc_y2 = y2;
+}
+
+/* GPUSTAT bit 31, which libetc's VSync waits on in interlace: in 480-line
+ * interlace (GP1(08h) bits 2 and 5) it is the displayed field's line parity,
+ * (display y + field) & 1, during the display range and y & 1 in the blank;
+ * the field flips at every blank while interlace is on and is 0 otherwise
+ * (DuckStation's CRTC). In other modes it flips every line. */
+static unsigned crtc_display_y, crtc_mode, crtc_field;
+
+int Psyz_GpuCrtcInterlaced480(void) { return (crtc_mode & 0x24) == 0x24; }
+
+unsigned Psyz_GpuCrtcFieldLines(void) { return crtc_mode & 8 ? 314 : 263; }
+
+unsigned Psyz_GpuCrtcBlankLines(void) {
+    unsigned total = Psyz_GpuCrtcFieldLines();
+    unsigned y1 = crtc_y1 < total ? crtc_y1 : total;
+    unsigned y2 = crtc_y2 < total ? crtc_y2 : total;
+    return y2 > y1 ? total - y2 + y1 : 0;
+}
+
+int Psyz_GpuCrtcOddLine(unsigned line) {
+    if (!Psyz_GpuCrtcInterlaced480()) {
+        return (int)((crtc_display_y + line) & 1);
+    }
+    if (line < Psyz_GpuCrtcBlankLines()) {
+        return (int)(crtc_display_y & 1);
+    }
+    return (int)((crtc_display_y + crtc_field) & 1);
+}
+
+void Psyz_GpuCrtcBlank(void) {
+    crtc_field = crtc_mode & 0x20 ? crtc_field ^ 1 : 0;
+}
+
+/* A GPU reset leaves the display mode of the console's region: a PAL
+ * console's CRTC runs 50 Hz fields from the start (DuckStation's GPUSTAT
+ * reset). PSY-Q games name it with SetVideoMode (Psyz_GpuConsoleVideoMode),
+ * which also sets the fields before the game's first display mode. */
+static int console_pal, display_mode_set;
+
+static void CrtcResetMode(void) {
+    unsigned mode = console_pal ? 8 : 0;
+    crtc_mode = mode;
+    Draw_SetDisplayMode((DisplayMode*)&mode);
+    Psyz_AudioVideoModeChanged(console_pal);
+}
+
+void Psyz_GpuConsoleVideoMode(int pal) {
+    console_pal = pal;
+    if (!display_mode_set) {
+        CrtcResetMode();
+    }
+}
+
+void Psyz_GpuCrtcReset(void) {
+    CrtcVerticalRange(CRTC_RESET_Y1, CRTC_RESET_Y2);
+    crtc_display_y = 0;
+    crtc_field = 0;
+    CrtcResetMode();
+}
+
 void Psyz_GpuDisplayCommand(unsigned int cmd) {
     unsigned char op = (cmd >> 24) & 0x3F;
     GpuDump_TrackDisplay(cmd);
     switch (op) {
     case 0:
         Draw_Reset();
+        Psyz_GpuCrtcReset();
         break;
     case 1:
         LOG_ONCE("Reset FIFO not implemented");
@@ -595,16 +669,21 @@ void Psyz_GpuDisplayCommand(unsigned int cmd) {
         LOG_ONCE("DMA direction not implemented");
         break;
     case 5:
+        crtc_display_y = (cmd >> 10) & 0x3FF;
         Draw_DisplayArea(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         break;
     case 6:
         Draw_DisplayHorizontalRange(cmd & 0xFFF, (cmd >> 12) & 0xFFF);
         break;
     case 7:
+        CrtcVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         Draw_DisplayVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         break;
     case 8:
         cmd &= 0xFFFFFF;
+        crtc_mode = cmd & 0xFF;
+        display_mode_set = 1;
+        Psyz_AudioVideoModeChanged((cmd & 8) != 0);
         Draw_SetDisplayMode((DisplayMode*)&cmd);
         break;
     default:

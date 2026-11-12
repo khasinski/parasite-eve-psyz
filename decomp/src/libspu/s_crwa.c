@@ -4,6 +4,12 @@ void WaitEvent(s32);
 s32 _SpuIsInAllocateArea_(u32);
 extern s32 _spu_zerobuf[];
 
+#ifdef __psyz
+void Psyz_SpendCycles(unsigned cycles);
+/* SPU DMA rate (spu.c) and the setup of each 1 KiB chunk (_spu_t's waits,
+ * the DMA event): 97 chunks took 1.27M clocks on DuckStation. */
+enum { SPU_CLEAR_DMA_CLOCKS_PER_BYTE = 8, SPU_CLEAR_CHUNK_CYCLES = 3070 };
+#endif
 long SpuClearReverbWorkArea(long rev_mode) {
     void (* volatile callback)();
     s32 oldTransmode;
@@ -47,6 +53,9 @@ long SpuClearReverbWorkArea(long rev_mode) {
         SPUW(trans_addr, dstAddr >> _spu_mem_mode_plus);
         Psyz_SpuMemWrite(
             SPUR(trans_addr) << _spu_mem_mode_plus, _spu_zerobuf, size);
+        // the chunk's DMA and its setup take their PS1 time
+        Psyz_SpendCycles(size * SPU_CLEAR_DMA_CLOCKS_PER_BYTE +
+                         SPU_CLEAR_CHUNK_CYCLES);
         _spu_DmaDone();
 #else
         _spu_t(2, dstAddr);

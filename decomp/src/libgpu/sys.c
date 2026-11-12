@@ -122,6 +122,31 @@ int D_800B8A44 = 0;
 #define GPU_PSX_PTR(x) (u_long*)((u_long)x & 0xFFFFFF)
 #endif
 
+#ifdef __psyz
+/* The PS1 CPU time of the calls, in system clocks (DuckStation, measured at
+ * the call): the library code, its BIOS memcpy of the PS1 environment
+ * (A(2Ah): 258 + 204 clocks per byte, DRAWENV 0x5C and DISPENV 0x14 bytes)
+ * and the DMA the CPU waits for (17 clocks per 16 words: the ordering table
+ * clear and an image upload, which the next DrawSync(0) finishes). */
+void Psyz_SpendCycles(unsigned cycles);
+#define GPU_TIME(cycles) Psyz_SpendCycles(cycles)
+#define GPU_BIOS_MEMCPY_CYCLES(bytes) (258 + 204 * (bytes))
+#define GPU_DMA_CYCLES(words) ((words) + ((words) + 15) / 16)
+enum {
+    PS1_DRAWENV_SIZE = 0x5C,
+    PS1_DISPENV_SIZE = 0x14,
+    PUT_DRAW_ENV_CYCLES = 1165, // PutDrawEnv without its memcpy
+    PUT_DISP_ENV_CYCLES = 396,  // PutDispEnv (unchanged ranges), ditto
+    GET_ENV_CYCLES = 40,
+    DRAW_OTAG_CYCLES = 483,
+    CLEAR_OTAG_R_CYCLES = 330, // and the OTC DMA of n words
+    LOAD_IMAGE_CYCLES = 830,   // and the DMA of the image
+    DRAW_SYNC_CYCLES = 246,    // an idle GPU queue
+};
+#else
+#define GPU_TIME(cycles)
+#endif
+
 #ifndef CLAMP
 #define CLAMP(value, low, high)                                                \
     value < low ? low : (value > high ? high : value)
@@ -226,6 +251,7 @@ int DrawSync(int mode) {
     if (info.level >= 2) {
         GPU_printf("DrawSync(%d)...\n", mode);
     }
+    GPU_TIME(DRAW_SYNC_CYCLES);
     return D_800B8920->sync(mode);
 }
 
@@ -262,6 +288,10 @@ int ClearImage2(RECT* rect, u8 r, u8 g, u8 b) {
 
 int LoadImage(RECT* rect, u_long* p) {
     checkRECT("LoadImage", rect);
+    GPU_TIME(LOAD_IMAGE_CYCLES +
+             (rect->w > 0 && rect->h > 0
+                  ? GPU_DMA_CYCLES(((unsigned)rect->w * rect->h + 1) / 2)
+                  : 0));
     return D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->dws,
                                (u_long)rect, sizeof(RECT), (u_long)p);
 }
@@ -319,6 +349,7 @@ OT_TYPE* ClearOTagR(OT_TYPE* ot, int n) {
     }
 
     D_800B8920->otc(ot, n);
+    GPU_TIME(CLEAR_OTAG_R_CYCLES + (n > 0 ? GPU_DMA_CYCLES((unsigned)n) : 0));
 #ifdef __psyz
     setaddr(ot, D_800B89E4);
     setlen(ot, 0);
@@ -338,6 +369,7 @@ void DrawOTag(OT_TYPE* p) {
     if (info.level >= 2) {
         GPU_printf("DrawOTag(%08x)...\n", p);
     }
+    GPU_TIME(DRAW_OTAG_CYCLES);
     #ifdef PE_PS5_GPU_NATIVE
     int native_accepted =
     #endif
@@ -358,6 +390,7 @@ DRAWENV* PutDrawEnv(DRAWENV* env) {
     D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->cwc,
                         (u_long)&env->dr_env, sizeof(DR_ENV), 0);
     __builtin_memcpy(&info.draw, env, sizeof(DRAWENV));
+    GPU_TIME(PUT_DRAW_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
     return env;
 }
 
@@ -373,6 +406,7 @@ void DrawOTagEnv(OT_TYPE* p, DRAWENV* env) {
     D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->cwc,
                         (u_long)&env->dr_env, sizeof(DR_ENV), 0);
     __builtin_memcpy(&info.draw, env, sizeof(DRAWENV));
+    GPU_TIME(PUT_DRAW_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
 #ifdef PE_PS5_GPU_NATIVE
     Psyz_VideoMovieFrameQueued(native_accepted==0);
 #endif
@@ -380,6 +414,7 @@ void DrawOTagEnv(OT_TYPE* p, DRAWENV* env) {
 
 DRAWENV* GetDrawEnv(DRAWENV* env) {
     memcpy(env, &info.draw, sizeof(DRAWENV));
+    GPU_TIME(GET_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
     return env;
 }
 
@@ -452,6 +487,7 @@ DISPENV* PutDispEnv(DISPENV* env) {
         D_800B8920->ctl(mode);
     }
     memcpy((u8*)&info.disp, (u8*)env, sizeof(DISPENV));
+    GPU_TIME(PUT_DISP_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DISPENV_SIZE));
 #ifdef PE_PS5_GPU_NATIVE
     /* Called even when unchanged mode/range registers are cached. */
     Psyz_VideoMovieDisplayEnvSubmitted();
@@ -461,6 +497,7 @@ DISPENV* PutDispEnv(DISPENV* env) {
 
 DISPENV* GetDispEnv(DISPENV* env) {
     memcpy(env, &info.disp, sizeof(DISPENV));
+    GPU_TIME(GET_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DISPENV_SIZE));
     return env;
 }
 
@@ -866,6 +903,10 @@ int SetIntrMask(int);
 int _reset(int mode) {
 #ifdef __psyz
     int psyz_gpu_version(int);
+    void Psyz_GpuCrtcReset(void);
+    if ((mode & 7) == 0 || (mode & 7) == 5) {
+        Psyz_GpuCrtcReset(); // GPU_STATUS = 0: GP1(00h)
+    }
     return psyz_gpu_version(mode);
 #endif
     u_long** queue = &_qout;

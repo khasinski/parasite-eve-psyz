@@ -81,11 +81,31 @@ void Psyz_VideoWaitBlank(void);
 // the next blank of the offline clock (sdl3_audio.c).
 void Psyz_AudioDisplayRangeChanged(
     unsigned y1, unsigned y2, unsigned new_y1, unsigned new_y2);
+// The display mode's PAL bit: the length of the offline clock's fields.
+void Psyz_AudioVideoModeChanged(int pal);
 // A GPU reset (GP1(00h)): the CRTC's display range returns to its default.
 void Psyz_GpuCrtcReset(void);
+// The console's region (SetVideoMode): a GPU reset's display mode (libgpu.c).
+void Psyz_GpuConsoleVideoMode(int pal);
+// The CRTC field (libgpu.c): GPUSTAT bit 31 `line` lines after a blank;
+// whether the display is 480-line interlace; the lines of a field (PAL or
+// NTSC) and from a blank to the display range; a blank's field change.
+int Psyz_GpuCrtcOddLine(unsigned line);
+int Psyz_GpuCrtcInterlaced480(void);
+unsigned Psyz_GpuCrtcFieldLines(void);
+unsigned Psyz_GpuCrtcBlankLines(void);
+void Psyz_GpuCrtcBlank(void);
 // The work of one blank (libapi.c): pad refresh, the VSync hook, the
 // vblank interrupt.
 void Psyz_VSyncBlank(void);
+// PS1 time (system clocks) of interrupt handler work: the main thread
+// loses it in the next CPU work it spends (Psyz_SpendCycles) or, for the
+// vblank handler, when VSync returns (kernel.c). Take returns the time owed
+// and clears it (a busy wait absorbs it).
+void Psyz_KernelInterruptCycles(unsigned cycles);
+unsigned Psyz_KernelTakeInterruptCycles(void);
+// libpad's controller driver runs at each vblank (PadStartCom, libetc.c).
+int Psyz_PadDriverRunning(void);
 
 // The BIOS memory card driver's work at a vblank (libcard.c).
 void Psyz_CardVBlank(void);

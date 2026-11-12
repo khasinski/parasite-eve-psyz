@@ -214,12 +214,14 @@ void Psyz_CardVBlank(void) {
 /* A PS1 program spinning on the card driver: spends a scanline of PS1 time.
  * Blanks normally come from that time (the offline clock); a clock that
  * does not raise them in a wait (real time, or no audio clock yet) gets the
- * driver's vblank after a field. */
+ * driver's vblank after a field and a half. */
 static void card_spin(void) {
     uint64_t before = Psyz_KernelNowUs();
     Psyz_SpendTime(64000);
     uint64_t now = Psyz_KernelNowUs();
-    if (now == before || now - card_drv.last_vblank_us > card_fields_us(1)) {
+    // half a field of slack: a PAL field of the clock can end a spin late
+    if (now == before ||
+        now - card_drv.last_vblank_us > card_fields_us(1) * 3 / 2) {
         Psyz_CardVBlank();
         card_drv.last_vblank_us = now;
     }
