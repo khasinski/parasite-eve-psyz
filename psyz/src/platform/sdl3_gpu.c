@@ -254,15 +254,24 @@ static bool InterpEnsureTarget(void);
  * double buffers; UI packets are deliberately never registered. */
 #define INTERP_PAIRS 16384u
 #define INTERP_MAP 65536u
-typedef struct { const void *address; unsigned pair, serial; } InterpAddress;
+typedef struct { const void *address; unsigned pair, serial, frame; } InterpAddress;
 typedef struct {
     const void *a,*b;
     unsigned serial, frame, count;
     bool background;
+    bool tagged; /* Psyz_GpuTagInterpolationPacket: a stable identity */
     uint64_t signature;
     float position[6][3];
 } InterpPair;
 static InterpAddress interp_addresses[INTERP_MAP],interp_queue[INTERP_MAP];
+/* Packets tagged with a stable identity (Psyz_GpuTagInterpolationPacket):
+ * the packet address -> its identity's pair, for the frame it is drawn in. */
+static InterpAddress interp_tags[INTERP_MAP];
+typedef struct { unsigned long long id; unsigned pair, serial; } InterpId;
+static InterpId interp_ids[INTERP_MAP];
+/* The midpoint waits for a blank without a new frame (a frame that takes
+ * more than one field): Psyz_GpuPrepareInterpolatedBlank. */
+static bool interp_blank_mid;
 static InterpPair interp_pairs[INTERP_PAIRS];
 static unsigned interp_serial,interp_frame,interp_phase,interp_matches;
 static unsigned interp_camera_frame;
@@ -335,8 +344,35 @@ void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b) {
     Psyz_GpuEnsureInterpolationPair(a,b);
     InterpAddress *e=InterpFind(interp_addresses,a);if(e&&interp_pairs[e->pair].serial==e->serial)interp_pairs[e->pair].background=true;
 }
+/* A tagged packet of the frame being drawn, or NULL. */
+static InterpAddress *InterpFindTagged(const void *packet) {
+    InterpAddress *t=InterpFind(interp_tags,packet);
+    return t&&t->serial&&t->frame==interp_frame&&interp_pairs[t->pair].serial==t->serial ? t : NULL;
+}
+void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id) {
+    if(!interpolation_enabled||!packet)return;
+    uint64_t mix=(uint64_t)id*0x9E3779B97F4A7C15ULL;
+    unsigned h=(unsigned)(mix>>40)&(INTERP_MAP-1);
+    InterpId *slot=NULL,*free_slot=NULL;
+    for(unsigned i=0;i<8&&!slot;++i){InterpId *e=&interp_ids[(h+i)&(INTERP_MAP-1)];
+        if(e->serial&&e->id==id)slot=e;
+        else if(!free_slot&&(!e->serial||interp_pairs[e->pair].serial!=e->serial))free_slot=e;}
+    if(!slot||interp_pairs[slot->pair].serial!=slot->serial){
+        if(!slot)slot=free_slot?free_slot:&interp_ids[h];
+        if(!interp_serial)interp_target_stale=true;
+        unsigned serial=++interp_serial;if(!serial)serial=++interp_serial;
+        unsigned index=serial&(INTERP_PAIRS-1);
+        interp_pairs[index]=(InterpPair){.serial=serial,.tagged=true};
+        *slot=(InterpId){id,index,serial};
+    }
+    InterpMap(interp_tags,packet,slot->pair,slot->serial);
+    InterpAddress *t=InterpFind(interp_tags,packet);
+    if(t)t->frame=interp_frame+1; /* drawn after the next BeginInterpolationFrame */
+}
 void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to) {
     if(!interpolation_enabled)return;
+    InterpAddress *t=InterpFindTagged(from);
+    if(t){InterpMap(interp_queue,to,t->pair,t->serial);return;}
     InterpAddress *e=InterpFind(interp_addresses,from);
     if(e && interp_pairs[e->pair].serial==e->serial)
         InterpMap(interp_queue,to,e->pair,e->serial);
@@ -352,6 +388,8 @@ void Psyz_GpuClearInterpolationPackets(void) {
     Psyz_GpuResetInterpolation();
     memset(interp_addresses,0,sizeof(interp_addresses));
     memset(interp_pairs,0,sizeof(interp_pairs));
+    memset(interp_tags,0,sizeof(interp_tags));
+    memset(interp_ids,0,sizeof(interp_ids));
 }
 int Psyz_GpuSetFrameInterpolation(int enabled) {
     interpolation_requested=enabled!=0;
@@ -433,8 +471,12 @@ void Psyz_GpuSetInterpolationCamera(int x,int y) {
     interp_camera_x=x;interp_camera_y=y;interp_camera_frame=interp_frame;
 }
 void Psyz_GpuPrepareInterpolatedPresent(int next_y) {
-    interp_next_y=next_y;interp_phase=0;
+    interp_next_y=next_y;interp_phase=0;interp_blank_mid=false;
     interp_pair_ready=interpolation_enabled&&interpolated_vram&&interp_matches>0&&next_y>=0&&next_y<VRAM_H;
+}
+void Psyz_GpuPrepareInterpolatedBlank(int next_y) {
+    Psyz_GpuPrepareInterpolatedPresent(next_y);
+    interp_blank_mid=interp_pair_ready;
 }
 static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     unsigned offset=(unsigned)(v-vertex_buf);
@@ -442,6 +484,7 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     for(unsigned i=0;i<count;++i)if(!((geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0.0f))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
     if(!interpolation_enabled||(!interpolated_vram&&interpolated_scale==internal_res)||count>6)return;
     InterpAddress *e=InterpFind(interp_queue,packet);
+    if(!e)e=InterpFindTagged(packet);
     if(!e)e=InterpFind(interp_addresses,packet);
     if(!e||!e->serial)return;
     InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial)return;
@@ -455,7 +498,9 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
         position[i][0]=projected?v[i].pgxp_pos[0]:(float)v[i].x+bias;
         position[i][1]=projected?v[i].pgxp_pos[1]:(float)v[i].y+bias;
         position[i][2]=projected?v[i].pgxp_pos[2]:1;
-        if(SDL_fabsf(position[i][0]-p->position[i][0])>32||SDL_fabsf(position[i][1]-p->position[i][1])>32)valid=false;
+        /* a tagged identity is the same face: it may move further */
+        const float limit=p->tagged?160.0f:32.0f;
+        if(SDL_fabsf(position[i][0]-p->position[i][0])>limit||SDL_fabsf(position[i][1]-p->position[i][1])>limit)valid=false;
     }
     /* An authored animation may switch to another tile entry this frame.
      * Keep that image intact, but move it with the same interpolated camera
@@ -1654,6 +1699,9 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
 static bool PlatformBackend_SetPresentSync(bool enable) {
     return PlatformBackend_SetDriverVsync(enable);
 }
+static bool PlatformBackend_BlankPresentWanted(void) {
+    return interp_blank_mid && interp_pair_ready && interpolation_enabled;
+}
 
 /* The frame's drawing runs during the blank wait; the present's command
  * buffer then holds only the display copy (the frame fences of SubmitFrame
@@ -2435,8 +2483,12 @@ static void PlatformBackend_Present(void) {
 #ifdef PE_PS5_GPU_NATIVE
             !native_movie_active&&
 #endif
-            !debug_show_vram&&game_speed==1&&interp_phase++==1;
+            !debug_show_vram&&game_speed==1&&
+            (interp_blank_mid?present_blank_poll:interp_phase++==1);
+        /* a blank midpoint is shown once, or not after a new frame */
+        if(interp_blank_mid){interp_blank_mid=false;interp_pair_ready=false;}
         if(interp_present_mid)++interpolated_present_count;
+        present_midpoint=interp_present_mid;
     }
 
     if(display_rgb24||

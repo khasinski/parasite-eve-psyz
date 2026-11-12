@@ -105,6 +105,17 @@ void Psyz_GpuResetInterpolation(void);
 void Psyz_GpuClearInterpolationPackets(void);
 void Psyz_GpuBeginInterpolationFrame(void);
 void Psyz_GpuPrepareInterpolatedPresent(int next_y);
+/* For a renderer whose packets are not at fixed addresses: tags a packet of
+ * the frame being built with a stable identity (e.g. model, instance and
+ * face), which pairs it with the packet of the same identity in the previous
+ * frame. Call between the frame's Psyz_GpuBeginInterpolationFrame calls,
+ * before the frame's own; untagged packets (HUD) keep their pose. */
+void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id);
+/* Like Psyz_GpuPrepareInterpolatedPresent, for a game that waits on VSync(1)
+ * over several fields with one VSync(0) per frame: the midpoint is presented
+ * at the next blank that passes during that wait (paced presents), and not
+ * at all when the next present is a new frame. */
+void Psyz_GpuPrepareInterpolatedBlank(int next_y);
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled);
 int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command

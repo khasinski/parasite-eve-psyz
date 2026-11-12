@@ -475,6 +475,7 @@ static bool PlatformBackend_SetPresentSync(bool enable) {
     return false;
 }
 static void PlatformBackend_SubmitDrawing(void) {}
+static bool PlatformBackend_BlankPresentWanted(void) { return false; }
 
 static void UpdateScissor(void);
 

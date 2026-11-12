@@ -66,6 +66,13 @@ static bool PlatformBackend_SetPresentSync(bool enable);
 /* Starts the drawing queued for the frame on the GPU before the blank wait
  * (paced presents). */
 static void PlatformBackend_SubmitDrawing(void);
+/* A present is wanted at a blank that passes without a VSync(0): an
+ * interpolated midpoint (Psyz_GpuPrepareInterpolatedBlank). */
+static bool PlatformBackend_BlankPresentWanted(void);
+/* The present is made at such a blank; the backend sets present_midpoint
+ * when it shows an interpolated midpoint (frame log). */
+static bool present_blank_poll, present_midpoint;
+static Uint32 last_present_blank;
 static void PlatformBackend_Present(void);
 static void QuitPlatform(void);
 #ifdef PLATFORM_WEB
@@ -606,7 +613,7 @@ static void FrameStatsRecord(Uint64 work_end, Uint64 present_start,
         if (log && *log && (frame_stats_log = fopen(log, "w")))
             fprintf(frame_stats_log, "# present_ms interval_ms work_ms "
                                      "present_call_ms wait_ms passes "
-                                     "after_blank_ms\n");
+                                     "after_blank_ms midpoint\n");
     }
     if (!frame_stats_mode && !frame_stats_log)
         return;
@@ -622,10 +629,10 @@ static void FrameStatsRecord(Uint64 work_end, Uint64 present_start,
         float wait =
             (float)(GetElapsedMicroseconds(wait_start, wait_end) / 1000.0);
         if (frame_stats_log)
-            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f %u %.3f\n",
+            fprintf(frame_stats_log, "%.3f %.3f %.3f %.3f %.3f %u %.3f %d\n",
                     GetElapsedMicroseconds(0, present_start) / 1000.0,
                     interval, work, present, wait, frame_stats_batches,
-                    present_after_blank_ms);
+                    present_after_blank_ms, present_midpoint);
         if (frame_stats_mode) {
             frame_stats_interval[frame_stats_count] = interval;
             frame_stats_work[frame_stats_count] = work;
@@ -680,6 +687,7 @@ static bool PacedPresents(void) {
 
 /* Presents; returns when the present call started and ended. */
 static void PresentFrame(Uint64* present_start, Uint64* present_end) {
+    last_present_blank = WallVblankCount();
     *present_start = SDL_GetPerformanceCounter();
     present_skip = SkipPresent();
     PlatformBackend_Present();
@@ -700,6 +708,7 @@ static void PresentDue(void) {
     PresentFrame(&present_start, &present_end);
     FrameStatsRecord(due_work_end, present_start, present_end, due_wait_start,
                      due_wait_end);
+    present_midpoint = false;
     present_after_blank_ms = 0.0f;
 }
 
@@ -782,6 +791,20 @@ int Psyz_VideoVSync(int mode) {
         ret = (unsigned short)(((Uint64)(Uint32)(now_us - last_vsync_us) *
                                 game_speed) >> 6);
     }
+    /* A game polling VSync(1) across a blank: a midpoint wanted there. */
+    if (mode == 1 && !present_due && PacedPresents() &&
+        PlatformBackend_BlankPresentWanted() &&
+        WallVblankCount() != last_present_blank) {
+        const Uint64 last_return = frame_stats_last_return;
+        Uint64 present_start, present_end;
+        present_blank_poll = true;
+        PresentFrame(&present_start, &present_end);
+        present_blank_poll = false;
+        FrameStatsRecord(present_start, present_start, present_end,
+                         present_end, present_end);
+        frame_stats_last_return = last_return; /* work goes on */
+        present_midpoint = false;
+    }
     if (mode == 0) {
         const Uint64 work_end = SDL_GetPerformanceCounter();
         PresentDue(); /* none came since the last blank */
@@ -800,6 +823,7 @@ int Psyz_VideoVSync(int mode) {
             WaitForNextFrame();
             FrameStatsRecord(work_end, present_start, present_end, present_end,
                              SDL_GetPerformanceCounter());
+            present_midpoint = false;
         }
         /* The offline audio clock follows every blank the counter advanced
          * by, including those a VSync(1) wait spent before this present
