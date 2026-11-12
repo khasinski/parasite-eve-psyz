@@ -40,6 +40,26 @@ emit_header() {
     } > "${name}_${suffix}.h"
 }
 
+# Metal on Apple GPUs: the fragment shader reads the destination pixel from
+# the colour attachment ([[color(0)]], framebuffer fetch) instead of the
+# texBlend copy, so semi-transparent primitives need no copy or new render
+# pass (sdl3_gpu.c, destination_fetch).
+emit_fetch_msl() {
+    read_dst='texBlend.read(uint2(int2(gl_FragCoord.xy)), 0)'
+    position='float4 gl_FragCoord \[\[position\]\])'
+    grep -qF "$read_dst" "$1" && grep -q "$position" "$1" || {
+        echo "build_shaders.sh: $1 has no texBlend read or position input" >&2
+        exit 1
+    }
+    sed -e "s/texBlend\.read(uint2(int2(gl_FragCoord\.xy)), 0)/psyz_destination/g" \
+        -e "s/$position/float4 gl_FragCoord [[position]], float4 psyz_destination [[color(0)]])/" \
+        "$1" > "$2"
+    if grep -q "texBlend\.read" "$2"; then
+        echo "build_shaders.sh: $2 still reads texBlend" >&2
+        exit 1
+    fi
+}
+
 if [ "$#" -eq 0 ]; then
     set -- psx.vert psx.frag clear.vert clear.frag
 fi
@@ -52,6 +72,11 @@ for shader in "$@"; do
     emit_header "$shader.spv" "$name" spv
     spirv-cross --msl --msl-decoration-binding "$shader.spv" --output "$shader.metal"
     emit_header "$shader.metal" "$name" msl
+    if [ "$shader" = psx.frag ]; then
+        emit_fetch_msl "$shader.metal" "$shader.fetch.metal"
+        emit_header "$shader.fetch.metal" psx_frag_fetch msl
+        rm -f "$shader.fetch.metal"
+    fi
     if [ -n "${SKIP_DXIL:-}" ]; then
         rm -f "$shader.spv" "$shader.metal"
         continue

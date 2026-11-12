@@ -55,6 +55,9 @@ static const void *interpolation_packet_current;
 #include "shaders/psx_frag_msl.h"
 #include "shaders/clear_vert_msl.h"
 #include "shaders/clear_frag_msl.h"
+#include "shaders/psx_frag_fetch_msl.h"
+#include <objc/message.h>
+#include <objc/runtime.h>
 #define psx_vert psx_vert_msl
 #define psx_vert_len psx_vert_msl_len
 #define psx_frag psx_frag_msl
@@ -225,6 +228,13 @@ static SDL_GPUTransferBuffer* vtx_transfer = NULL;
 static SDL_GPUTransferBuffer* tex_upload_transfer = NULL;
 static SDL_GPUTransferBuffer* tex_download_transfer = NULL;
 static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
+/* Semi-transparent primitives read their destination pixel in the fragment
+ * shader from the colour attachment (Metal framebuffer fetch on Apple GPUs,
+ * which orders the reads of overlapping fragments by primitive): no copy of
+ * the target and no new render pass per primitive (Draw_FlushBuffer). The
+ * shader computes the same blend from the same pixel as from the copy. */
+static SDL_GPUGraphicsPipeline* pipe_direct_fetch;
+static bool destination_fetch;
 static SDL_GPUGraphicsPipeline* pipe_clear = NULL;
 static SDL_GPUCommandBuffer* pending_cmd = NULL;
 /* SDL D3D12 has 2048 sampler descriptors per command buffer. Keep half
@@ -990,6 +1000,29 @@ static bool SubmitCmdAndWait(void) {
     return true;
 }
 
+#if defined(__APPLE__)
+/* Whether the system's Metal device is an Apple GPU (MTLGPUFamilyApple1 and
+ * later read colour attachments in fragment shaders); PSYZ_GPU_FETCH=0 turns
+ * framebuffer fetch off. */
+void* MTLCreateSystemDefaultDevice(void);
+static bool MetalFramebufferFetch(void) {
+    const char* env = SDL_getenv("PSYZ_GPU_FETCH");
+    if (env && !strcmp(env, "0"))
+        return false;
+    if (strcmp(SDL_GetGPUDeviceDriver(device), "metal"))
+        return false;
+    id mtl = (id)MTLCreateSystemDefaultDevice();
+    if (!mtl)
+        return false;
+    SEL supports = sel_registerName("supportsFamily:");
+    bool apple = class_respondsToSelector(object_getClass(mtl), supports) &&
+                 ((BOOL(*)(id, SEL, long))objc_msgSend)(
+                     mtl, supports, 1001 /* MTLGPUFamilyApple1 */);
+    ((void (*)(id, SEL))objc_msgSend)(mtl, sel_registerName("release"));
+    return apple;
+}
+#endif
+
 static SDL_GPUShader* CreateShader(
     const unsigned char* code, unsigned int code_len, SDL_GPUShaderStage stage,
     Uint32 num_samplers, Uint32 num_uniform_buffers) {
@@ -1297,6 +1330,30 @@ static bool CreateGpuResources(void) {
         PSX_SHADERS_CURRENT ? 4 : 3, 1);
     SDL_GPUShader* clear_vs = CreateShader(
         clear_vert, clear_vert_len, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
+    destination_fetch = false;
+#if defined(__APPLE__) && defined(psx_frag_fetch_msl_revision)
+    if (PSX_SHADERS_CURRENT &&
+        psx_frag_fetch_msl_revision == PSX_SHADER_REVISION &&
+        MetalFramebufferFetch() && psx_vs) {
+        SDL_GPUShader* fetch_fs = SDL_CreateGPUShader(
+            device, &(SDL_GPUShaderCreateInfo){
+                        .code = psx_frag_fetch_msl,
+                        .code_size = psx_frag_fetch_msl_len,
+                        .format = SDL_GPU_SHADERFORMAT_MSL,
+                        .entrypoint = "main0",
+                        .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+                        .num_samplers = 4,
+                        .num_uniform_buffers = 1});
+        if (fetch_fs) {
+            pipe_direct_fetch =
+                CreatePsxPipeline(psx_vs, fetch_fs, BLEND_DIRECT);
+            SDL_ReleaseGPUShader(device, fetch_fs);
+        }
+        destination_fetch = pipe_direct_fetch != NULL;
+        INFOF("SDL_GPU semi-transparency: %s",
+              destination_fetch ? "framebuffer fetch" : "target copies");
+    }
+#endif
     SDL_GPUShader* clear_fs = CreateShader(
         clear_frag, clear_frag_len, SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0);
     bool shaders_ok = psx_vs && psx_fs && clear_vs && clear_fs;
@@ -2696,6 +2753,10 @@ static void QuitPlatform(void) {
                 pipe_tri[i] = NULL;
             }
         }
+        if (pipe_direct_fetch)
+            SDL_ReleaseGPUGraphicsPipeline(device, pipe_direct_fetch);
+        pipe_direct_fetch = NULL;
+        destination_fetch = false;
         if (pipe_clear) {
             SDL_ReleaseGPUGraphicsPipeline(device, pipe_clear);
             pipe_clear = NULL;
@@ -4749,6 +4810,8 @@ typedef struct DrawSegment {
     bool semi;
 } DrawSegment;
 #define DRAW_SEGMENTS_MAX 32
+/* Runs in one pass when the shader fetches the destination (no copies). */
+#define DRAW_SEGMENTS_FETCH_MAX 512
 static bool PrimitiveBox(int start, int end, bool midpoint,
                          bool scaled_target, unsigned target_scale,
                          float sub_x, float sub_y, float target_centre,
@@ -4919,12 +4982,16 @@ void Draw_FlushBuffer(void) {
              * semi-transparent primitive) from one copy: a semi-transparent
              * primitive joins it while its pixels miss those of every
              * earlier segment of the run, so the copy still holds its
-             * destination. */
-            DrawSegment segments[DRAW_SEGMENTS_MAX];
-            SemiBox boxes[DRAW_SEGMENTS_MAX];
+             * destination. With destination_fetch the shader reads the
+             * destination from the target itself: a run of semi-transparent
+             * primitives is one draw and nothing breaks the pass. */
+            DrawSegment segments[DRAW_SEGMENTS_FETCH_MAX];
+            SemiBox boxes[DRAW_SEGMENTS_FETCH_MAX];
+            const int max_segments = destination_fetch ? DRAW_SEGMENTS_FETCH_MAX
+                                                       : DRAW_SEGMENTS_MAX;
             int n_segments = 0, n_draws = 0;
             int end = start;
-            while (end < n_indices && n_segments < DRAW_SEGMENTS_MAX) {
+            while (end < n_indices && n_segments < max_segments) {
                 int seg_start = end;
                 bool semi = vertex_buf[index_buf[seg_start]].a != 0xFF;
                 int seg_end =
@@ -4936,9 +5003,9 @@ void Draw_FlushBuffer(void) {
                     vertex_buf[index_buf[seg_end]].a != 0xFF &&
                     SharedVertices(seg_start, seg_end) >= 2)
                     seg_end += 3;
-                if (!semi) {
+                if (!semi || destination_fetch) {
                     while (seg_end < n_indices &&
-                           vertex_buf[index_buf[seg_end]].a == 0xFF)
+                           (vertex_buf[index_buf[seg_end]].a != 0xFF) == semi)
                         seg_end += 3;
                 }
                 if (seg_end > n_indices)
@@ -4948,7 +5015,7 @@ void Draw_FlushBuffer(void) {
                     seg_start, seg_end, midpoint, target_index != 0,
                     target_scale, sub_x, sub_y, target_centre, ws_squeeze, clip,
                     &box);
-                if (semi && n_segments) {
+                if (semi && n_segments && !destination_fetch) {
                     bool overlaps = false;
                     for (int i = 0; visible && i < n_segments; ++i)
                         overlaps |= boxes[i].x1 > boxes[i].x0 &&
@@ -4979,7 +5046,7 @@ void Draw_FlushBuffer(void) {
                 return;
             }
             SDL_GPUCopyPass* blend_copy = NULL;
-            for (int i = 0; i < n_segments; ++i) {
+            for (int i = 0; i < n_segments && !destination_fetch; ++i) {
                 if (!segments[i].semi)
                     continue;
                 if (!blend_copy)
@@ -5076,7 +5143,8 @@ void Draw_FlushBuffer(void) {
                     cmd, 0, color_pass, sizeof(color_pass));
 
                 SDL_BindGPUGraphicsPipeline(
-                    pass, pipe_tri[semi      ? BLEND_DIRECT
+                    pass, semi && destination_fetch ? pipe_direct_fetch :
+                          pipe_tri[semi      ? BLEND_DIRECT
                                    : checked ? BLEND_CHECK
                                              : BLEND_ADD]);
                 SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
