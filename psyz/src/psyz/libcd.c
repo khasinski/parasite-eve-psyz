@@ -176,14 +176,14 @@ static char* extract_token(char* str, char* dest, int max_len) {
 
 // Get file size in sectors
 static int get_file_size_in_sectors(const char* file_path) {
-    FILE* fp = fopen(file_path, "rb");
+    FILE* fp = Psyz_FileOpen(file_path, "rb");
     if (!fp) {
         WARNF("Failed to open file for size calculation: %s", file_path);
         return 0;
     }
 
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
+    int64_t file_size =
+        Psyz_FileSeek(fp, 0, SEEK_END) == 0 ? Psyz_FileTell(fp) : -1;
     fclose(fp);
 
     if (file_size < 0) {
@@ -197,16 +197,20 @@ static int get_file_size_in_sectors(const char* file_path) {
 
 // Parse a CUE file and populate the global track table
 static int parse_cue_file(const char* cue_path) {
-    FILE* fp = fopen(cue_path, "r");
+    // Binary mode: lines end in LF or CRLF on every host (str_trim drops the
+    // CR), and the paths are UTF-8 (Psyz_FileOpen).
+    FILE* fp = Psyz_FileOpen(cue_path, "rb");
     if (!fp) {
         ERRORF("error opening CUE file %s", cue_path);
         return -1;
     }
 
-    // Extract base directory from CUE path for resolving relative file paths
+    // Extract base directory from CUE path for resolving relative file paths:
+    // the last separator of either kind ("C:/discs\\rr4.cue" mixes them).
     const char* last_slash = strrchr(cue_path, '/');
-    if (!last_slash) {
-        last_slash = strrchr(cue_path, '\\');
+    const char* last_backslash = strrchr(cue_path, '\\');
+    if (!last_slash || (last_backslash && last_backslash > last_slash)) {
+        last_slash = last_backslash;
     }
     if (last_slash) {
         unsigned int len = (unsigned int)(last_slash - cue_path + 1);
@@ -227,8 +231,16 @@ static int parse_cue_file(const char* cue_path) {
         0; // Absolute sector where current file starts
 
     g_track_count = 0;
+    int first_line = 1;
     while (fgets(full_line, sizeof(full_line), fp)) {
-        char* line = str_trim(full_line);
+        char* line = full_line;
+        // A UTF-8 byte order mark, as Windows editors save CUE sheets.
+        if (first_line && (unsigned char)line[0] == 0xEF &&
+            (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+            line += 3;
+        }
+        first_line = 0;
+        line = str_trim(line);
         if (strncmp(line, "FILE", 4) == 0) {
             // Before switching to new file, calculate size of previous file
             if (current_file[0] != '\0') {
@@ -990,7 +1002,7 @@ static int open_track_at_cd_pos(void) {
     }
     Psyz_AudioLock();
     close_track_file();
-    FILE* file = fopen(track->file_path, "rb");
+    FILE* file = Psyz_FileOpen(track->file_path, "rb");
     if (!file) {
         ERRORF("failed to open audio file: %s", track->file_path);
         Psyz_AudioUnlock();
@@ -998,8 +1010,8 @@ static int open_track_at_cd_pos(void) {
     }
     int sector_offset = sector - track->abs_sector;
     sector_offset += track->start_sector;
-    long byte_offset = (long)sector_offset * SECTOR_SIZE;
-    if (fseek(file, byte_offset, SEEK_SET) != 0) {
+    int64_t byte_offset = (int64_t)sector_offset * SECTOR_SIZE;
+    if (Psyz_FileSeek(file, byte_offset, SEEK_SET) != 0) {
         ERRORF("failed to seek to sector %d in %s", sector, track->file_path);
         fclose(file);
         Psyz_AudioUnlock();
@@ -1021,16 +1033,17 @@ static int read_sector_unlocked(int sector, u_char* out) {
     }
     if (track != track_file_track || !track_file) {
         close_track_file();
-        track_file = fopen(track->file_path, "rb");
+        track_file = Psyz_FileOpen(track->file_path, "rb");
         if (!track_file) {
             ERRORF("failed to open data file: %s", track->file_path);
             return -1;
         }
         track_file_track = track;
     }
-    long offset =
-        (long)(sector - track->abs_sector + track->start_sector) * SECTOR_SIZE;
-    if (fseek(track_file, offset, SEEK_SET) == 0 &&
+    int64_t offset =
+        (int64_t)(sector - track->abs_sector + track->start_sector) *
+        SECTOR_SIZE;
+    if (Psyz_FileSeek(track_file, offset, SEEK_SET) == 0 &&
         fread(out, 1, SECTOR_SIZE, track_file) == SECTOR_SIZE) {
         return 0;
     }
@@ -2197,8 +2210,8 @@ for(unsigned i=0;i<4;i++){FIELD(xa.rh_l[i],6);FIELD(xa.rh_r[i],6);}
 return at==79584;}
 size_t Psyz_StateCdBytes(void){return 79584;}
 static int state_cd_bindings(void){return Psyz_StateAudioOwned()&&Psyz_StateKernelOwned()&&state_cd_bound&&state_cd_sync==CD_cbsync&&state_cd_ready==CD_cbready&&state_cd_reader==disk_read_cb;}
-int Psyz_StateCdCapture(unsigned char *out,size_t bytes){if(!out||bytes!=79584||!Psyz_StateAudioOwned()||!Psyz_StateKernelOwned()||data_read_active)return 0;if(!state_cd_bound){state_cd_sync=CD_cbsync;state_cd_ready=CD_cbready;state_cd_reader=disk_read_cb;state_cd_bound=1;}if(!state_cd_bindings())return 0;uint32_t track=0;if(track_file){for(int i=0;i<g_track_count;i++)if(track_file_track==&g_tracks[i])track=i+1;if(!track)return 0;}long pos=track_file?ftell(track_file):0;if(pos<0)return 0;memcpy(out,"PECD001!",8);state_cd_put(out+8,(uint32_t)state_cd_generation);state_cd_put(out+12,(uint32_t)(state_cd_generation>>32));state_cd_put(out+16,track);state_cd_put(out+20,(uint32_t)(uint64_t)pos);state_cd_put(out+24,(uint32_t)((uint64_t)pos>>32));state_cd_put(out+28,g_track_count);return state_cd_walk(0,out,0);}
+int Psyz_StateCdCapture(unsigned char *out,size_t bytes){if(!out||bytes!=79584||!Psyz_StateAudioOwned()||!Psyz_StateKernelOwned()||data_read_active)return 0;if(!state_cd_bound){state_cd_sync=CD_cbsync;state_cd_ready=CD_cbready;state_cd_reader=disk_read_cb;state_cd_bound=1;}if(!state_cd_bindings())return 0;uint32_t track=0;if(track_file){for(int i=0;i<g_track_count;i++)if(track_file_track==&g_tracks[i])track=i+1;if(!track)return 0;}int64_t pos=track_file?Psyz_FileTell(track_file):0;if(pos<0)return 0;memcpy(out,"PECD001!",8);state_cd_put(out+8,(uint32_t)state_cd_generation);state_cd_put(out+12,(uint32_t)(state_cd_generation>>32));state_cd_put(out+16,track);state_cd_put(out+20,(uint32_t)(uint64_t)pos);state_cd_put(out+24,(uint32_t)((uint64_t)pos>>32));state_cd_put(out+28,g_track_count);return state_cd_walk(0,out,0);}
 int Psyz_StateCdValidate(const unsigned char *in,size_t bytes){if(!in||bytes!=79584||memcmp(in,"PECD001!",8)||!state_cd_bindings())return 0;uint64_t generation=(uint64_t)state_cd_get(in+8)|((uint64_t)state_cd_get(in+12)<<32),pos=(uint64_t)state_cd_get(in+20)|((uint64_t)state_cd_get(in+24)<<32);uint32_t track=state_cd_get(in+16);if(generation!=state_cd_generation||state_cd_get(in+28)!=(uint32_t)g_track_count||track>(uint32_t)g_track_count||pos>LONG_MAX||(!track&&pos)||data_read_active)return 0;if(track&&!g_tracks[track-1].is_valid)return 0;if(state_cd_get(in+76)||state_cd_get(in+96)>state_cd_get(in+100)||state_cd_get(in+136)>state_cd_get(in+132)||state_cd_get(in+156)>0x20000u||state_cd_get(in+168)>XA_MAX_SECTOR_GAP)return 0;return state_cd_walk(in,0,0);}
-int Psyz_StateCdRestore(const unsigned char *in,size_t bytes){if(!Psyz_StateCdValidate(in,bytes))return 0;uint32_t track=state_cd_get(in+16);uint64_t pos=(uint64_t)state_cd_get(in+20)|((uint64_t)state_cd_get(in+24)<<32);FILE *next=0;if(track){next=fopen(g_tracks[track-1].file_path,"rb");if(!next)return 0;if(fseek(next,(long)pos,SEEK_SET)){fclose(next);return 0;}}/* New validated handle exists before old one is released. */
+int Psyz_StateCdRestore(const unsigned char *in,size_t bytes){if(!Psyz_StateCdValidate(in,bytes))return 0;uint32_t track=state_cd_get(in+16);uint64_t pos=(uint64_t)state_cd_get(in+20)|((uint64_t)state_cd_get(in+24)<<32);FILE *next=0;if(track){next=Psyz_FileOpen(g_tracks[track-1].file_path,"rb");if(!next)return 0;if(Psyz_FileSeek(next,(int64_t)pos,SEEK_SET)){fclose(next);return 0;}}/* New validated handle exists before old one is released. */
 FILE *previous=track_file;track_file=next;track_file_track=track?&g_tracks[track-1]:0;if(previous)fclose(previous);return state_cd_walk(in,0,1);}
 #endif

@@ -10,6 +10,17 @@
 #include <kernel.h>
 #include <romio.h>
 
+// Host paths are UTF-8 already; stdio takes them as they are.
+FILE* Psyz_FileOpen(const char* path, const char* mode) {
+    return fopen(path, mode);
+}
+
+int Psyz_FileSeek(FILE* file, int64_t offset, int whence) {
+    return fseeko(file, (off_t)offset, whence);
+}
+
+int64_t Psyz_FileTell(FILE* file) { return (int64_t)ftello(file); }
+
 static void populate_entry(
     const char* baseDir, struct DIRENTRY* dst, struct dirent* src) {
     char buf[8192];
@@ -248,8 +259,9 @@ int psyz_open(const char* devname, int flag) {
     }
 }
 int psyz_close(int fd) { return (int)close((int)fd); }
+// The BIOS offset is signed: SEEK_CUR / SEEK_END may move backwards.
 unsigned long psyz_lseek(int fd, unsigned int offset, int flag) {
-    return lseek(fd, (off_t)offset, flag);
+    return (unsigned long)lseek(fd, (off_t)(int)offset, flag);
 }
 long psyz_read(long fd, void* buf, long n) {
     return (long)read((int)fd, buf, (size_t)n);

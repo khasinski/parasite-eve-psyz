@@ -3,6 +3,9 @@
 #include <libapi.h>
 #include <psyz/log.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <libetc.h>
@@ -211,12 +214,14 @@ void Psyz_CardVBlank(void) {
 /* A PS1 program spinning on the card driver: spends a scanline of PS1 time.
  * Blanks normally come from that time (the offline clock); a clock that
  * does not raise them in a wait (real time, or no audio clock yet) gets the
- * driver's vblank after a field. */
+ * driver's vblank after a field and a half. */
 static void card_spin(void) {
     uint64_t before = Psyz_KernelNowUs();
     Psyz_SpendTime(64000);
     uint64_t now = Psyz_KernelNowUs();
-    if (now == before || now - card_drv.last_vblank_us > card_fields_us(1)) {
+    // half a field of slack: a PAL field of the clock can end a spin late
+    if (now == before ||
+        now - card_drv.last_vblank_us > card_fields_us(1) * 3 / 2) {
         Psyz_CardVBlank();
         card_drv.last_vblank_us = now;
     }
@@ -263,11 +268,9 @@ void _bu_init(void) {
     char path[4096];
     Psyz_AdjustPath(path, "bu00:*", sizeof(path));
     Psyz_AdjustPath(path, "bu10:*", sizeof(path));
-#elif defined(_MSC_VER)
-    NOT_IMPLEMENTED;
-#elif __MINGW32__
-    mkdir("bu00");
-    mkdir("bu10");
+#elif defined(_WIN32)
+    _mkdir("bu00");
+    _mkdir("bu10");
 #else
     mkdir("bu00", 0755);
     mkdir("bu10", 0755);

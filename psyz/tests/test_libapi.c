@@ -22,17 +22,28 @@
 #define PATH_SEP "/"
 #endif
 
+// Fixture steps must run in release builds too, where NDEBUG removes the
+// whole expression of an assert().
+#define BU_CHECK(cond)                                                         \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "%s:%d: fixture step failed: %s\n", __FILE__,      \
+                    __LINE__, #cond);                                          \
+            abort();                                                           \
+        }                                                                      \
+    } while (0)
+
 static void bu_make_file(const char* path, int len, int val, int inc) {
     FILE* f = fopen(path, "wb");
-    assert(f != NULL);
+    BU_CHECK(f != NULL);
     unsigned char* d = (unsigned char*)malloc(len);
-    assert(d != NULL);
+    BU_CHECK(d != NULL);
     for (int i = 0; i < len; i++) {
         d[i] = val;
         val += inc;
     }
-    assert(fwrite(d, 1, len, f) == (size_t)len);
-    assert(fclose(f) == 0);
+    BU_CHECK(fwrite(d, 1, len, f) == (size_t)len);
+    BU_CHECK(fclose(f) == 0);
     free(d);
 }
 
@@ -46,10 +57,10 @@ ZTEST_SETUP(bu) {
 
 ZTEST_TEARDOWN(bu) {
     zskip_targets("ps1");
-    assert(remove("bu00/BASLUS-00000PSYZ00") == 0);
-    assert(remove("bu00/BASLUS-00000PSYZ01") == 0);
-    assert(rmdir("bu00") == 0);
-    assert(rmdir("bu10") == 0);
+    BU_CHECK(remove("bu00/BASLUS-00000PSYZ00") == 0);
+    BU_CHECK(remove("bu00/BASLUS-00000PSYZ01") == 0);
+    BU_CHECK(rmdir("bu00") == 0);
+    BU_CHECK(rmdir("bu10") == 0);
 }
 
 ZTEST(bu, for_invalid_path) {
@@ -276,3 +287,70 @@ ZTEST(truncation, nextfile_truncates_long_filename) {
     zprintf("File name should be bounded to 20 bytes\n");
     zexpect_u8array_eq(TRUNCATED_NAME_20, d[1].name, 20);
 }
+
+#if defined(__psyz) && !defined(__PSP__)
+#include <SDL3/SDL.h>
+
+// Memory cards in a directory whose UTF-8 name is not ASCII, as a profile
+// directory ("C:\Users\Zoë\...") gives it: save a file the way games do
+// (create, write, reopen, seek, read back), list it with its size and erase
+// it. The narrow CRT calls of the Windows backend failed all of these.
+#define CARD_UTF8_DIR "psyz_card_\xc3\xab\xe6\x97\xa5"
+
+static int card_utf8_path(char* dst, const char* src, int maxlen) {
+    if (strncmp(src, "bu00:", 5) != 0) {
+        return -1;
+    }
+    snprintf(dst, maxlen, CARD_UTF8_DIR "/%s", src + 5);
+    return (int)strlen(dst);
+}
+
+ZTEST_SETUP(card_utf8) {
+    SDL_CreateDirectory(CARD_UTF8_DIR);
+    Psyz_AdjustPathCB(card_utf8_path);
+}
+
+ZTEST_TEARDOWN(card_utf8) {
+    Psyz_AdjustPathCB(NULL);
+    SDL_RemovePath(CARD_UTF8_DIR "/BESCES-00000RR4TEST");
+    SDL_RemovePath(CARD_UTF8_DIR);
+}
+
+ZTEST(card_utf8, save_list_reload_and_erase) {
+    static unsigned char block[8192], back[8192];
+    const char* name = "bu00:BESCES-00000RR4TEST";
+    for (int i = 0; i < (int)sizeof(block); i++) {
+        block[i] = (unsigned char)(i * 7 + (i >> 8));
+    }
+    block[100] = 0x0A; // a text-mode write would expand these
+    block[101] = 0x0D;
+    block[102] = 0x1A; // and a text-mode read stop at this one
+
+    int fd = open(name, FCREAT | (1 << 16));
+    zassert_s32_ne(-1, fd);
+    close(fd);
+    fd = open(name, FWRITE);
+    zassert_s32_ne(-1, fd);
+    zexpect_s32_eq(8192, write(fd, (char*)block, 8192));
+    close(fd);
+
+    struct DIRENTRY d = {0};
+    zassert_ptr_eq(&d, firstfile((char*)"bu00:", &d));
+    zexpect_str_eq("BESCES-00000RR4TEST", d.name);
+    zexpect_s32_eq(8192, d.size);
+
+    fd = open(name, FREAD);
+    zassert_s32_ne(-1, fd);
+    zexpect_s32_eq(8192, read(fd, back, 8192));
+    zexpect_u8array_eq(block, back, 8192);
+    zexpect_s32_eq(4096, lseek(fd, 4096, SEEK_SET));
+    zexpect_s32_eq(256, read(fd, back, 256));
+    zexpect_u8array_eq(block + 4096, back, 256);
+    zprintf("a negative SEEK_CUR offset moves back\n");
+    zexpect_s32_eq(4096, lseek(fd, (unsigned int)-256, SEEK_CUR));
+    close(fd);
+
+    zexpect_s32_ne(0, erase((char*)name));
+    zexpect_s32_eq(-1, open(name, FREAD));
+}
+#endif

@@ -128,7 +128,7 @@ int Psyz_GpuDumpBegin(const char* path) {
     if (!vram)
         return -1;
     ReadVram(vram);
-    dump_file = fopen(path, "wb");
+    dump_file = Psyz_FileOpen(path, "wb");
     if (!dump_file) {
         free(vram);
         return -1;
@@ -175,7 +175,7 @@ int Psyz_GpuDumpEnd(const char* vram_path) {
     if (!vram)
         return -1;
     ReadVram(vram);
-    FILE* f = fopen(vram_path, "wb");
+    FILE* f = Psyz_FileOpen(vram_path, "wb");
     int ok = f && fwrite(vram, sizeof(u16), VRAM_W * VRAM_H, f) == VRAM_W * VRAM_H;
     if (f)
         fclose(f);

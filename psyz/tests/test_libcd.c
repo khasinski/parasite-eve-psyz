@@ -97,13 +97,29 @@ static void reset_state(const char* prefix) {
     alloc_count = 0;
 }
 
+// UTF-8 paths (the non-ASCII directory test): SDL removes them on Windows
+// too, where the narrow remove() takes the ANSI code page.
+static void remove_path(const char* path) {
+#if defined(__psyz) && !defined(__PSP__)
+    SDL_RemovePath(path);
+#else
+    remove(path);
+#endif
+}
+
+static char utf8_dir[PATH_LEN];
+
 static void cleanup_files(void) {
     int i;
     for (i = 0; i < bin_count; i++) {
-        remove(bins[i]);
+        remove_path(bins[i]);
     }
     if (cue[0] != '\0') {
-        remove(cue);
+        remove_path(cue);
+    }
+    if (utf8_dir[0] != '\0') {
+        remove_path(utf8_dir);
+        utf8_dir[0] = '\0';
     }
     rmdir(dir);
     for (i = 0; i < alloc_count; i++) {
@@ -605,6 +621,59 @@ ZTEST(libcd, data_read_advances_through_sectors) {
 
     CdControlB(CdlStop, NULL, NULL);
 }
+
+#if defined(__psyz) && !defined(__PSP__)
+// A disc image under a directory whose name is not ASCII (UTF-8, as SDL
+// dialogs and preference paths give it), named with a mixed separator, in a
+// CUE sheet saved with a byte order mark and CRLF line ends.
+ZTEST(libcd, data_read_from_a_utf8_path) {
+    char bin[PATH_LEN];
+    unsigned char sector[SECTOR_SIZE];
+    unsigned char expected[SECTOR_SIZE];
+    u_char header[12];
+    u_char payload[2048];
+    FILE* f;
+    int i;
+    // "Gry \u00e9\u65e5\u672c" (e acute, two CJK ideographs outside
+    // every Windows ANSI code page that has the e acute).
+    snprintf(utf8_dir, sizeof(utf8_dir),
+             "%s/Gry \xc3\xa9\xe6\x97\xa5\xe6\x9c\xac", dir);
+    zassert_s32_ne(0, SDL_CreateDirectory(utf8_dir));
+    snprintf(bin, sizeof(bin), "%s/d\xc3\xafsc.bin", utf8_dir);
+    f = Psyz_FileOpen(bin, "wb");
+    zassert_ptr_ne(NULL, f);
+    add_bin(bin);
+    for (i = 0; i < 2; ++i) {
+        build_data_sector(sector, i);
+        zassert_u32_eq(SECTOR_SIZE, fwrite(sector, 1, SECTOR_SIZE, f));
+    }
+    fclose(f);
+#ifdef _WIN32
+    // Windows takes either separator; "C:/x/Gry...\\disc.cue" mixes them.
+    snprintf(cue, sizeof(cue), "%s\\d\xc3\xafsc.cue", utf8_dir);
+#else
+    snprintf(cue, sizeof(cue), "%s/d\xc3\xafsc.cue", utf8_dir);
+#endif
+    f = Psyz_FileOpen(cue, "wb");
+    zassert_ptr_ne(NULL, f);
+    fputs("\xef\xbb\xbf"
+          "FILE \"d\xc3\xafsc.bin\" BINARY\r\n"
+          "  TRACK 01 MODE2/2352\r\n"
+          "    INDEX 01 00:00:00\r\n",
+          f);
+    fclose(f);
+    mount_cue();
+
+    start_read_at(1);
+    build_data_sector(expected, 1);
+    zassert_s32_eq(CdlDataReady, CdReady(1, NULL));
+    zassert_s32_ne(0, CdGetSector(header, sizeof(header) / 4));
+    zexpect_u8array_eq(expected + 12, header, sizeof(header));
+    zassert_s32_ne(0, CdGetSector(payload, sizeof(payload) / 4));
+    zexpect_u8array_eq(expected + 24, payload, sizeof(payload));
+    CdControlB(CdlStop, NULL, NULL);
+}
+#endif
 
 ZTEST(libcd, data_read_uses_the_read_callback) {
     unsigned char expected[SECTOR_SIZE];

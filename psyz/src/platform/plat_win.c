@@ -19,31 +19,81 @@
 #include <share.h>
 #include <SDL3/SDL.h>
 #include <wchar.h>
+#include <errno.h>
+#include <stdio.h>
+#include <windows.h>
 #include <romio.h>
 
-/* SDL paths are UTF-8; CRT file APIs need UTF-16. Absolute paths use the
- * extended form so user-data directories also work beyond MAX_PATH. */
+/* SDL paths are UTF-8; the CRT's narrow file APIs take the ANSI code page,
+ * so every host path goes through UTF-16. The path is made absolute and
+ * normalised (GetFullPathNameW resolves ".", ".." and "/") and given the
+ * extended-length prefix, so user-data directories also work beyond
+ * MAX_PATH. The result is released with SDL_free. */
 static wchar_t* file_path_utf16(const char* path) {
-    char* extended = NULL;
-    if (!strncmp(path, "\\\\?\\", 4))
-        extended = SDL_strdup(path);
-    else if (strlen(path) >= 3 && path[1] == ':' &&
-             (path[2] == '/' || path[2] == '\\'))
-        SDL_asprintf(&extended, "\\\\?\\%s", path);
-    else if (path[0] == '\\' && path[1] == '\\')
-        SDL_asprintf(&extended, "\\\\?\\UNC\\%s", path + 2);
-    else
-        extended = SDL_strdup(path);
-    if (!extended)
+    if (!path)
         return NULL;
     wchar_t* wide = (wchar_t*)SDL_iconv_string(
-        "UTF-16LE", "UTF-8", extended, strlen(extended) + 1);
-    SDL_free(extended);
-    for (wchar_t* p = wide; p && *p; ++p)
+        "UTF-16LE", "UTF-8", path, strlen(path) + 1);
+    if (!wide)
+        return NULL;
+    for (wchar_t* p = wide; *p; ++p)
         if (*p == L'/')
             *p = L'\\';
-    return wide;
+    if (!wcsncmp(wide, L"\\\\?\\", 4) || !*wide)
+        return wide;
+    DWORD needed = GetFullPathNameW(wide, 0, NULL, NULL);
+    if (!needed)
+        return wide;
+    // "\\?\UNC\" replaces the leading "\\" of a UNC path: +6 characters.
+    wchar_t* full = (wchar_t*)SDL_malloc((needed + 8) * sizeof(wchar_t));
+    if (!full) {
+        SDL_free(wide);
+        return NULL;
+    }
+    DWORD len = GetFullPathNameW(wide, needed, full + 8, NULL);
+    SDL_free(wide);
+    if (!len || len >= needed) {
+        SDL_free(full);
+        return NULL;
+    }
+    wchar_t* body = full + 8;
+    wchar_t* out;
+    if (body[0] == L'\\' && body[1] == L'\\') {
+        if (body[2] == L'?' || body[2] == L'.')
+            return memmove(full, body, (len + 1) * sizeof(wchar_t));
+        out = body + 2 - 8; // "\\?\UNC\" + "server\share..."
+        memcpy(out, L"\\\\?\\UNC\\", 8 * sizeof(wchar_t));
+    } else {
+        out = body - 4;
+        memcpy(out, L"\\\\?\\", 4 * sizeof(wchar_t));
+    }
+    memmove(full, out, (wcslen(out) + 1) * sizeof(wchar_t));
+    return full;
 }
+
+FILE* Psyz_FileOpen(const char* path, const char* mode) {
+    if (!path || !mode) {
+        errno = EINVAL;
+        return NULL;
+    }
+    wchar_t* wide_path = file_path_utf16(path);
+    wchar_t* wide_mode = (wchar_t*)SDL_iconv_string(
+        "UTF-16LE", "UTF-8", mode, strlen(mode) + 1);
+    FILE* file = NULL;
+    if (wide_path && wide_mode)
+        file = _wfopen(wide_path, wide_mode);
+    else
+        errno = ENOMEM;
+    SDL_free(wide_path);
+    SDL_free(wide_mode);
+    return file;
+}
+
+int Psyz_FileSeek(FILE* file, int64_t offset, int whence) {
+    return _fseeki64(file, offset, whence);
+}
+
+int64_t Psyz_FileTell(FILE* file) { return _ftelli64(file); }
 
 typedef struct {
     char** filenames;
@@ -293,8 +343,9 @@ int psyz_open(const char* devname, int flag, ...) {
 
 int psyz_close(int fd) { return _close(fd); }
 
+// The BIOS offset is signed: SEEK_CUR / SEEK_END may move backwards.
 unsigned long psyz_lseek(int fd, unsigned int offset, int flag) {
-    return _lseek(fd, offset, flag);
+    return (unsigned long)_lseek(fd, (long)(int)offset, flag);
 }
 
 int psyz_read(int fd, void* buf, unsigned int n) { return _read(fd, buf, n); }

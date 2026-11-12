@@ -5,6 +5,7 @@
 #include <psyz.h>
 #include <psyz/log.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <kernel.h>
@@ -22,6 +23,18 @@ typedef struct {
     int current_index;
 } DirState;
 static DirState g_dir = {0};
+
+// stdio streams (newlib) for disc images; offsets beyond 2 GB need no PSP
+// support.
+FILE* Psyz_FileOpen(const char* path, const char* mode) {
+    return fopen(path, mode);
+}
+
+int Psyz_FileSeek(FILE* file, int64_t offset, int whence) {
+    return fseek(file, (long)offset, whence);
+}
+
+int64_t Psyz_FileTell(FILE* file) { return (int64_t)ftell(file); }
 
 static int compare_entries(const void* a, const void* b) {
     return strcmp(((const FileEntry*)a)->name, ((const FileEntry*)b)->name);

@@ -11,6 +11,20 @@
 #include "pe-ps5-render-buffer.h"
 #include <stdlib.h>
 #include <limits.h>
+/* Entry points stay in the object even when nothing in it calls them (the
+ * linker's section GC). MSVC keeps external functions without help. */
+#if defined(__GNUC__) || defined(__clang__)
+#if defined(__has_attribute)
+#if __has_attribute(retain)
+#define PE2_KEEP __attribute__((used, retain))
+#endif
+#endif
+#ifndef PE2_KEEP
+#define PE2_KEEP __attribute__((used))
+#endif
+#else
+#define PE2_KEEP
+#endif
 #define PE2_MAX_SCALE 8
 #define PE2_MAX_PIXELS ((size_t)320*240*PE2_MAX_SCALE*PE2_MAX_SCALE)
 static bool Pe2PageValid(int x,int y,int w,int h){
@@ -59,9 +73,9 @@ typedef struct {
 static void Pe2RejectReason(Pe2Frame *f,int reason){
  if(f && f->active){if(!f->failed)f->reason=reason;f->failed=true;}
 }
-__attribute__((used,retain)) void Pe2Reject(Pe2Frame *f){Pe2RejectReason(f,PE2_UNSUPPORTED);}
+PE2_KEEP void Pe2Reject(Pe2Frame *f){Pe2RejectReason(f,PE2_UNSUPPORTED);}
 /* Bounds and page identity are explicit. No backing pointer escapes. */
-__attribute__((used,retain)) bool Pe2Begin(Pe2Frame *f,int scale,const uint16_t *native,int pitch,
+PE2_KEEP bool Pe2Begin(Pe2Frame *f,int scale,const uint16_t *native,int pitch,
  int x,int y,int w,int h) {
  if(!f)return false;
  f->active=false;f->failed=false;f->drawn=false;f->reason=0;f->scale=scale;
@@ -85,7 +99,7 @@ __attribute__((used,retain)) bool Pe2Begin(Pe2Frame *f,int scale,const uint16_t 
   f->pixels[py*f->w+px]=native[(y+py/f->scale)*pitch+x+px/f->scale];
  f->active=true;return true;
 }
-__attribute__((used,retain)) void Pe2Scissor(Pe2Frame *f,int x0,int y0,int x1,int y1){
+PE2_KEEP void Pe2Scissor(Pe2Frame *f,int x0,int y0,int x1,int y1){
  if(!f || !f->active)return;
  if(x0 < -2048 || x0>2047 || y0 < -2048 || y0>2047 ||
     x1 < -2048 || x1>2047 || y1 < -2048 || y1>2047){Pe2Reject(f);return;}
@@ -171,7 +185,7 @@ static bool Pe2CenteredLineTriangle(Pe2Frame *f,Pe2Vertex a,Pe2Vertex b,Pe2Verte
  * final image. Canonical sampler MUST be read-only and alias-free for epoch.
  * Aliasing, lines and VRAM mutations
  * require Pe2Reject; native raster remains the sole feedback authority. */
-__attribute__((used,retain)) bool Pe2Triangle(Pe2Frame *f,Pe2Vertex a,Pe2Vertex b,Pe2Vertex c,
+PE2_KEEP bool Pe2Triangle(Pe2Frame *f,Pe2Vertex a,Pe2Vertex b,Pe2Vertex c,
  bool gouraud,bool do_dither,Pe2PolygonSample sample,void *context,Pe2Paint paint,bool unsupported){
  if(!f || !f->active || f->failed)return false;
  if(unsupported){Pe2Reject(f);return false;}
@@ -234,7 +248,7 @@ __attribute__((used,retain)) bool Pe2Triangle(Pe2Frame *f,Pe2Vertex a,Pe2Vertex 
  * Quarter/three-quarter destination samples share floor(local position): no
  * fractional source detail is supplied by this API. Horizontal grid stretching
  * is deliberately rejected by the caller rather than inventing UV phase. */
-__attribute__((used,retain)) bool Pe2Rectangle(Pe2Frame *f,int ox,int oy,int w,int h,
+PE2_KEEP bool Pe2Rectangle(Pe2Frame *f,int ox,int oy,int w,int h,
  int u,int v,uint16_t color,Pe2Sample sample,void *ctx,Pe2Paint paint,bool unsupported){
  if(!f || !f->active || f->failed)return false;
  if(unsupported || ox < -2048 || ox>2047 || oy < -2048 || oy>2047 ||
@@ -262,7 +276,7 @@ __attribute__((used,retain)) bool Pe2Rectangle(Pe2Frame *f,int ox,int oy,int w,i
  return true;
 }
 
-__attribute__((used,retain)) const uint16_t *Pe2Output(Pe2Frame *f,int page_x,int page_y,int w,int h){
+PE2_KEEP const uint16_t *Pe2Output(Pe2Frame *f,int page_x,int page_y,int w,int h){
  if(!f || !f->active || f->failed || !f->drawn)return NULL;
  if(w<=0 || w>320 || h<=0 || h>240){Pe2RejectReason(f,PE2_PAGE);return NULL;}
  if(page_x!=f->page_x || page_y!=f->page_y || w*f->scale!=f->w || h*f->scale!=f->h){
