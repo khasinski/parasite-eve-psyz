@@ -326,6 +326,18 @@ int Psyz_VideoGetWidescreenViewMargin(void);
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right);
 
 /**
+ * @brief Draw and show one display buffer as without widescreen
+ *
+ * While widescreen is on, drawing into the buffer at VRAM row buffer_y is
+ * not squeezed and the buffer is presented (and captured) exactly as with
+ * widescreen off, until the next Psyz_VideoSetWidescreenPicture* for it:
+ * for frames (menus, 2D screens) a game keeps at 4:3. Call it before
+ * drawing the frame into that buffer. Each buffer keeps its own setting, so
+ * the buffer on screen is presented as it was drawn.
+ */
+void Psyz_VideoSetWidescreenNative(int buffer_y);
+
+/**
  * @brief Draw centred in the 16:9 view, ignoring the view's shift
  *
  * While on, drawing into a display buffer lands where it would with the view

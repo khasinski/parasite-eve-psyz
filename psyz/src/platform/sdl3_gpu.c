@@ -570,6 +570,8 @@ static struct {
     bool field, ends_move;
     float ex, ey;
     int camera_x;
+    /* Psyz_VideoSetWidescreenNative: drawn and shown as without widescreen */
+    bool native;
 } ws_picture[2] = {{-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0},
                    {-1, 0, 0, 0, false, false, 0.0f, 0.0f, 0}};
 static float ws_mid_shift[2],ws_mid_qx[2],ws_mid_qy[2],ws_mid_ex[2],ws_mid_ey[2],ws_mid_left[2],ws_mid_right[2];
@@ -652,7 +654,20 @@ static bool DisplayBufferDraw(void) {
 #include "committed_presentation.h"
 #endif
 
-static bool WidescreenDraw(void) { return widescreen && DisplayBufferDraw(); }
+static int WidescreenDrawPicture(void);
+/* The buffer at VRAM row y is drawn and shown as without widescreen. */
+static bool WidescreenNativeBuffer(int y) {
+    for (int i = 0; i < 2; ++i)
+        if (ws_picture[i].y == y)
+            return ws_picture[i].native;
+    return false;
+}
+static bool WidescreenDraw(void) {
+    if (!widescreen || !DisplayBufferDraw())
+        return false;
+    const int picture = WidescreenDrawPicture();
+    return picture < 0 || !ws_picture[picture].native;
+}
 
 /* Half the 16:9 view's width in whole game pixels, for the screen's pixel
  * aspect (199 for 320x224), so its edges meet the picture's ends exactly;
@@ -2584,6 +2599,7 @@ static void PlatformBackend_Present(void) {
                  * the picture the swapchain clear leaves black; a room
                  * narrower than the window shows 4:3, with even bars. */
                 if (widescreen && !rgb24 && !debug_show_vram &&
+                    !WidescreenNativeBuffer(interp_present_mid ? interp_next_y : display_area.y) &&
 #ifdef PE_PS5_GPU_NATIVE
                     !native_movie_active &&
 #endif
@@ -3097,14 +3113,16 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
             *w=enhanced->w;*h=enhanced->h;return pixels;
         }
     }
+    const bool shown_wide =
+        widescreen && !WidescreenNativeBuffer(interp_present_mid ? interp_next_y : display_area.y);
     if (UseSoftwareBackend() || display_rgb24 ||
-        (!scaled_vram_render && !widescreen && !interp_present_mid)) {
+        (!scaled_vram_render && !shown_wide && !interp_present_mid)) {
         unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
         if (!pixels)
             *w = *h = 0;
         return pixels;
     }
-    if ((!scaled_vram_render && !widescreen && !interp_present_mid) || display_area.x < 0 ||
+    if ((!scaled_vram_render && !shown_wide && !interp_present_mid) || display_area.x < 0 ||
         display_area.y < 0 || display_size.x <= 0 || display_size.y <= 0 ||
         display_area.x > VRAM_W - display_size.x ||
         display_area.y > VRAM_H - display_size.y)
@@ -3112,7 +3130,7 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     unsigned output_scale = Psyz_VideoGetInternalResolution();
     unsigned width = (unsigned)display_size.x * output_scale;
     unsigned height = (unsigned)display_size.y * output_scale;
-    bool capture_widescreen = widescreen && !debug_show_vram;
+    bool capture_widescreen = shown_wide && !debug_show_vram;
     if (capture_widescreen) {
         width = (height * 16u + 4u) / 9u;
         if (!ws_capture || ws_capture_width != width ||
@@ -3410,6 +3428,12 @@ static void SetWidescreenPicture(int buffer_y, int left, int right, bool field,
 void Psyz_VideoSetWidescreenPicture(int buffer_y, int left, int right) {
     SetWidescreenPicture(buffer_y, left, right, false, 0.0f, 0.0f, 0);
 }
+void Psyz_VideoSetWidescreenNative(int buffer_y) {
+    SetWidescreenPicture(buffer_y, 0, 0, false, 0.0f, 0.0f, 0);
+    for (int i = 0; i < 2; ++i)
+        if (ws_picture[i].y == buffer_y)
+            ws_picture[i].native = true;
+}
 void Psyz_VideoSetWidescreenPictureShifted(
     int buffer_y, int left, int right, float dx, float dy, int camera_x) {
     SetWidescreenPicture(buffer_y, left, right, true, dx, dy, camera_x);
@@ -3475,6 +3499,7 @@ static void SetWidescreenPicture(int buffer_y, int left, int right, bool field,
     ws_picture[slot].shift = (int)shift;
     /* A view that follows the picture's end to the fraction keeps the room
      * still on screen: only the room's shift past that is left to show. */
+    ws_picture[slot].native = false;
     ws_picture[slot].field = field;
     ws_picture[slot].ends_move = ends_move;
     ws_picture[slot].ex = field ? dx - (exact_shift - shift) : 0.0f;
