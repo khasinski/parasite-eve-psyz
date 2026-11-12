@@ -96,15 +96,40 @@ static uint64_t card_fields_us(unsigned fields);
  * both ports in turn and raises nothing: a blank card in port 1 and an
  * empty port 2 take 76 fields, an unformatted card in port 1 four and two
  * empty ports five. Psyz_CardSetInstantTiming(1) / PSYZ_CARD_TIMING=instant
- * completes every request at once. */
-enum { CARD_LOAD_TRANSFERS = 36, CARD_BU_INIT_TRANSFERS = 37 };
+ * completes every request at once.
+ *
+ * A 128-byte frame read or write ends when the card has answered its last
+ * byte, CARD_SECTOR_CLOCKS after the vblank that started it (DuckStation: a
+ * FileRead's last frame raises its event 266.3k system clocks after that
+ * vblank). A BIOS file service waiting for such a transfer (firstfile's
+ * sector 0 check, a synchronous file read or write) returns then, and an
+ * FASYNC file transfer raises its event then. When _bu_init finds a port
+ * without a card it clears that port's directory cache (a ROM bzero of its
+ * 15 entries and the code around it: 74.2k clocks after the timeout). The
+ * handler's bookkeeping when a request ends (its events undelivered and
+ * raised) adds 5.4k clocks to that interrupt. */
+enum {
+    CARD_LOAD_TRANSFERS = 36,
+    CARD_BU_INIT_TRANSFERS = 37,
+    CARD_SECTOR_CLOCKS = 266300,
+    CARD_BU_INIT_EMPTY_PORT_CLOCKS = 74200,
+    CARD_FINISH_ISR_CLOCKS = 5400,
+};
+
+enum {
+    CARD_RAISE_NONE,
+    CARD_RAISE_BOTH, // SwCARD and HwCARD (the driver's own requests)
+    CARD_RAISE_SW,   // SwCARD only (file I/O)
+};
 
 typedef struct {
     long chan;
     int transfers; // still to make; 0: no request
-    int raise;     // raise the result on SwCARD and HwCARD when done
+    int raise;     // CARD_RAISE_*: where the result is raised when done
     int load;      // an unformatted card answers EvSpNEW
     int parse;     // the directory is parsed a vblank after the last read
+    int sector;    // the last transfer moves a frame (CARD_SECTOR_CLOCKS)
+    int answering; // that frame is still on the wire
 } CardRequest;
 
 static struct {
@@ -148,10 +173,27 @@ static void card_finish(int port, unsigned spec) {
     CardRequest* r = &card_drv.req[port];
     int raise = r->raise;
     r->transfers = 0;
-    if (raise) {
+    r->answering = 0;
+    Psyz_KernelInterruptCycles(CARD_FINISH_ISR_CLOCKS);
+    if (raise == CARD_RAISE_SW) {
+        Psyz_KernelRaise(SwCARD, spec);
+    } else if (raise) {
         card_raise(spec);
     }
 }
+
+static uint64_t card_clocks_us(uint64_t clocks) {
+    return (clocks * 1000000 + 33868800 / 2) / 33868800;
+}
+
+static void card_sector_done(int port) {
+    CardRequest* r = &card_drv.req[port];
+    if (r->answering) {
+        card_finish(port, card_result(r));
+    }
+}
+static void card_sector_done0(void) { card_sector_done(0); }
+static void card_sector_done1(void) { card_sector_done(1); }
 
 // The BIOS card handler's work at one vblank.
 void Psyz_CardVBlank(void) {
@@ -188,7 +230,7 @@ void Psyz_CardVBlank(void) {
         return;
     }
     CardRequest* r = &card_drv.req[port];
-    if (!r->transfers) {
+    if (!r->transfers || r->answering) {
         return;
     }
     int state = card_chan_state(r->chan);
@@ -206,6 +248,12 @@ void Psyz_CardVBlank(void) {
     if (r->parse) {
         r->transfers = 1; // busy until the directory is parsed
         card_drv.parse_port = port;
+    } else if (r->sector && state != PSYZ_CARD_NONE) {
+        r->transfers = 1; // busy until the card has answered the frame
+        r->answering = 1;
+        Psyz_KernelPostAt(card_drv.last_vblank_us +
+                              card_clocks_us(CARD_SECTOR_CLOCKS),
+                          port ? card_sector_done1 : card_sector_done0);
     } else {
         card_finish(port, card_result(r));
     }
@@ -227,14 +275,17 @@ static void card_spin(void) {
     }
 }
 
-static long card_request(long chan, int transfers, int raise, int load, int parse) {
+static long card_request_sectors(long chan, int transfers, int raise, int load,
+                                 int parse, int sector) {
     if (!validate_chan(chan)) {
         return 0;
     }
     last_chan = chan;
     if (card_is_instant()) {
-        CardRequest r = {chan, 0, raise, load, 0};
-        if (raise) {
+        CardRequest r = {chan, 0, raise, load, 0, 0, 0};
+        if (raise == CARD_RAISE_SW) {
+            Psyz_KernelRaise(SwCARD, card_result(&r));
+        } else if (raise) {
             card_raise(card_result(&r));
         }
         return 1;
@@ -248,7 +299,13 @@ static long card_request(long chan, int transfers, int raise, int load, int pars
     r->raise = raise;
     r->load = load;
     r->parse = parse;
+    r->sector = sector;
+    r->answering = 0;
     return 1;
+}
+
+static long card_request(long chan, int transfers, int raise, int load, int parse) {
+    return card_request_sectors(chan, transfers, raise, load, parse, 0);
 }
 
 static void card_wait(int port) {
@@ -257,10 +314,10 @@ static void card_wait(int port) {
     }
 }
 
-long _card_info(long chan) { return card_request(chan, 1, 1, 0, 0); }
+long _card_info(long chan) { return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0); }
 
 long _card_load(long chan) {
-    return card_request(chan, CARD_LOAD_TRANSFERS, 1, 1, 1);
+    return card_request(chan, CARD_LOAD_TRANSFERS, CARD_RAISE_BOTH, 1, 1);
 }
 
 void _bu_init(void) {
@@ -279,14 +336,19 @@ void _bu_init(void) {
         return;
     }
     for (int port = 0; port < 2; port++) {
-        if (card_request((long)port << 4, CARD_BU_INIT_TRANSFERS, 0, 1, 0)) {
+        if (card_request((long)port << 4, CARD_BU_INIT_TRANSFERS,
+                         CARD_RAISE_NONE, 1, 0)) {
             card_wait(port);
+            if (Psyz_CardSlotState(port) == PSYZ_CARD_NONE) {
+                Psyz_SpendCycles(CARD_BU_INIT_EMPTY_PORT_CLOCKS);
+            }
         }
     }
 }
 
 void Psyz_CardSyncTransfer(long chan) {
-    if (card_request(chan, 1, 0, 0, 0) && !card_is_instant()) {
+    if (card_request_sectors(chan, 1, CARD_RAISE_NONE, 0, 0, 1) &&
+        !card_is_instant()) {
         card_wait((int)(chan >> 4));
     }
 }
@@ -360,6 +422,8 @@ long _card_wait(long drv) {
 unsigned long _card_chan(void) { return (unsigned long)last_chan; }
 
 static void card_driver_reset(int running) {
+    Psyz_KernelCancel(card_sector_done0);
+    Psyz_KernelCancel(card_sector_done1);
     memset(card_drv.req, 0, sizeof(card_drv.req));
     card_drv.running = running;
     card_drv.port = 0;
@@ -442,27 +506,27 @@ long _card_write(long chan, long block, unsigned char* buf) {
     LOG_ONCE("raw sectors are not emulated, only the completion event");
     (void)block;
     (void)buf;
-    return card_request(chan, 1, 1, 0, 0);
+    return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0);
 }
 
 long _card_read(long chan, long block, unsigned char* buf) {
     LOG_ONCE("raw sectors are not emulated, only the completion event");
     (void)block;
     (void)buf;
-    return card_request(chan, 1, 1, 0, 0);
+    return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0);
 }
 
-/* Memory card file timing ("bu" device). The BIOS moves one 128-byte frame
- * of a file about every two fields (the card driver steps its transfers on
- * the vblank interrupt), so an 8 KiB block takes 128 fields plus a few of
- * setup; an FASYNC read or write returns at once and raises SwCARD/EvSpIOE
- * when its last frame is done, a synchronous one returns then. Creating a
- * file first writes its directory frames. Measured on DuckStation with
- * Ridge Racer Type 4 (PAL): a 1-block save or load waits 133..134 fields
- * for its event and the file creation blocks 8 fields.
+/* Memory card file timing ("bu" device). The BIOS moves a file's 128-byte
+ * frames through the card driver, one transfer per turn of the port (every
+ * other vblank), after a frame of its own: a 1-block FASYNC read raises
+ * SwCARD/EvSpIOE a sector time after the vblank of its 65th transfer, 130.3
+ * fields after the call (DuckStation, Ridge Racer Type 4, PAL); a
+ * synchronous transfer returns then. Without a running driver (or with the
+ * port busy) the transfer takes the same number of turns on the clock.
+ * Creating a file first writes its directory frames: 8 fields.
  * Psyz_CardSetInstantTiming(1) or PSYZ_CARD_TIMING=instant completes card
  * I/O at once. */
-enum { CARD_FIELDS_PER_FRAME = 2, CARD_SETUP_FIELDS = 5, CARD_CREATE_FIELDS = 8 };
+enum { CARD_FIELDS_PER_FRAME = 2, CARD_FILE_EXTRA_TRANSFERS = 1, CARD_CREATE_FIELDS = 8 };
 
 static int card_instant = -1;
 
@@ -477,15 +541,17 @@ static int card_is_instant(void) {
 }
 
 static uint64_t card_fields_us(unsigned fields) {
-    /* PS1 field: 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks at
-     * 53.693175 MHz. */
-    uint64_t clocks = GetVideoMode() == MODE_PAL ? 3406ull * 314 : 3413ull * 263;
-    return (fields * clocks * 1000 + 26846) / 53693;
+    /* PS1 field: 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks, the GPU
+     * clock being 33.8688 MHz * 709379/451584 (PAL, 53.203425 MHz) or
+     * * 715909/451584 (NTSC, 53.693175 MHz). */
+    if (GetVideoMode() == MODE_PAL) {
+        return (fields * 3406ull * 314 * 1000000 + 26601712) / 53203425;
+    }
+    return (fields * 3413ull * 263 * 1000000 + 26846587) / 53693175;
 }
 
-static unsigned card_transfer_fields(long bytes) {
-    long frames = (bytes + 127) / 128;
-    return (unsigned)(CARD_SETUP_FIELDS + frames * CARD_FIELDS_PER_FRAME);
+static int card_file_transfers(long bytes) {
+    return (int)((bytes + 127) / 128) + CARD_FILE_EXTRA_TRANSFERS;
 }
 
 static void card_spend_fields(unsigned fields) {
@@ -499,18 +565,29 @@ static void card_spend_fields(unsigned fields) {
 
 static void card_async_done(void) { Psyz_KernelRaise(SwCARD, EvSpIOE); }
 
-void Psyz_CardFileTransfer(long bytes, int async) {
+void Psyz_CardFileTransfer(long chan, long bytes, int async) {
     if (card_is_instant()) {
         if (async) {
             card_async_done();
         }
         return;
     }
-    uint64_t us = card_fields_us(card_transfer_fields(bytes));
+    int transfers = card_file_transfers(bytes);
+    if (card_drv.running && validate_chan(chan) &&
+        card_request_sectors(chan, transfers, async ? CARD_RAISE_SW : CARD_RAISE_NONE,
+                             0, 0, 1)) {
+        if (!async) {
+            card_wait((int)(chan >> 4));
+        }
+        return;
+    }
+    uint64_t us = card_fields_us((unsigned)(transfers * CARD_FIELDS_PER_FRAME)) +
+                  card_clocks_us(CARD_SECTOR_CLOCKS);
     if (async) {
         Psyz_KernelPostAt(Psyz_KernelNowUs() + us, card_async_done);
     } else {
-        card_spend_fields(card_transfer_fields(bytes));
+        Psyz_SpendTime((unsigned)(card_clocks_us(CARD_SECTOR_CLOCKS) * 1000));
+        card_spend_fields((unsigned)(transfers * CARD_FIELDS_PER_FRAME));
     }
 }
 

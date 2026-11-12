@@ -306,19 +306,38 @@ void SystemError(char c, long n) {
     ERRORF("SystemError('%c', 0x%X)", c, n);
 }
 
+/* The BIOS card directory search after firstfile's sector 0 check: 25.8k
+ * clocks, 6.2k more when it returns an entry, and 13.7k for a nextfile
+ * (DuckStation, SCPH-1001 BIOS). */
+enum {
+    BIOS_CARD_FIRSTFILE_CYCLES = 25800,
+    BIOS_CARD_ENTRY_CYCLES = 6200,
+    BIOS_CARD_NEXTFILE_CYCLES = 13700,
+};
+static int card_search; // the last firstfile searched a card
+
 struct DIRENTRY* my_firstfile(char* dirPath, struct DIRENTRY* firstEntry);
 struct DIRENTRY* firstfile(char* dirPath, struct DIRENTRY* firstEntry) {
     // The BIOS checks the card ("buPS:") by reading its sector 0 first.
-    if (dirPath && dirPath[0] == 'b' && dirPath[1] == 'u' &&
-        dirPath[2] >= '0' && dirPath[2] <= '1' && dirPath[3] >= '0' &&
-        dirPath[3] <= '3') {
+    card_search = dirPath && dirPath[0] == 'b' && dirPath[1] == 'u' &&
+                  dirPath[2] >= '0' && dirPath[2] <= '1' &&
+                  dirPath[3] >= '0' && dirPath[3] <= '3';
+    if (card_search) {
         Psyz_CardSyncTransfer(((dirPath[2] - '0') << 4) | (dirPath[3] - '0'));
     }
-    return my_firstfile(dirPath, firstEntry);
+    struct DIRENTRY* entry = my_firstfile(dirPath, firstEntry);
+    if (card_search) {
+        Psyz_SpendCycles(BIOS_CARD_FIRSTFILE_CYCLES +
+                         (entry ? BIOS_CARD_ENTRY_CYCLES : 0));
+    }
+    return entry;
 }
 
 struct DIRENTRY* my_nextfile(struct DIRENTRY* outEntry);
 struct DIRENTRY* nextfile(struct DIRENTRY* outEntry) {
+    if (card_search) {
+        Psyz_SpendCycles(BIOS_CARD_NEXTFILE_CYCLES);
+    }
     return my_nextfile(outEntry);
 }
 

@@ -189,13 +189,14 @@ void Psyz_SpendCycles(unsigned cycles);
 void Psyz_MdecSetInstantTiming(int instant);
 
 /**
- * @brief Account for a memory card ("bu") file transfer of `bytes`
+ * @brief Account for a memory card ("bu") file transfer of `bytes` on `chan`
  *
- * For a host-side BIOS file layer. An asynchronous (FASYNC) transfer
- * raises SwCARD/EvSpIOE once the PS1 would have finished it, on the
- * emulated clock; a synchronous one spends that time before returning.
+ * For a host-side BIOS file layer. The frames go through the card driver's
+ * turns of the port (chan: port << 4 | slot). An asynchronous (FASYNC)
+ * transfer raises SwCARD/EvSpIOE once the PS1 would have finished it, on
+ * the emulated clock; a synchronous one waits for that before returning.
  */
-void Psyz_CardFileTransfer(long bytes, int async);
+void Psyz_CardFileTransfer(long chan, long bytes, int async);
 
 /**
  * @brief Spend the time the BIOS takes to create a card file
