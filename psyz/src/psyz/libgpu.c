@@ -591,10 +591,24 @@ static void CrtcVerticalRange(unsigned y1, unsigned y2) {
 
 /* GPUSTAT bit 31, which libetc's VSync waits on in interlace: in 480-line
  * interlace (GP1(08h) bits 2 and 5) it is the displayed field's line parity,
- * (display y + field) & 1, during the display range and y & 1 in the blank;
- * the field flips at every blank while interlace is on and is 0 otherwise
- * (DuckStation's CRTC). In other modes it flips every line. */
-static unsigned crtc_display_y, crtc_mode, crtc_field;
+ * (display y + display field) & 1, during the display range and y & 1 in
+ * the blank; in other modes it flips every line. As in DuckStation's CRTC
+ * the field flips at the start of each field (line 0, the end of the blank
+ * lines after the display range) while vertical interlace (bit 5) is on and
+ * is 0 otherwise, and the displayed field is latched at each vblank start:
+ * the field after the flip in 480-line interlace, else 0. A mode set in the
+ * blank, as a PutDispEnv right after VSync, counts for that flip but not
+ * for the latched field, so the first two interlaced fields show the same
+ * parity, unless a moved display range starts another vblank before line 0
+ * (Psyz_AudioDisplayRangeChanged). */
+static unsigned crtc_display_y, crtc_mode, crtc_field, crtc_display_field;
+static int crtc_flip_pending; // the next field start after the last vblank
+static uint64_t crtc_flip_us; // its time
+
+static void CrtcFieldStart(void) {
+    crtc_flip_pending = 0;
+    crtc_field = crtc_mode & 0x20 ? crtc_field ^ 1 : 0;
+}
 
 int Psyz_GpuCrtcInterlaced480(void) { return (crtc_mode & 0x24) == 0x24; }
 
@@ -618,11 +632,20 @@ int Psyz_GpuCrtcOddLine(unsigned line) {
     if (line < Psyz_GpuCrtcBlankLines()) {
         return (int)(crtc_display_y & 1);
     }
-    return (int)((crtc_display_y + crtc_field) & 1);
+    return (int)((crtc_display_y + crtc_display_field) & 1);
 }
 
 void Psyz_GpuCrtcBlank(void) {
-    crtc_field = crtc_mode & 0x20 ? crtc_field ^ 1 : 0;
+    uint64_t now = Psyz_KernelNowUs();
+    if (crtc_flip_pending && now >= crtc_flip_us) {
+        CrtcFieldStart();
+    }
+    crtc_display_field = Psyz_GpuCrtcInterlaced480() ? crtc_field ^ 1 : 0;
+    unsigned total = Psyz_GpuCrtcFieldLines();
+    unsigned lines = crtc_y2 < total ? total - crtc_y2 : 0;
+    uint64_t line_ns = total == 314 ? 64017 : 63563;
+    crtc_flip_pending = 1;
+    crtc_flip_us = now + lines * line_ns / 1000;
 }
 
 /* A GPU reset leaves the display mode of the console's region: a PAL
@@ -649,6 +672,8 @@ void Psyz_GpuCrtcReset(void) {
     CrtcVerticalRange(CRTC_RESET_Y1, CRTC_RESET_Y2);
     crtc_display_y = 0;
     crtc_field = 0;
+    crtc_display_field = 0;
+    crtc_flip_pending = 0;
     CrtcResetMode();
 }
 
@@ -685,6 +710,9 @@ void Psyz_GpuDisplayCommand(unsigned int cmd) {
         break;
     case 8:
         cmd &= 0xFFFFFF;
+        if (crtc_flip_pending && Psyz_KernelNowUs() >= crtc_flip_us) {
+            CrtcFieldStart(); // the field started in the old mode
+        }
         crtc_mode = cmd & 0xFF;
         display_mode_set = 1;
         Psyz_AudioVideoModeChanged((cmd & 8) != 0);
