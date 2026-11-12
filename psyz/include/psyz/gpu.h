@@ -95,6 +95,8 @@ int Psyz_GpuGetFrameInterpolation(void);
 int Psyz_GpuGetFrameInterpolationRequested(void);
 float Psyz_GpuGetPresentedFps(void);
 void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b);
+/* Midpoints presented; an unpaced run (headless, limitless) counts those a
+ * paced one would present. */
 unsigned long long Psyz_GpuGetInterpolatedPresentCount(void);
 /* The last frame drawn: primitives the midpoint could move, those tagged
  * with an identity (Psyz_GpuTagInterpolationPacket) and those paired with

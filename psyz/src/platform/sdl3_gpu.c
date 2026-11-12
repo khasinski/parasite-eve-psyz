@@ -28,7 +28,7 @@ static bool ps5_interactive_software;
 static bool UseSoftwareBackend(void);
 #define PSYZ_SOFTWARE_ROUTING
 static const void *interpolation_packet_current;
-#define PSYZ_CAPTURE_INTERPOLATION(v,n) InterpCapture(interpolation_packet_current,v,n)
+#define PSYZ_CAPTURE_INTERPOLATION(v,n,i,ni) InterpCapture(interpolation_packet_current,v,n,i,ni)
 /* Drawing state changes between queued primitives (mask bits, drawing area,
  * offset) are recorded as marks instead of flushing (Draw_FlushBuffer). */
 #define DRAW_STATE_MARKS 1
@@ -271,6 +271,20 @@ typedef struct {
     float motion[6][2];
     uint64_t signature;
     float position[6][3];
+    float depth[6]; /* view depths of position (vertex_depth), 0 for none */
+    unsigned long long id; /* the identity (PSYZ_INTERP_PROBE) */
+    /* Psyz_GpuTagInterpolationPacket'ed for this frame */
+    unsigned tagged_frame;
+    /* The primitive the frame drew (interp_store), for a ghost in the next
+     * midpoint when that frame leaves the identity out (InterpBuildGhosts):
+     * its frame, vertices, indices and drawing offset. */
+    unsigned store_frame, store_offset;
+    unsigned char store_count, store_indices, store_index[6];
+    /* the drawing offset within the drawing area, and the area's size */
+    short store_offset_x, store_offset_y, store_width, store_height;
+    /* ghosts drawn after this identity's primitive (pair index + 1) in the
+     * frame ghost_frame, and the next ghost of a list */
+    unsigned ghost_frame, ghost_head, ghost_next;
 } InterpPair;
 static InterpAddress interp_addresses[INTERP_MAP],interp_queue[INTERP_MAP];
 /* Packets tagged with a stable identity (Psyz_GpuTagInterpolationPacket):
@@ -296,6 +310,40 @@ static SDL_GPUTexture *interp_unwitnessed;
 static unsigned interpolated_scale;
 static Vertex interpolated_vertices[MAX_VERTEX_COUNT];
 static unsigned long long interpolated_present_count;
+/* The screen area (pixels) of the frame's tagged primitives by what the
+ * midpoint does with them (InterpMidpointUnsound); PSYZ_INTERP_STATS=1 logs
+ * them per frame, PSYZ_INTERP_PROBE (InterpProbe) the primitives at a pixel. */
+enum { ISTAT_PAIRED, ISTAT_NEW, ISTAT_MISMATCH, ISTAT_FRAME_ONLY, ISTAT_MID_ONLY, ISTAT_VANISHED, ISTAT_GHOST, ISTAT_REPLACED, ISTAT_N };
+static double interp_area[ISTAT_N];
+static unsigned interp_count[ISTAT_N];
+static int interp_stats_log=-1;
+static float InterpArea(float (*pos)[3],unsigned count);
+/* Ghosts: an identity the frame before drew and this frame leaves out (a
+ * tile leaving the drawn range, a level of detail switching to another
+ * representation, an object culled) would leave its place in the midpoint
+ * to whatever is drawn behind it. Its primitive is kept (interp_store) and
+ * drawn into the midpoint only, where it was half a frame later, right
+ * after the primitive drawn before it in that frame (interp_order). A new
+ * identity drawn where a ghost goes (the other representation) stays out
+ * of the midpoint. PSYZ_INTERP_GHOSTS=0 turns them off. */
+#define INTERP_STORE 32768u
+/* the largest move (pixels a frame) a ghost continues */
+#define INTERP_GHOST_MOTION 384.0f
+#define INTERP_ORDER 16384u
+static Vertex interp_store[2][INTERP_STORE];
+static unsigned interp_store_len[2];
+static unsigned interp_order[2][INTERP_ORDER],interp_order_len[2];
+static unsigned interp_inject,interp_ghost_first;
+static int interp_ghosts=-1;
+/* the frame's ghosts leave out more than this share of its identities: a cut */
+static bool interp_ghost_cut;
+#define INTERP_COVER_CELL 8
+static unsigned short interp_ghost_cover[VRAM_H/INTERP_COVER_CELL][VRAM_W/INTERP_COVER_CELL];
+static const unsigned short *interp_capture_index;
+static unsigned interp_capture_indices;
+static bool InterpGhostCovers(float (*pos)[3],unsigned count);
+static void InterpStore(InterpPair *p,unsigned pair,const Vertex *v,unsigned count);
+static void InterpBuildGhosts(void);
 static bool present_commit_pending,present_commit_mid;
 static Uint64 present_window_start;
 static unsigned present_window_frames,present_window_mid;
@@ -381,7 +429,7 @@ void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long i
             const InterpPair *old=&interp_pairs[index];
             if(tries>=64||!old->serial||!old->tagged||!old->frame||old->frame+1<interp_frame)break;
         }
-        interp_pairs[index]=(InterpPair){.serial=serial,.tagged=true};
+        interp_pairs[index]=(InterpPair){.serial=serial,.tagged=true,.id=id};
         *slot=(InterpId){id,index,serial};
     }
     InterpMap(interp_tags,packet,slot->pair,slot->serial);
@@ -389,6 +437,7 @@ void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long i
     /* drawn after the next BeginInterpolationFrame; the flags are the
      * packet's (one identity may be drawn twice, e.g. a tile listed twice) */
     if(t){t->frame=interp_frame+1;t->flags=flags;}
+    interp_pairs[slot->pair].tagged_frame=interp_frame+1;
 }
 void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to) {
     if(!interpolation_enabled)return;
@@ -470,10 +519,25 @@ void Psyz_GpuGetInterpolationStats(unsigned *primitives,unsigned *tagged,unsigne
     if(tagged)*tagged=interp_stat_last[1];
     if(paired)*paired=interp_stat_last[2];
 }
+static void InterpStatsFrame(void) {
+    if(interp_stats_log<0){const char *e=SDL_getenv("PSYZ_INTERP_STATS");interp_stats_log=e&&*e&&*e!='0';}
+    if(interp_stats_log<=0||!interp_frame)return;
+    /* identities drawn the frame before the last one and not in it */
+    for(unsigned i=0;i<INTERP_PAIRS;++i){InterpPair *p=&interp_pairs[i];
+        if(p->serial&&p->tagged&&p->frame+1==interp_frame&&!p->midpoint_pose){
+            interp_area[ISTAT_VANISHED]+=InterpArea(p->position,p->count);++interp_count[ISTAT_VANISHED];}}
+    SDL_Log("[interp-stats] f=%u paired=%u/%.0f new=%u/%.0f mismatch=%u/%.0f frameonly=%u/%.0f midonly=%u/%.0f vanished=%u/%.0f ghost=%u/%.0f replaced=%u/%.0f cut=%d",interp_frame,
+        interp_count[0],interp_area[0],interp_count[1],interp_area[1],interp_count[2],interp_area[2],interp_count[3],interp_area[3],
+        interp_count[4],interp_area[4],interp_count[5],interp_area[5],interp_count[6],interp_area[6],interp_count[7],interp_area[7],interp_ghost_cut);
+    memset(interp_area,0,sizeof(interp_area));memset(interp_count,0,sizeof(interp_count));
+}
 void Psyz_GpuBeginInterpolationFrame(void) {
+    InterpStatsFrame();
     interp_matches=0;
     memcpy(interp_stat_last,interp_stat,sizeof(interp_stat));memset(interp_stat,0,sizeof(interp_stat));
     ++interp_frame;if(!interp_frame){Psyz_GpuResetInterpolation();interp_frame=1;}
+    interp_store_len[interp_frame&1]=interp_order_len[interp_frame&1]=0;
+    InterpBuildGhosts();
     if(!interpolation_enabled||!device||UseSoftwareBackend())return;
     if(!InterpEnsureTarget()){
         WARNF("60 Hz interpolation target unavailable; original 30 Hz presentation retained: %s",SDL_GetError());
@@ -534,6 +598,21 @@ void Psyz_GpuSetInterpolationCamera(int x,int y) {
     interp_camera_half_y=interp_camera_previous?dy*0.5f:0;
     interp_camera_x=x;interp_camera_y=y;interp_camera_frame=interp_frame;
 }
+/* The midpoint of the frame just drawn is no plausible in-between: a cut
+ * (most of the frame's identities are new), or much of the picture is
+ * geometry without a pose in the frame before, which the midpoint can only
+ * draw where this frame has it. The frame before stays on screen for that
+ * field instead. PSYZ_INTERP_HOLD=share of the picture (default 0.15). */
+static Posi display_size;
+static bool InterpMidpointUnsound(void) {
+    static float share=-1;
+    if(share<0){const char *e=SDL_getenv("PSYZ_INTERP_HOLD");share=e&&*e?(float)SDL_atof(e):0.15f;}
+    if(interp_ghost_cut)return true;
+    const double picture=(double)display_size.x*display_size.y;
+    const double posed=interp_area[ISTAT_PAIRED]+interp_area[ISTAT_GHOST]+interp_area[ISTAT_REPLACED];
+    const double unposed=interp_area[ISTAT_NEW]+interp_area[ISTAT_MISMATCH];
+    return unposed>picture*share||(posed+unposed>0&&posed<unposed);
+}
 void Psyz_GpuPrepareInterpolatedPresent(int next_y) {
     interp_next_y=next_y;interp_phase=0;interp_blank_mid=false;
     interp_pair_ready=interpolation_enabled&&interpolated_vram&&interp_matches>0&&next_y>=0&&next_y<VRAM_H;
@@ -593,7 +672,23 @@ static bool InterpLine(const u_long *words,int count,bool gouraud,int *mid_x,int
     if(valid||extrapolated){++interp_stat[2];++interp_matches;}
     return (valid||extrapolated)&&!*own_only;
 }
-static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
+static void InterpProbe(const void *packet,const Vertex *v,const Vertex *mid,unsigned count,const char *what);
+static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count);
+static const char *interp_probe_what;
+static unsigned interp_probe_pair,interp_probe_flags;
+static void InterpCapture(const void *packet,Vertex *v,unsigned count,const unsigned short *index,unsigned indices) {
+    static int probe=-1;
+    interp_capture_index=index;interp_capture_indices=indices;
+    if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
+    interp_probe_what="untracked";interp_probe_pair=0;interp_probe_flags=0;
+    InterpCaptureDraw(packet,v,count);
+    if(probe&&!interp_line_mode&&count<=6)InterpProbe(packet,v,interpolated_vertices+(v-vertex_buf),count,interp_probe_what);
+}
+/* A screen position the GTE did not clamp to its limit (a projection). */
+static bool InterpUnclamped(const float *pos) {
+    return pos[0]>-1023.0f&&pos[0]<1022.0f&&pos[1]>-1023.0f&&pos[1]<1022.0f;
+}
+static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
     unsigned offset=(unsigned)(v-vertex_buf);
     memcpy(interpolated_vertices+offset,v,count*sizeof(*v));
     for(unsigned i=0;i<count;++i)if(!((geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0.0f))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
@@ -620,13 +715,14 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     const unsigned flags=p->tagged?e->flags:0;
     const bool any_texture=(flags&PSYZ_INTERP_ANY_TEXTURE)!=0;
     const bool midpoint_only=(flags&PSYZ_INTERP_MIDPOINT_ONLY)!=0;
-    const bool frame_only=(flags&PSYZ_INTERP_FRAME_ONLY)!=0;
+    bool frame_only=(flags&PSYZ_INTERP_FRAME_ONLY)!=0;
     uint64_t signature=14695981039346656037ULL;
     /* texture coordinates, CLUT and page of a textured primitive (an
      * untextured one leaves them as whatever was drawn before it) */
     for(unsigned i=0;i<count;++i){const unsigned char *s=(const void *)&v[i].u;
         if(!(v[i].t&TPAGE_NOTEXTURE))for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
-    float position[6][3];
+    float position[6][3],depth[6];
+    for(unsigned i=0;i<count;++i){const float d=vertex_depth[offset+i];depth[i]=d>0.0f?d:0.0f;}
     for(unsigned i=0;i<count;++i){bool projected=(geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0;
         float bias=(v[i].t&TPAGE_POLYGON)&&internal_res==1?0.5f:0.0f;
         position[i][0]=projected?v[i].pgxp_pos[0]:(float)v[i].x+bias;
@@ -639,9 +735,14 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
             if(p->out_mode==1&&!frame_only){out->pgxp_pos[0]=p->out[i][0];out->pgxp_pos[1]=p->out[i][1];out->pgxp_pos[2]=p->out[i][2];}
             else if(frame_only){out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048.0f;out->pgxp_pos[2]=-1.0f;}}
         if(midpoint_only)for(unsigned i=0;i<count;++i){v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
+        if(p->ghost_frame==interp_frame&&p->ghost_head)interp_inject=e->pair+1;
         return;
     }
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&(any_texture||p->signature==signature);
+    /* a new identity where a ghost goes: the other representation of it */
+    const bool replaced=p->tagged&&!valid&&!midpoint_only&&!frame_only&&!(p->frame&&p->frame+1==interp_frame)&&
+        InterpGhostCovers(position,count);
+    if(replaced)frame_only=true;
     /* A midpoint-only packet is geometry the game leaves out of the frame
      * (nearer than the projection plane): it pairs only with a pose the
      * game drew in the frame before; two midpoint-only poses are no
@@ -666,16 +767,37 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     bool clamped=midpoint_only&&!valid;
     if(!valid&&!camera_fallback&&p->tagged)
         for(unsigned i=0;i<count;++i)clamped|=v[i].x<=-1024||v[i].x>=1023||v[i].y<=-1024||v[i].y>=1023;
-    const bool extrapolated=clamped&&!p->midpoint_pose&&p->frame&&p->frame+1==interp_frame&&p->motion_frame==p->frame&&
-        p->count==count&&(any_texture||p->signature==signature);
+    const bool extrapolated=clamped&&!p->midpoint_pose&&p->frame&&p->frame+1==interp_frame&&
+        (p->motion_frame==p->frame||midpoint_only)&&p->count==count&&(any_texture||p->signature==signature);
+    /* without a last motion (a level of detail drawn in the frame before
+     * only), midpoint-only geometry stays where that frame drew it rather
+     * than leaving a hole */
+    const float step=p->motion_frame==p->frame?0.5f:0.0f;
     if(p->tagged)++interp_stat[1];
     if(valid||extrapolated)++interp_stat[2];
+    interp_probe_pair=e->pair;interp_probe_flags=flags;
+    if(p->tagged){
+        const int k=replaced?ISTAT_REPLACED:frame_only?ISTAT_FRAME_ONLY:(valid||extrapolated)?ISTAT_PAIRED:midpoint_only?ISTAT_MID_ONLY:
+            (p->frame&&p->frame+1==interp_frame)?ISTAT_MISMATCH:ISTAT_NEW;
+        interp_area[k]+=InterpArea(position,count);++interp_count[k];
+    }
+    interp_probe_what=!p->tagged?"untagged-pair":valid?"paired":extrapolated?"extrapolated":camera_fallback?"camera":clamped&&midpoint_only?"hidden":"unpaired";
     if(debug>0&&!valid&&!extrapolated&&p->tagged)
         for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->r=255;out->g=0;out->b=255;}
     if((valid||camera_fallback||extrapolated)&&!frame_only)++interp_matches;
     p->out_mode=0;
     for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
-        if(valid){
+        if(valid&&depth[i]>0.0f&&p->depth[i]>0.0f&&InterpUnclamped(position[i])&&InterpUnclamped(p->position[i])){
+            /* the projection of the midpoint of the two view-space
+             * positions: their screen positions weighted by depth (the
+             * projection centre cancels out); points on a line stay on
+             * it, so subdivided pieces meet their neighbours */
+            const float w=depth[i]/(depth[i]+p->depth[i]);
+            out->pgxp_pos[0]=position[i][0]*w+p->position[i][0]*(1.0f-w);
+            out->pgxp_pos[1]=position[i][1]*w+p->position[i][1]*(1.0f-w);
+            out->pgxp_pos[2]=position[i][2]>1.0f&&p->position[i][2]>1.0f?(depth[i]+p->depth[i])*0.5f:
+                2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]);
+        }else if(valid){
             out->pgxp_pos[0]=(position[i][0]+p->position[i][0])*0.5f;
             out->pgxp_pos[1]=(position[i][1]+p->position[i][1])*0.5f;
             out->pgxp_pos[2]=2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]);
@@ -684,8 +806,8 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
             out->pgxp_pos[1]=position[i][1]+interp_camera_half_y;
             out->pgxp_pos[2]=position[i][2];
         }else if(extrapolated){
-            out->pgxp_pos[0]=p->position[i][0]+p->motion[i][0]*0.5f;
-            out->pgxp_pos[1]=p->position[i][1]+p->motion[i][1]*0.5f;
+            out->pgxp_pos[0]=p->position[i][0]+p->motion[i][0]*step;
+            out->pgxp_pos[1]=p->position[i][1]+p->motion[i][1]*step;
             out->pgxp_pos[2]=p->position[i][2];
         }else if(clamped&&midpoint_only){
             out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048.0f;out->pgxp_pos[2]=-1.0f;
@@ -697,7 +819,10 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
         p->motion_frame=interp_frame;
     }else p->motion_frame=0;
     memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
+    memcpy(p->depth,depth,count*sizeof(depth[0]));
     p->midpoint_pose=midpoint_only;
+    if(p->tagged&&!midpoint_only)InterpStore(p,e->pair,v,count);
+    if(p->tagged&&p->ghost_frame==interp_frame&&p->ghost_head)interp_inject=e->pair+1;
     if(frame_only)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048;out->pgxp_pos[2]=-1;}
     if(midpoint_only)for(unsigned i=0;i<count;++i){
         v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
@@ -735,6 +860,152 @@ static Posi cur_display_size = {-1, -1};
 static Posi draw_offset = {0, 0};
 static Posi draw_area_start = {0, 0};
 static Posi draw_area_end = {0x10000, 0x10000};
+/* The on-screen area of a primitive's pose (vertex space), clipped to the
+ * drawing area's bounding box by clamping. */
+static float InterpArea(float (*pos)[3],unsigned count) {
+    static const unsigned tri[3][2][3]={{{0,1,2},{0,1,2}},{{0,1,2},{2,1,3}},{{0,1,2},{3,4,5}}};
+    if(count!=3&&count!=4&&count!=6)return 0;
+    const unsigned k=count==3?0:count==4?1:2;
+    const float x0=(float)(draw_area_start.x-draw_offset.x),x1=(float)(draw_area_end.x+1-draw_offset.x);
+    const float y0=(float)(draw_area_start.y-draw_offset.y),y1=(float)(draw_area_end.y+1-draw_offset.y);
+    float area=0;
+    for(unsigned t=0;t<(count==3?1u:2u);++t){float q[3][2];
+        for(unsigned i=0;i<3;++i){q[i][0]=SDL_clamp(pos[tri[k][t][i]][0],x0,x1);q[i][1]=SDL_clamp(pos[tri[k][t][i]][1],y0,y1);}
+        area+=SDL_fabsf((q[1][0]-q[0][0])*(q[2][1]-q[0][1])-(q[2][0]-q[0][0])*(q[1][1]-q[0][1]))*0.5f;}
+    return area;
+}
+static bool InterpGhostEnabled(void) {
+    if(interp_ghosts<0){const char *e=SDL_getenv("PSYZ_INTERP_GHOSTS");interp_ghosts=!(e&&*e=='0');}
+    return interp_ghosts>0;
+}
+static unsigned short InterpCoverStamp(void){return (unsigned short)(interp_frame&0xFFFF)?(unsigned short)(interp_frame&0xFFFF):1;}
+/* Marks the cells whose centre a triangle (drawing area coordinates) covers. */
+static void InterpCoverTriangle(const float a[2],const float b[2],const float c[2]) {
+    const float area=(b[0]-a[0])*(c[1]-a[1])-(c[0]-a[0])*(b[1]-a[1]);
+    if(SDL_fabsf(area)<1.0f)return;
+    const int x0=SDL_max(0,(int)SDL_floorf(SDL_min(a[0],SDL_min(b[0],c[0]))/INTERP_COVER_CELL));
+    const int x1=SDL_min(VRAM_W/INTERP_COVER_CELL-1,(int)SDL_floorf(SDL_max(a[0],SDL_max(b[0],c[0]))/INTERP_COVER_CELL));
+    const int y0=SDL_max(0,(int)SDL_floorf(SDL_min(a[1],SDL_min(b[1],c[1]))/INTERP_COVER_CELL));
+    const int y1=SDL_min(VRAM_H/INTERP_COVER_CELL-1,(int)SDL_floorf(SDL_max(a[1],SDL_max(b[1],c[1]))/INTERP_COVER_CELL));
+    const unsigned short stamp=InterpCoverStamp();
+    for(int y=y0;y<=y1;++y)for(int x=x0;x<=x1;++x){
+        const float px=(x+0.5f)*INTERP_COVER_CELL,py=(y+0.5f)*INTERP_COVER_CELL;
+        const float d1=(b[0]-a[0])*(py-a[1])-(px-a[0])*(b[1]-a[1]);
+        const float d2=(c[0]-b[0])*(py-b[1])-(px-b[0])*(c[1]-b[1]);
+        const float d3=(a[0]-c[0])*(py-c[1])-(px-c[0])*(a[1]-c[1]);
+        if(area>0?(d1>=0&&d2>=0&&d3>=0):(d1<=0&&d2<=0&&d3<=0))interp_ghost_cover[y][x]=stamp;
+    }
+}
+static const unsigned interp_tri[3][2][3]={{{0,1,2},{0,1,2}},{{0,1,2},{2,1,3}},{{0,1,2},{3,4,5}}};
+/* Most of a primitive's pose (vertex space) lies where ghosts go. */
+static bool InterpGhostCovers(float (*pos)[3],unsigned count) {
+    if(!InterpGhostEnabled()||interp_ghost_cut||(count!=3&&count!=4&&count!=6))return false;
+    const unsigned k=count==3?0:count==4?1:2,tris=count==3?1u:2u;
+    const unsigned short stamp=InterpCoverStamp();
+    unsigned samples=0,covered=0;
+    for(unsigned t=0;t<tris;++t){
+        const float *a=pos[interp_tri[k][t][0]],*b=pos[interp_tri[k][t][1]],*c=pos[interp_tri[k][t][2]];
+        static const float w[4][3]={{1/3.f,1/3.f,1/3.f},{.6f,.2f,.2f},{.2f,.6f,.2f},{.2f,.2f,.6f}};
+        for(unsigned i=0;i<4;++i){
+            const int x=(int)SDL_floorf((w[i][0]*a[0]+w[i][1]*b[0]+w[i][2]*c[0]+draw_offset.x-draw_area_start.x)/INTERP_COVER_CELL);
+            const int y=(int)SDL_floorf((w[i][0]*a[1]+w[i][1]*b[1]+w[i][2]*c[1]+draw_offset.y-draw_area_start.y)/INTERP_COVER_CELL);
+            ++samples;
+            if(x>=0&&y>=0&&x<VRAM_W/INTERP_COVER_CELL&&y<VRAM_H/INTERP_COVER_CELL&&interp_ghost_cover[y][x]==stamp)++covered;
+        }
+    }
+    return covered*4>=samples*3;
+}
+/* Keeps the primitive an identity drew in this frame for a ghost. */
+static void InterpStore(InterpPair *p,unsigned pair,const Vertex *v,unsigned count) {
+    const unsigned b=interp_frame&1;
+    if(p->store_frame==interp_frame||!InterpGhostEnabled())return;
+    /* semi-transparent shapes (shadows, effects) blend: a ghost of one
+     * shows as a patch where nothing was */
+    if(count<3||count>6||interp_capture_indices<3||interp_capture_indices>6||v[0].exact[0][3]||v[0].a!=0xFF||
+       interp_store_len[b]+count>INTERP_STORE||interp_order_len[b]>=INTERP_ORDER)return;
+    /* a pose crossing the view plane (a vertex at the GTE's screen limit)
+     * or moving faster than a ghost can follow is no pose to continue */
+    for(unsigned i=0;i<count;++i){
+        if(v[i].x<=-1024||v[i].x>=1023||v[i].y<=-1024||v[i].y>=1023)return;
+        if(p->motion_frame==interp_frame&&(SDL_fabsf(p->motion[i][0])>INTERP_GHOST_MOTION||SDL_fabsf(p->motion[i][1])>INTERP_GHOST_MOTION))return;
+    }
+    const unsigned base=(unsigned)(v-vertex_buf);
+    for(unsigned k=0;k<interp_capture_indices;++k){
+        const unsigned i=(unsigned)interp_capture_index[k]-base;
+        if(i>=count)return;
+        p->store_index[k]=(unsigned char)i;
+    }
+    memcpy(&interp_store[b][interp_store_len[b]],v,count*sizeof(*v));
+    p->store_offset=interp_store_len[b];interp_store_len[b]+=count;
+    p->store_count=(unsigned char)count;p->store_indices=(unsigned char)interp_capture_indices;
+    p->store_offset_x=(short)(draw_offset.x-draw_area_start.x);p->store_offset_y=(short)(draw_offset.y-draw_area_start.y);
+    p->store_width=(short)(draw_area_end.x-draw_area_start.x);p->store_height=(short)(draw_area_end.y-draw_area_start.y);
+    p->store_frame=interp_frame;
+    interp_order[b][interp_order_len[b]++]=pair;
+}
+/* The pose of a ghost after a whole frame (step 1) or half (0.5). */
+static void InterpGhostPose(const InterpPair *g,unsigned i,float step,float out[2]) {
+    const bool moving=g->motion_frame&&g->motion_frame==g->frame;
+    out[0]=g->position[i][0]+(moving?g->motion[i][0]*step:0);
+    out[1]=g->position[i][1]+(moving?g->motion[i][1]*step:0);
+}
+/* After the frame's tags (Psyz_GpuBeginInterpolationFrame): the identities
+ * the frame before drew and this one leaves out become ghosts. */
+static void InterpBuildGhosts(void) {
+    const unsigned f=interp_frame-1,b=f&1,n=interp_order_len[b];
+    unsigned vanished=0,last=0,tail=0;
+    interp_inject=interp_ghost_first=0;interp_ghost_cut=false;
+    if(!InterpGhostEnabled()||!n)return;
+    for(unsigned k=0;k<n;++k){const InterpPair *p=&interp_pairs[interp_order[b][k]];
+        if(p->store_frame==f&&p->tagged_frame!=interp_frame)++vanished;}
+    if(interp_stats_log>0)SDL_Log("[ghost-build] f=%u order=%u store=%u vanished=%u",interp_frame,n,interp_store_len[b],vanished);
+    /* most of the picture is new: a cut, which nothing pairs across */
+    if(vanished*2>n){interp_ghost_cut=true;return;}
+    for(unsigned k=0;k<n;++k){
+        const unsigned q=interp_order[b][k];InterpPair *p=&interp_pairs[q];
+        if(p->store_frame!=f)continue;
+        if(p->tagged_frame==interp_frame){p->ghost_frame=interp_frame;p->ghost_head=0;last=q+1;tail=0;continue;}
+        p->ghost_next=0;
+        if(tail)interp_pairs[tail-1].ghost_next=q+1;
+        else if(last)interp_pairs[last-1].ghost_head=q+1;
+        else interp_ghost_first=q+1;
+        tail=q+1;
+        const unsigned c=p->store_count,kk=c==3?0:c==4?1:2;
+        for(unsigned t=0;t<(c==3?1u:2u);++t){float a[3][2];
+            for(unsigned i=0;i<3;++i){InterpGhostPose(p,interp_tri[kk][t][i],1.0f,a[i]);a[i][0]+=p->store_offset_x;a[i][1]+=p->store_offset_y;}
+            InterpCoverTriangle(a[0],a[1],a[2]);}
+    }
+}
+/* PSYZ_INTERP_PROBE=x,y[,first,last]: log every primitive whose frame or
+ * midpoint pose covers draw-area pixel x,y (interpolation frames first..last). */
+static bool InterpProbeCovers(const Vertex *v,unsigned count,bool precise,float px,float py) {
+    static const unsigned tri[3][2][3]={{{0,1,2},{0,1,2}},{{0,1,2},{2,1,3}},{{0,1,2},{3,4,5}}};
+    if(count!=3&&count!=4&&count!=6)return false;
+    const unsigned k=count==3?0:count==4?1:2;
+    for(unsigned t=0;t<2;++t){
+        const Vertex *a=&v[tri[k][t][0]],*b=&v[tri[k][t][1]],*c=&v[tri[k][t][2]];
+        float ax=precise&&a->pgxp_pos[2]>0?a->pgxp_pos[0]:a->x,ay=precise&&a->pgxp_pos[2]>0?a->pgxp_pos[1]:a->y;
+        float bx=precise&&b->pgxp_pos[2]>0?b->pgxp_pos[0]:b->x,by=precise&&b->pgxp_pos[2]>0?b->pgxp_pos[1]:b->y;
+        float cx=precise&&c->pgxp_pos[2]>0?c->pgxp_pos[0]:c->x,cy=precise&&c->pgxp_pos[2]>0?c->pgxp_pos[1]:c->y;
+        float d1=(px-bx)*(ay-by)-(ax-bx)*(py-by),d2=(px-cx)*(by-cy)-(bx-cx)*(py-cy),d3=(px-ax)*(cy-ay)-(cx-ax)*(py-ay);
+        bool neg=d1<0||d2<0||d3<0,pos=d1>0||d2>0||d3>0;
+        if((ax-bx)*(cy-by)!=(ay-by)*(cx-bx)&&!(neg&&pos))return true;
+    }
+    return false;
+}
+static void InterpProbe(const void *packet,const Vertex *v,const Vertex *mid,unsigned count,const char *what) {
+    static int px=-1,py,first=0,last=0x7FFFFFFF;
+    static bool init,all;
+    if(!init){init=true;if(SDL_sscanf(SDL_getenv("PSYZ_INTERP_PROBE"),"%d,%d,%d,%d",&px,&py,&first,&last)<2)px=-2;else if(px==-1)all=true,px=0;}
+    if(px<0||(int)interp_frame<first||(int)interp_frame>last)return;
+    const float x=(float)(px+draw_area_start.x-draw_offset.x)+0.5f,y=(float)(py+draw_area_start.y-draw_offset.y)+0.5f;
+    const bool own=InterpProbeCovers(v,count,true,x,y),in_mid=InterpProbeCovers(mid,count,true,x,y);
+    if(!own&&!in_mid&&!all)return;
+    char line[512];int n=SDL_snprintf(line,sizeof(line),"[probe] f=%u %p id=%llx fl=%u %s%s%s n=%u rgb=%d,%d,%d t=%04x",interp_frame,packet,interp_pairs[interp_probe_pair].id,interp_probe_flags,what,own?" own":"",in_mid?" mid":"",count,v->r,v->g,v->b,(unsigned)v->t);
+    for(unsigned i=0;i<count&&n<(int)sizeof(line)-40;++i)n+=SDL_snprintf(line+n,sizeof(line)-(size_t)n," (%.1f,%.1f|%.1f,%.1f)",
+        v[i].pgxp_pos[2]>0?v[i].pgxp_pos[0]:v[i].x,v[i].pgxp_pos[2]>0?v[i].pgxp_pos[1]:v[i].y,mid[i].pgxp_pos[2]>0?mid[i].pgxp_pos[0]:mid[i].x,mid[i].pgxp_pos[2]>0?mid[i].pgxp_pos[1]:mid[i].y);
+    SDL_Log("%s",line);
+}
 static SDL_Rect scissor_rect = {0, 0, VRAM_W, VRAM_H};
 
 /* Widescreen (Psyz_VideoSetWidescreen). The default squeeze, 3/4, keeps
@@ -2742,14 +3013,20 @@ static void PlatformBackend_Present(void) {
     }
     /* a capture shows what the last present showed */
     if(!ws_capture_active){
-        interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
+        const bool mid_ready=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
             interpolated_scale==internal_res&&interp_next_y>=0&&interp_next_y<=VRAM_H-display_size.y&&
             !display_rgb24&&
 #ifdef PE_PS5_GPU_NATIVE
             !native_movie_active&&
 #endif
             !debug_show_vram&&game_speed==1&&
-            (interp_blank_mid?present_blank_poll:interp_phase++==1);
+            /* decided when it is shown: a paced present draws the frame
+             * during the wait before */
+            !InterpMidpointUnsound();
+        interp_present_mid=mid_ready&&(interp_blank_mid?present_blank_poll:interp_phase++==1);
+        /* Unpaced (headless, limitless) runs poll no blank: they count the
+         * midpoint a paced present would have shown (captures, tests). */
+        if(interp_blank_mid&&mid_ready&&!present_blank_poll&&!PacedPresents())++interpolated_present_count;
         /* a blank midpoint is shown once, or not after a new frame */
         if(interp_blank_mid){interp_blank_mid=false;interp_pair_ready=false;}
         if(interp_present_mid)++interpolated_present_count;
@@ -4007,6 +4284,47 @@ int Draw_ExequeSync() { return 0; }
 
 // optimization to avoid sampling the VRAM on an untextured batch draw
 static bool batch_has_texture = false;
+static void ClutCacheUpdate(u16 tpage, u16 clut);
+/* Draw_EnqueueBuffer: the ghosts that follow the primitive just queued. */
+static void InterpInjectGhosts(unsigned h) {
+    const unsigned f=interp_frame-1,b=f&1;
+    while(h){
+        InterpPair *g=&interp_pairs[h-1];h=g->ghost_next;
+        /* another view (the drawing area of a buffer moves with it) */
+        if(g->store_frame!=f||g->tagged_frame==interp_frame||g->store_offset_x!=draw_offset.x-draw_area_start.x||
+           g->store_offset_y!=draw_offset.y-draw_area_start.y||g->store_width!=draw_area_end.x-draw_area_start.x||
+           g->store_height!=draw_area_end.y-draw_area_start.y)continue;
+        const unsigned n=g->store_count,ni=g->store_indices;
+        const Vertex *src=&interp_store[b][g->store_offset];
+        /* the CLUT cache row of the frame before is gone: load it again */
+        const bool textured=!(src[0].t&TPAGE_NOTEXTURE);
+        if(textured)ClutCacheUpdate(src[0].t,src[0].c);
+        Draw_EnsureBufferWillNotOverflow((int)n,(int)ni);
+        const unsigned base=n_vertices;
+        for(unsigned i=0;i<n;++i){
+            Vertex *out=&interpolated_vertices[base+i];float pose[2];
+            *out=src[i];InterpGhostPose(g,i,0.5f,pose);
+            out->pgxp_pos[0]=pose[0];out->pgxp_pos[1]=pose[1];out->pgxp_pos[2]=g->position[i][2]>0?g->position[i][2]:1.0f;
+            if(textured)out->exact[4][3]=clut_cache_row;
+            vertex_cur[i]=src[i];vertex_cur[i].x=vertex_cur[i].y=-2048;
+            vertex_cur[i].pgxp_pos[0]=vertex_cur[i].pgxp_pos[1]=-2048.0f;vertex_cur[i].pgxp_pos[2]=-1.0f;
+        }
+        for(unsigned k=0;k<ni;++k)index_cur[k]=(unsigned short)(base+g->store_index[k]);
+        if(textured)batch_has_texture=true;
+        vertex_cur+=n;index_cur+=ni;n_vertices+=(unsigned short)n;n_indices+=(int)ni;
+        interp_area[ISTAT_GHOST]+=InterpArea(g->position,n);++interp_count[ISTAT_GHOST];
+        static int probe=-1;
+        if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
+        if(probe){interp_probe_pair=(unsigned)(g-interp_pairs);interp_probe_flags=0;InterpProbe(NULL,&vertex_buf[base],&interpolated_vertices[base],n,"ghost");}
+    }
+}
+static void InterpEnqueued(void) {
+    if(!interp_inject&&!interp_ghost_first)return;
+    if(!interpolation_enabled||!interpolated_vram||interpolated_scale!=internal_res||interp_line_mode){interp_inject=0;return;}
+    if(interp_ghost_first){const unsigned h=interp_ghost_first;interp_ghost_first=0;InterpInjectGhosts(h);}
+    if(interp_inject){InterpPair *p=&interp_pairs[interp_inject-1];const unsigned h=p->ghost_head;
+        p->ghost_head=0;interp_inject=0;InterpInjectGhosts(h);}
+}
 /* Retain the PS1's signed 12-fractional-bit attribute gradients while the
  * GPU rasterizes the geometry, including at higher internal resolutions. */
 static void SetPolygonAttributes(Vertex* vertices) {
@@ -4735,6 +5053,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 Vertex second[3] = {vertex_cur[2], vertex_cur[1],
                                     vertex_cur[3]};
                 memcpy(vertex_cur + 3, second, sizeof(second));
+                {
+                    float *depth = &vertex_depth[vertex_cur - vertex_buf];
+                    const float second_depth[3] = {depth[2], depth[1], depth[3]};
+                    memcpy(depth + 3, second_depth, sizeof(second_depth));
+                }
                 const bool culled = index_cur[3] == index_cur[4];
                 index_cur[3] = n_vertices + 3;
                 index_cur[4] = n_vertices + (culled ? 3 : 4);
