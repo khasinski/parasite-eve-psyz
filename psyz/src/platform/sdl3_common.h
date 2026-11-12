@@ -775,7 +775,9 @@ int Psyz_VideoVSync(int mode) {
          * (Psyz_VideoWaitBlank). The count runs from the last VSync(0). */
         int offline = Psyz_AudioWaitUs(mode == 1 ? 64 : 0);
         if (offline) {
-            ret = (unsigned short)(
+            /* The line counter is 16 bits: wrap the whole count (a double
+             * past 65535 converts to unsigned short undefined). */
+            ret = (unsigned short)(uint64_t)(
                 (double)(Psyz_KernelNowUs() - offline_vsync_us) /
                 LineMicroseconds());
             if (mode == 1)
