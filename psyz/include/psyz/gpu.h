@@ -96,6 +96,14 @@ int Psyz_GpuGetFrameInterpolationRequested(void);
 float Psyz_GpuGetPresentedFps(void);
 void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b);
 unsigned long long Psyz_GpuGetInterpolatedPresentCount(void);
+/* The last frame drawn: primitives the midpoint could move, those tagged
+ * with an identity (Psyz_GpuTagInterpolationPacket) and those paired with
+ * the frame before (drawn at the midpoint). */
+void Psyz_GpuGetInterpolationStats(unsigned *primitives,unsigned *tagged,unsigned *paired);
+/* For tests: the midpoint drawn for the displayed buffer (the in-between
+ * of the frame shown and the one before), RGB like
+ * Psyz_VideoAllocRenderedFrame; NULL without one. */
+unsigned char *Psyz_VideoAllocMidpointFrame(int *w,int *h);
 void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b);
 void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b);
 void Psyz_GpuSetInterpolationCamera(int x,int y);
@@ -111,11 +119,29 @@ void Psyz_GpuPrepareInterpolatedPresent(int next_y);
  * frame. Call between the frame's Psyz_GpuBeginInterpolationFrame calls,
  * before the frame's own; untagged packets (HUD) keep their pose. */
 void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id);
+/* With PSYZ_INTERP_ANY_TEXTURE the packet pairs whatever its texture
+ * coordinates (an environment map that follows the view); otherwise a
+ * packet only pairs when they did not change. */
+#define PSYZ_INTERP_ANY_TEXTURE 1u
+/* With PSYZ_INTERP_MIDPOINT_ONLY the packet is drawn into the midpoint only
+ * (geometry the game culls but whose previous pose still shows there); it
+ * is left out when it does not pair. */
+#define PSYZ_INTERP_MIDPOINT_ONLY 2u
+/* With PSYZ_INTERP_FRAME_ONLY the packet is left out of the midpoint (a
+ * new level of detail whose previous one is drawn there instead); it still
+ * pairs with the next frame. */
+#define PSYZ_INTERP_FRAME_ONLY 4u
+void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long id,unsigned flags);
 /* Like Psyz_GpuPrepareInterpolatedPresent, for a game that waits on VSync(1)
  * over several fields with one VSync(0) per frame: the midpoint is presented
  * at the next blank that passes during that wait (paced presents), and not
  * at all when the next present is a new frame. */
 void Psyz_GpuPrepareInterpolatedBlank(int next_y);
+/* Before a frame is drawn into the rows at dst_y: the midpoint target there
+ * starts as the frame drawn at src_y (the one before), so what the midpoint
+ * leaves uncovered (geometry the new frame culled) shows that frame instead
+ * of an older picture. */
+void Psyz_GpuInterpolationBackdrop(int x,int src_y,int dst_y,int w,int h);
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled);
 int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command

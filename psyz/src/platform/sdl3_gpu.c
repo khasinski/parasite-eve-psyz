@@ -254,12 +254,18 @@ static bool InterpEnsureTarget(void);
  * double buffers; UI packets are deliberately never registered. */
 #define INTERP_PAIRS 16384u
 #define INTERP_MAP 65536u
-typedef struct { const void *address; unsigned pair, serial, frame; } InterpAddress;
+typedef struct { const void *address; unsigned pair, serial, frame, flags; } InterpAddress;
 typedef struct {
     const void *a,*b;
     unsigned serial, frame, count;
     bool background;
     bool tagged; /* Psyz_GpuTagInterpolationPacket: a stable identity */
+    /* the midpoint drawn for the identity this frame, for a second packet
+     * of it in the same frame: 0 none, 1 at out */
+    unsigned out_mode;
+    float out[6][3];
+    unsigned motion_frame; /* frame of motion: its last paired move */
+    float motion[6][2];
     uint64_t signature;
     float position[6][3];
 } InterpPair;
@@ -350,6 +356,9 @@ static InterpAddress *InterpFindTagged(const void *packet) {
     return t&&t->serial&&t->frame==interp_frame&&interp_pairs[t->pair].serial==t->serial ? t : NULL;
 }
 void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id) {
+    Psyz_GpuTagInterpolationPacketFlags(packet,id,0);
+}
+void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long id,unsigned flags) {
     if(!interpolation_enabled||!packet)return;
     uint64_t mix=(uint64_t)id*0x9E3779B97F4A7C15ULL;
     unsigned h=(unsigned)(mix>>40)&(INTERP_MAP-1);
@@ -360,19 +369,29 @@ void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id) {
     if(!slot||interp_pairs[slot->pair].serial!=slot->serial){
         if(!slot)slot=free_slot?free_slot:&interp_ids[h];
         if(!interp_serial)interp_target_stale=true;
-        unsigned serial=++interp_serial;if(!serial)serial=++interp_serial;
-        unsigned index=serial&(INTERP_PAIRS-1);
+        /* a new identity takes the next pair that no identity drew in the
+         * last two frames, so the live ones keep their history */
+        unsigned serial,index;
+        for(unsigned tries=0;;++tries){
+            serial=++interp_serial;if(!serial)serial=++interp_serial;
+            index=serial&(INTERP_PAIRS-1);
+            const InterpPair *old=&interp_pairs[index];
+            if(tries>=64||!old->serial||!old->tagged||!old->frame||old->frame+1<interp_frame)break;
+        }
         interp_pairs[index]=(InterpPair){.serial=serial,.tagged=true};
         *slot=(InterpId){id,index,serial};
     }
     InterpMap(interp_tags,packet,slot->pair,slot->serial);
     InterpAddress *t=InterpFind(interp_tags,packet);
-    if(t)t->frame=interp_frame+1; /* drawn after the next BeginInterpolationFrame */
+    /* drawn after the next BeginInterpolationFrame; the flags are the
+     * packet's (one identity may be drawn twice, e.g. a tile listed twice) */
+    if(t){t->frame=interp_frame+1;t->flags=flags;}
 }
 void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to) {
     if(!interpolation_enabled)return;
     InterpAddress *t=InterpFindTagged(from);
-    if(t){InterpMap(interp_queue,to,t->pair,t->serial);return;}
+    if(t){const unsigned flags=t->flags;InterpMap(interp_queue,to,t->pair,t->serial);
+        InterpAddress *q=InterpFind(interp_queue,to);if(q)q->flags=flags;return;}
     InterpAddress *e=InterpFind(interp_addresses,from);
     if(e && interp_pairs[e->pair].serial==e->serial)
         InterpMap(interp_queue,to,e->pair,e->serial);
@@ -441,8 +460,16 @@ static bool InterpEnsureTarget(void) {
     interpolated_vram=candidate;interpolated_scale=internal_res;
     Psyz_GpuResetInterpolation();return true;
 }
+/* Primitives of the frames drawn: all, tagged with an identity, paired. */
+static unsigned interp_stat[3],interp_stat_last[3];
+void Psyz_GpuGetInterpolationStats(unsigned *primitives,unsigned *tagged,unsigned *paired) {
+    if(primitives)*primitives=interp_stat_last[0];
+    if(tagged)*tagged=interp_stat_last[1];
+    if(paired)*paired=interp_stat_last[2];
+}
 void Psyz_GpuBeginInterpolationFrame(void) {
     interp_matches=0;
+    memcpy(interp_stat_last,interp_stat,sizeof(interp_stat));memset(interp_stat,0,sizeof(interp_stat));
     ++interp_frame;if(!interp_frame){Psyz_GpuResetInterpolation();interp_frame=1;}
     if(!interpolation_enabled||!device||UseSoftwareBackend())return;
     if(!InterpEnsureTarget()){
@@ -462,6 +489,40 @@ void Psyz_GpuBeginInterpolationFrame(void) {
         }
     }
 }
+/* Psyz_GpuInterpolationBackdrop of the frame being drawn: a background
+ * fill of its rows (the game's DrawEnv clear) is followed by the copy. */
+static struct { int x, src_y, dst_y, w, h; unsigned frame; } interp_backdrop;
+static void InterpBackdropCopy(int x,int y,int w,int h) {
+    SDL_GPUCommandBuffer *cmd=AcquireCmd();
+    SDL_GPUCopyPass *copy=cmd?SDL_BeginGPUCopyPass(cmd):NULL;
+    if(!copy)return;
+    const unsigned r=internal_res;
+    const int src_y=interp_backdrop.src_y+(y-interp_backdrop.dst_y);
+    const SDL_GPUTextureLocation from={.texture=GetRenderTarget(),.x=(Uint32)x*r,.y=(Uint32)src_y*r},
+                                 to={.texture=interpolated_vram,.x=(Uint32)x*r,.y=(Uint32)y*r};
+    SDL_CopyGPUTextureToTexture(copy,&from,&to,(Uint32)w*r,(Uint32)h*r,1,false);
+    SDL_EndGPUCopyPass(copy);
+}
+static void InterpBackdropAfterFill(int x,int y,int w,int h) {
+    if(!interp_backdrop.frame||interp_backdrop.frame!=interp_frame||!interpolated_vram||
+       interpolated_scale!=internal_res||!interpolation_enabled)return;
+    const int x0=SDL_max(x,interp_backdrop.x),x1=SDL_min(x+w,interp_backdrop.x+interp_backdrop.w);
+    const int y0=SDL_max(y,interp_backdrop.dst_y),y1=SDL_min(y+h,interp_backdrop.dst_y+interp_backdrop.h);
+    if(x0<x1&&y0<y1)InterpBackdropCopy(x0,y0,x1-x0,y1-y0);
+}
+void Psyz_GpuInterpolationBackdrop(int x,int src_y,int dst_y,int w,int h) {
+    interp_backdrop.frame=0;
+
+    if(!interpolation_enabled||!device||UseSoftwareBackend()||!interpolated_vram||
+       interpolated_scale!=internal_res||!interp_serial||interp_target_stale)return;
+    if(x<0){w+=x;x=0;}
+    if(x+w>VRAM_W)w=VRAM_W-x;
+    if(w<=0||h<=0||src_y<0||dst_y<0||src_y+h>VRAM_H||dst_y+h>VRAM_H||src_y==dst_y)return;
+    Draw_FlushBuffer();
+    interp_backdrop.x=x;interp_backdrop.src_y=src_y;interp_backdrop.dst_y=dst_y;
+    interp_backdrop.w=w;interp_backdrop.h=h;interp_backdrop.frame=interp_frame;
+    InterpBackdropCopy(x,dst_y,w,h);
+}
 void Psyz_GpuSetInterpolationCamera(int x,int y) {
     interp_camera_previous=interp_camera_frame&&interp_camera_frame+1==interp_frame;
     int dx=x-interp_camera_x,dy=y-interp_camera_y;
@@ -478,40 +539,143 @@ void Psyz_GpuPrepareInterpolatedBlank(int next_y) {
     Psyz_GpuPrepareInterpolatedPresent(next_y);
     interp_blank_mid=interp_pair_ready;
 }
+/* Drawing the runs of a line (Draw_PushPrim): see InterpCapture. */
+static int interp_line_mode;
+#define INTERP_LINE_POINTS 6
+/* A line packet tagged for interpolation: records its points and, when the
+ * previous frame drew the same identity with as many points, returns the
+ * midpoint points (VRAM pixels relative to the drawing offset). A midpoint-
+ * only line (*own false) is not drawn into the frame. */
+static bool InterpLine(const u_long *words,int count,bool gouraud,int *mid_x,int *mid_y,bool *own,bool *own_only) {
+    *own=true;*own_only=false;
+    if(!interpolation_enabled||!interpolated_vram||interpolated_scale!=internal_res||
+       count<2||count>INTERP_LINE_POINTS)return false;
+    const void *packet=interpolation_packet_current;
+    ++interp_stat[0];
+    InterpAddress *e=InterpFind(interp_queue,packet);
+    if(!e)e=InterpFindTagged(packet);
+    if(!e)e=InterpFind(interp_addresses,packet);
+    if(!e||!e->serial)return false;
+    InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial||!p->tagged)return false;
+    ++interp_stat[1];
+    *own=!(e->flags&PSYZ_INTERP_MIDPOINT_ONLY);*own_only=(e->flags&PSYZ_INTERP_FRAME_ONLY)!=0;
+    float position[INTERP_LINE_POINTS][3];
+    const unsigned points=(unsigned)count|0x100u; /* never pairs with a polygon */
+    bool valid=p->frame&&p->frame+1==interp_frame&&p->count==points;
+    for(int i=0,at=0;i<count;i++){
+        if(i&&gouraud)at++;
+        position[i][0]=(float)s11(((const short*)&words[at])[0]);
+        position[i][1]=(float)s11(((const short*)&words[at])[1]);
+        position[i][2]=1.0f;
+        at++;
+        if(SDL_fabsf(position[i][0]-p->position[i][0])>160.0f||SDL_fabsf(position[i][1]-p->position[i][1])>160.0f)valid=false;
+        if(valid){mid_x[i]=(int)SDL_floorf((position[i][0]+p->position[i][0])*0.5f+0.5f);
+                  mid_y[i]=(int)SDL_floorf((position[i][1]+p->position[i][1])*0.5f+0.5f);}
+    }
+    memcpy(p->position,position,(size_t)count*sizeof(position[0]));p->frame=interp_frame;p->count=points;p->signature=0;
+    if(valid){++interp_stat[2];++interp_matches;}
+    return valid&&!*own_only;
+}
 static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     unsigned offset=(unsigned)(v-vertex_buf);
     memcpy(interpolated_vertices+offset,v,count*sizeof(*v));
     for(unsigned i=0;i<count;++i)if(!((geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0.0f))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
+    if(interp_line_mode){
+        /* runs of a line: 1 its own pose only, 2 the midpoint only, 3 both */
+        if(interp_line_mode!=3)for(unsigned i=0;i<count;++i){
+            Vertex *hide=interp_line_mode==1?&interpolated_vertices[offset+i]:&v[i];
+            hide->x=hide->y=-2048;hide->pgxp_pos[0]=hide->pgxp_pos[1]=-2048.0f;hide->pgxp_pos[2]=-1.0f;}
+        return;
+    }
     if(!interpolation_enabled||(!interpolated_vram&&interpolated_scale==internal_res)||count>6)return;
+    ++interp_stat[0];
+    /* PSYZ_INTERP_DEBUG=1 tints the midpoint's unpaired tagged primitives
+     * magenta, =2 also the untagged ones green. */
+    static int debug=-1;
+    if(debug<0){const char *d=SDL_getenv("PSYZ_INTERP_DEBUG");debug=d?SDL_atoi(d):0;}
     InterpAddress *e=InterpFind(interp_queue,packet);
     if(!e)e=InterpFindTagged(packet);
     if(!e)e=InterpFind(interp_addresses,packet);
+    if(debug>1&&(!e||!e->serial||interp_pairs[e->pair].serial!=e->serial))
+        for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->r=0;out->g=255;out->b=0;}
     if(!e||!e->serial)return;
     InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial)return;
+    const unsigned flags=p->tagged?e->flags:0;
+    const bool any_texture=(flags&PSYZ_INTERP_ANY_TEXTURE)!=0;
+    const bool midpoint_only=(flags&PSYZ_INTERP_MIDPOINT_ONLY)!=0;
+    const bool frame_only=(flags&PSYZ_INTERP_FRAME_ONLY)!=0;
     uint64_t signature=14695981039346656037ULL;
+    /* texture coordinates, CLUT and page of a textured primitive (an
+     * untextured one leaves them as whatever was drawn before it) */
     for(unsigned i=0;i<count;++i){const unsigned char *s=(const void *)&v[i].u;
-        for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
-    bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&p->signature==signature;
+        if(!(v[i].t&TPAGE_NOTEXTURE))for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
     float position[6][3];
     for(unsigned i=0;i<count;++i){bool projected=(geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0;
         float bias=(v[i].t&TPAGE_POLYGON)&&internal_res==1?0.5f:0.0f;
         position[i][0]=projected?v[i].pgxp_pos[0]:(float)v[i].x+bias;
         position[i][1]=projected?v[i].pgxp_pos[1]:(float)v[i].y+bias;
-        position[i][2]=projected?v[i].pgxp_pos[2]:1;
-        /* a tagged identity is the same face: it may move further */
-        const float limit=p->tagged?160.0f:32.0f;
+        position[i][2]=projected?v[i].pgxp_pos[2]:1;}
+    /* A second packet of an identity in the same frame (the game drew the
+     * same face twice): drawn as the first one was. */
+    if(p->tagged&&p->frame==interp_frame&&p->count==count&&!memcmp(p->position,position,count*sizeof(position[0]))){
+        for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
+            if(p->out_mode==1&&!frame_only){out->pgxp_pos[0]=p->out[i][0];out->pgxp_pos[1]=p->out[i][1];out->pgxp_pos[2]=p->out[i][2];}
+            else if(frame_only){out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048.0f;out->pgxp_pos[2]=-1.0f;}}
+        if(midpoint_only)for(unsigned i=0;i<count;++i){v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
+        return;
+    }
+    bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&(any_texture||p->signature==signature);
+    for(unsigned i=0;i<count;++i){
+        /* a tagged identity is the same face: it may move as far as the
+         * view reaches (vertices past the GTE's limit are handled below) */
+        const float limit=p->tagged?1024.0f:32.0f;
         if(SDL_fabsf(position[i][0]-p->position[i][0])>limit||SDL_fabsf(position[i][1]-p->position[i][1])>limit)valid=false;
     }
     /* An authored animation may switch to another tile entry this frame.
      * Keep that image intact, but move it with the same interpolated camera
      * as its static neighbours so patch boundaries cannot separate. */
     bool camera_fallback=!valid&&p->background&&interp_camera_previous;
-    if(valid||camera_fallback)++interp_matches;
-    if(valid||camera_fallback)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
-        out->pgxp_pos[0]=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0]+interp_camera_half_x;
-        out->pgxp_pos[1]=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1]+interp_camera_half_y;
-        out->pgxp_pos[2]=valid?2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]):position[i][2];}
+    /* A tagged primitive with a vertex at the GTE's screen limit crosses the
+     * view plane: that pose is not a projection. When it was paired the
+     * frame before, the midpoint continues its last motion from there. A
+     * midpoint-only one that does not pair is left out. */
+    bool clamped=midpoint_only&&!valid;
+    if(!valid&&!camera_fallback&&p->tagged)
+        for(unsigned i=0;i<count;++i)clamped|=v[i].x<=-1024||v[i].x>=1023||v[i].y<=-1024||v[i].y>=1023;
+    const bool extrapolated=clamped&&p->frame&&p->frame+1==interp_frame&&p->motion_frame==p->frame&&
+        p->count==count&&(any_texture||p->signature==signature);
+    if(p->tagged)++interp_stat[1];
+    if(valid||extrapolated)++interp_stat[2];
+    if(debug>0&&!valid&&!extrapolated&&p->tagged)
+        for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->r=255;out->g=0;out->b=255;}
+    if((valid||camera_fallback||extrapolated)&&!frame_only)++interp_matches;
+    p->out_mode=0;
+    for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
+        if(valid){
+            out->pgxp_pos[0]=(position[i][0]+p->position[i][0])*0.5f;
+            out->pgxp_pos[1]=(position[i][1]+p->position[i][1])*0.5f;
+            out->pgxp_pos[2]=2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]);
+        }else if(camera_fallback){
+            out->pgxp_pos[0]=position[i][0]+interp_camera_half_x;
+            out->pgxp_pos[1]=position[i][1]+interp_camera_half_y;
+            out->pgxp_pos[2]=position[i][2];
+        }else if(extrapolated){
+            out->pgxp_pos[0]=p->position[i][0]+p->motion[i][0]*0.5f;
+            out->pgxp_pos[1]=p->position[i][1]+p->motion[i][1]*0.5f;
+            out->pgxp_pos[2]=p->position[i][2];
+        }else if(clamped&&midpoint_only){
+            out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048.0f;out->pgxp_pos[2]=-1.0f;
+        }
+        if(valid||extrapolated){p->out[i][0]=out->pgxp_pos[0];p->out[i][1]=out->pgxp_pos[1];p->out[i][2]=out->pgxp_pos[2];p->out_mode=1;}
+    }
+    if(valid){
+        for(unsigned i=0;i<count;++i){p->motion[i][0]=position[i][0]-p->position[i][0];p->motion[i][1]=position[i][1]-p->position[i][1];}
+        p->motion_frame=interp_frame;
+    }else p->motion_frame=0;
     memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
+    if(frame_only)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048;out->pgxp_pos[2]=-1;}
+    if(midpoint_only)for(unsigned i=0;i<count;++i){
+        v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
 }
 
 /* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
@@ -1763,6 +1927,7 @@ static void MarkVramDirty(SDL_Rect r) {
 static void ResetVramDirty(void) { vram_dirty = (SDL_Rect){0, 0, 0, 0}; }
 
 // mirror a native VRAM region into the scaled render target
+static void InterpBackdropAfterFill(int x, int y, int w, int h);
 static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     if ((!scaled_vram_render && !interpolated_vram) || w <= 0 || h <= 0) {
         return;
@@ -1789,6 +1954,7 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     };
     SDL_BlitGPUTexture(cmd, &blit);
     }
+    InterpBackdropAfterFill(x, y, w, h);
 }
 
 static void ReleaseTransientDisplayTextures(void) {
@@ -2490,8 +2656,8 @@ static void PlatformBackend_Present(void) {
         !RefreshWindowSwapchain()) {
         can_present = false;
     }
-    if(ws_capture_active)interp_present_mid=false;
-    else {
+    /* a capture shows what the last present showed */
+    if(!ws_capture_active){
         interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
             interpolated_scale==internal_res&&interp_next_y>=0&&interp_next_y<=VRAM_H-display_size.y&&
             !display_rgb24&&
@@ -3091,6 +3257,24 @@ unsigned char* Psyz_VideoAllocScaledVramDump(int* w, int* h) {
     return rgba;
 }
 
+unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h);
+unsigned char* Psyz_VideoAllocMidpointFrame(int* w, int* h) {
+    if (w)
+        *w = 0;
+    if (h)
+        *h = 0;
+    if (!interpolation_enabled || !interpolated_vram || interpolated_scale != internal_res ||
+        !interp_serial || display_area.y < 0 || display_area.y > VRAM_H - display_size.y)
+        return NULL;
+    const bool mid = interp_present_mid;
+    const int next = interp_next_y;
+    interp_present_mid = true;
+    interp_next_y = display_area.y;
+    unsigned char* pixels = Psyz_VideoAllocRenderedFrame(w, h);
+    interp_present_mid = mid;
+    interp_next_y = next;
+    return pixels;
+}
 unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     if (w)
         *w = 0;
@@ -4452,6 +4636,13 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             lt |= TPAGE_DITHER;
         }
         const bool semi = (code & SEMITRANSP) != 0;
+        /* A line paired for the midpoint is drawn twice: its own pose only
+         * into the frame, the midpoint pose only into the midpoint target. */
+        int mid_x[INTERP_LINE_POINTS], mid_y[INTERP_LINE_POINTS];
+        bool own_line, own_only;
+        const bool mid_line = InterpLine(packets, count, isGouraud, mid_x, mid_y, &own_line, &own_only);
+        for (int pass = own_line ? 0 : 1; pass < (mid_line ? 2 : own_line ? 1 : 0); pass++) {
+        interp_line_mode = mid_line || own_only ? 1 + pass : 3;
         int x0 = 0, y0 = 0, r0 = v->r, g0 = v->g, b0 = v->b;
         int at = 0;
         for (int i = 0; i < count; i++) {
@@ -4462,13 +4653,15 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 b1 = ((u8*)&packets[at])[2];
                 at++;
             }
-            const int x1 = s11(((short*)&packets[at])[0]);
-            const int y1 = s11(((short*)&packets[at])[1]);
+            const int x1 = pass ? mid_x[i] : s11(((short*)&packets[at])[0]);
+            const int y1 = pass ? mid_y[i] : s11(((short*)&packets[at])[1]);
             at++;
             if (i)
                 DrawLinePixels(x0, y0, r0, g0, b0, x1, y1, r1, g1, b1, semi, lt);
             x0 = x1, y0 = y1, r0 = r1, g0 = g1, b0 = b1;
         }
+        }
+        interp_line_mode = 0;
         packets += length - 1;
         len -= length - 1;
     } else if (isTile) {

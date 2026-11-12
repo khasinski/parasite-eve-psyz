@@ -1643,11 +1643,17 @@ int Psyz_GpuGetFrameInterpolation(void){return 0;}
 int Psyz_GpuGetFrameInterpolationRequested(void){return 0;}
 float Psyz_GpuGetPresentedFps(void){return 0.0f;}
 unsigned long long Psyz_GpuGetInterpolatedPresentCount(void){return 0;}
+void Psyz_GpuGetInterpolationStats(unsigned *a,unsigned *b,unsigned *c){if(a)*a=0;if(b)*b=0;if(c)*c=0;}
+unsigned char *Psyz_VideoAllocMidpointFrame(int *w,int *h){if(w)*w=0;if(h)*h=0;return NULL;}
 void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b){(void)a;(void)b;}
 void Psyz_GpuCopyInterpolationPacket(const void *a,const void *b){(void)a;(void)b;}
 void Psyz_GpuResetInterpolation(void){}
 void Psyz_GpuBeginInterpolationFrame(void){}
 void Psyz_GpuPrepareInterpolatedPresent(int y){(void)y;}
+void Psyz_GpuPrepareInterpolatedBlank(int y){(void)y;}
+void Psyz_GpuInterpolationBackdrop(int x,int s,int d,int w,int h){(void)x;(void)s;(void)d;(void)w;(void)h;}
+void Psyz_GpuTagInterpolationPacket(const void *p,unsigned long long id){(void)p;(void)id;}
+void Psyz_GpuTagInterpolationPacketFlags(const void *p,unsigned long long id,unsigned f){(void)p;(void)id;(void)f;}
 
 void Psyz_GpuClearInterpolationPackets(void){}
 
