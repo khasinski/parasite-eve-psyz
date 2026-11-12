@@ -511,7 +511,7 @@ static void WaitForNextFrame(void) {
 }
 
 /* Frame timing statistics (PSYZ_FRAME_STATS=1 prints a summary every 500
- * presents; PSYZ_FRAME_LOG=file writes one line per present). Each blocking
+ * presents, =n every n; PSYZ_FRAME_LOG=file writes one line per present). Each blocking
  * VSync is split into the application's CPU time since the previous VSync
  * returned ("work"), the present call ("present") and the pacing wait; the
  * interval is the time between consecutive present calls. */
@@ -519,7 +519,7 @@ static void WaitForNextFrame(void) {
 static int frame_stats_mode = -1;
 static FILE* frame_stats_log;
 static Uint64 frame_stats_last_present, frame_stats_last_return;
-static unsigned frame_stats_count;
+static unsigned frame_stats_count, frame_stats_window;
 static float frame_stats_interval[FRAME_STATS_WINDOW];
 static float frame_stats_work[FRAME_STATS_WINDOW];
 static float frame_stats_present[FRAME_STATS_WINDOW];
@@ -549,6 +549,10 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
         const char* stats = SDL_getenv("PSYZ_FRAME_STATS");
         const char* log = SDL_getenv("PSYZ_FRAME_LOG");
         frame_stats_mode = stats && *stats && strcmp(stats, "0");
+        /* PSYZ_FRAME_STATS=n summarises every n presents (up to 500). */
+        frame_stats_window = stats ? (unsigned)atoi(stats) : 0;
+        if (frame_stats_window < 10 || frame_stats_window > FRAME_STATS_WINDOW)
+            frame_stats_window = FRAME_STATS_WINDOW;
         if (log && *log && (frame_stats_log = fopen(log, "w")))
             fprintf(frame_stats_log, "# present_ms interval_ms work_ms "
                                      "present_call_ms wait_ms passes\n");
@@ -575,7 +579,7 @@ static void FrameStatsRecord(Uint64 present_start, Uint64 present_end,
             frame_stats_work[frame_stats_count] = work;
             frame_stats_present[frame_stats_count] = present;
             frame_stats_batch[frame_stats_count] = (float)frame_stats_batches;
-            if (++frame_stats_count == FRAME_STATS_WINDOW) {
+            if (++frame_stats_count == frame_stats_window) {
                 INFOF("[Frame stats] %u presents, target %.3f ms, driver vsync %d",
                       frame_stats_count, target_frame_time_us / game_speed / 1000.0,
                       use_driver_vsync);

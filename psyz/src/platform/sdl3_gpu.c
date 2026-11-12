@@ -297,8 +297,12 @@ static void InterpMap(InterpAddress *map,const void *p,unsigned pair,unsigned se
     if(!e){e=&map[h];for(unsigned i=0;i<4;++i)if(!map[(h+i)&(INTERP_MAP-1)].address){e=&map[(h+i)&(INTERP_MAP-1)];break;}}
     *e=(InterpAddress){p,pair,serial};
 }
+/* Until the first pair the midpoint target is not drawn: it is refreshed
+ * from the render target at the next interpolation frame. */
+static bool interp_target_stale;
 void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b) {
     if(!a||!b)return;
+    if(!interp_serial)interp_target_stale=true;
     unsigned serial=++interp_serial;if(!serial)serial=++interp_serial;
     unsigned index=serial&(INTERP_PAIRS-1);
     interp_pairs[index]=(InterpPair){.a=a,.b=b,.serial=serial};
@@ -393,6 +397,17 @@ void Psyz_GpuBeginInterpolationFrame(void) {
         WARNF("60 Hz interpolation target unavailable; original 30 Hz presentation retained: %s",SDL_GetError());
         interpolation_enabled=false;Psyz_GpuResetInterpolation();
         Psyz_PgxpSetActive(!headless_renderer&&(set_geometry_correction||set_effect_geometry_correction||set_model_filtering));
+    }
+    else if(interp_target_stale){
+        Draw_FlushBuffer();
+        SDL_GPUCommandBuffer *cmd=AcquireCmd();
+        SDL_GPUCopyPass *copy=cmd?SDL_BeginGPUCopyPass(cmd):NULL;
+        if(copy){
+            const SDL_GPUTextureLocation from={.texture=GetRenderTarget()},to={.texture=interpolated_vram};
+            SDL_CopyGPUTextureToTexture(copy,&from,&to,VRAM_W*internal_res,VRAM_H*internal_res,1,false);
+            SDL_EndGPUCopyPass(copy);
+            interp_target_stale=false;
+        }
     }
 }
 void Psyz_GpuSetInterpolationCamera(int x,int y) {
@@ -4868,9 +4883,11 @@ void Draw_FlushBuffer(void) {
         ws_field && WidescreenDraw() ? WidescreenDrawPicture() : -1;
 
     /* Native VRAM is independently rasterized: gameplay readback and texture
-     * feedback must not depend on high-resolution sample positions. */
+     * feedback must not depend on high-resolution sample positions. The
+     * midpoint target is drawn once the application registered packet pairs
+     * (without them no midpoint can be presented). */
     for (unsigned target_index = 0;
-         target_index < (scaled_vram_render ? 2u : 1u) + (interpolation_enabled && interpolated_vram && interpolated_scale==internal_res ? 1u : 0u); ++target_index) {
+         target_index < (scaled_vram_render ? 2u : 1u) + (interpolation_enabled && interpolated_vram && interpolated_scale==internal_res && interp_serial ? 1u : 0u); ++target_index) {
         bool midpoint=interpolation_enabled&&interpolated_vram&&target_index==(scaled_vram_render?2u:1u);
         SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
         if(midpoint){
