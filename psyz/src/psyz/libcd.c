@@ -1485,9 +1485,9 @@ static int drive_ready_sector = -1; // sector the ready callback may fetch
 
 /* PS1 time of one poll of the drive in a busy loop: StGetNext and its retry
  * loop in a movie player (Ridge Racer Type 4 spins 4,000,000 polls on an
- * empty ring before its first read: 291 fields, 5.85 s, on DuckStation),
- * and the other drive queries. */
-#define ST_POLL_NS 1462
+ * empty ring before its first read: 5.83 s, 290 fields, on DuckStation
+ * without breakpoints, which slow its CPU), and the other drive queries. */
+#define ST_POLL_NS 1458
 #define CD_POLL_NS 2000
 
 // Sectors the current read has reached by `now` (0 while seeking).
