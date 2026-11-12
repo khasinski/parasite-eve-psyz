@@ -726,9 +726,14 @@ ZTEST(libcd, readn_in_rt_mode_leaves_the_data_path_idle) {
 /* Drive timing (the libcd suite otherwise runs with instant timing). These
  * run on the host clock; a frozen offline clock skips them. */
 static uint64_t timing_now_us(void) {
+#if defined(__psyz) && !defined(__PSP__)
+    // SDL's monotonic clock: the MSVC runtime has no clock_gettime.
+    return SDL_GetTicksNS() / 1000;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+#endif
 }
 
 // Polls CdReady(1) for the next sector; returns 0 after 3 s without (a
