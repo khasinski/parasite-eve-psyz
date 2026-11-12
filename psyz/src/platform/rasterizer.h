@@ -15,6 +15,7 @@ typedef struct {
     void (*offset)(int x, int y);
     int (*horizontal_grid)(unsigned int source, unsigned int target);
     void (*mask)(int set, int preserve);
+    void (*clear_cache)(void);
     void (*clear_image)(PS1_RECT* rect, u_char r, u_char g, u_char b);
     void (*load_image)(PS1_RECT* rect, u_long* data);
     void (*store_image)(PS1_RECT* rect, u_long* data);

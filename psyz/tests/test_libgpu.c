@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -1818,19 +1819,7 @@ ZTEST(gpu, drawenv_clear_vram) {
  * GP0 02h fill rounding to 16 pixels. The golden frame is DuckStation's
  * software GPU replaying this test's GP0 commands: PSYZ_TEST_GPU_DUMP=file
  * records them as a GPUDUMP file for duckstation-regtest. */
-ZTEST(gpu, native_rasterization_matches_ps1_gpu) {
-    zskip_targets("psp");
-    u_short tpage, clut;
-    if (LoadTim(img_4bpp, &tpage, &clut)) {
-        return;
-    }
-#if defined(__psyz) && !defined(__PSP__)
-    Psyz_VideoSetNativeRasterizer(1);
-    VSync(0); /* the SDL GPU backend switches rasterizers at a present */
-    const char* dump = getenv("PSYZ_TEST_GPU_DUMP");
-    if (dump && *dump)
-        Psyz_GpuDumpBegin(dump);
-#endif
+static void DrawRasterizationScene(u_short tpage, u_short clut) {
     ClearImage(&cdb->draw.clip, 60, 120, 120);
     DR_MODE mode;
     SetDrawMode(&mode, 0, 1, tpage, NULL); /* dithering on */
@@ -1917,6 +1906,22 @@ ZTEST(gpu, native_rasterization_matches_ps1_gpu) {
     DrawPrim(&f3);
     RECT fill = {5, 222, 20, 10}; /* the GPU fills x 0..31 */
     ClearImage(&fill, 250, 250, 250);
+}
+
+ZTEST(gpu, native_rasterization_matches_ps1_gpu) {
+    zskip_targets("psp");
+    u_short tpage, clut;
+    if (LoadTim(img_4bpp, &tpage, &clut)) {
+        return;
+    }
+#if defined(__psyz) && !defined(__PSP__)
+    Psyz_VideoSetNativeRasterizer(1);
+    VSync(0); /* the SDL GPU backend switches rasterizers at a present */
+    const char* dump = getenv("PSYZ_TEST_GPU_DUMP");
+    if (dump && *dump)
+        Psyz_GpuDumpBegin(dump);
+#endif
+    DrawRasterizationScene(tpage, clut);
     DrawSync(0);
 #if defined(__psyz) && !defined(__PSP__)
     if (dump && *dump)
@@ -1928,6 +1933,21 @@ ZTEST(gpu, native_rasterization_matches_ps1_gpu) {
 #if defined(__psyz) && !defined(__PSP__)
     Psyz_VideoSetNativeRasterizer(0);
 #endif
+}
+
+/* The same scene drawn by the SDL GPU rasterizer at 1x matches the PS1 GPU
+ * frame too (under PSYZ_HEADLESS=1 it is the CPU rasterizer again). */
+ZTEST(gpu, sdl_gpu_rasterization_matches_ps1_gpu) {
+    zskip_targets("psp");
+    u_short tpage, clut;
+    if (LoadTim(img_4bpp, &tpage, &clut)) {
+        return;
+    }
+    DrawRasterizationScene(tpage, clut);
+    DrawSync(0);
+    VSync(0);
+    PutDispEnv(&cdb->disp);
+    ASSERT_FRAME("native_rasterization", 0, 1.0f);
 }
 
 ZTEST(gpu, move_image) {
@@ -3422,4 +3442,324 @@ ZTEST(gpu, ps1_polygon_attribute_gradients) {
         zexpect_u32_eq(144, test);
     }
     zassert_s32_eq(0, Psyz_VideoSetInternalResolution(1));
+}
+
+/* ===== GPU rules shared by every rasterizer ===== */
+
+static void SubmitGP0(const u32* words, int count) {
+    for (int i = 0; i < count; i++)
+        Psyz_GpuWriteGP0(words[i]);
+    Psyz_GpuExeque();
+}
+
+static u16 ReadPixel(int x, int y) {
+    RECT r = {(short)x, (short)y, 1, 1};
+    u16 pixel = 0;
+    StoreImage(&r, (u_long*)&pixel);
+    DrawSync(0);
+    return pixel;
+}
+
+/* GP0 E6h: "set mask" forces bit 15 of every pixel drawn or transferred;
+ * "check mask" keeps pixels whose bit 15 is set, for opaque and
+ * semi-transparent primitives, uploads and copies. Fills ignore both. */
+ZTEST(gpu, mask_bit_set_and_check) {
+    zskip_targets("psp");
+    RECT area = {0, 300, 64, 16};
+    ClearImage(&area, 0, 0, 0);
+    DrawSync(0);
+    const u32 draw_all[] = {0xE3000000, 0xE4000000 | (511 << 10) | 1023,
+                            0xE5000000, 0xE1000000};
+    SubmitGP0(draw_all, 4);
+    const u32 set_red[] = {0xE6000001, 0x600000F8, (300u << 16) | 0, (4u << 16) | 8};
+    SubmitGP0(set_red, 4); /* x 0..7 red, masked */
+    const u32 check_green[] = {0xE6000002, 0x6000F800, (300u << 16) | 4,
+                               (4u << 16) | 8};
+    SubmitGP0(check_green, 4); /* x 4..11: only 8..11 drawn */
+    const u32 check_semi[] = {0xE6000002, 0x62F80000, (300u << 16) | 0,
+                              (4u << 16) | 16};
+    SubmitGP0(check_semi, 4); /* blue, B/2 + F/2 over x 8..15 only */
+    zexpect_u16_eq(0x801F, ReadPixel(2, 301));
+    zexpect_u16_eq(0x801F, ReadPixel(6, 301));
+    zexpect_u16_eq(0x3DE0, ReadPixel(9, 301)); /* (green + blue) / 2 */
+    zexpect_u16_eq(0x3C00, ReadPixel(13, 301)); /* (black + blue) / 2 */
+    /* an opaque triangle pair over masked and unmasked pixels */
+    const u32 check_quad[] = {0xE6000002, 0x2800FF00, (304u << 16) | 0,
+                              (304u << 16) | 16, (308u << 16) | 0,
+                              (308u << 16) | 16};
+    const u32 set_left[] = {0xE6000001, 0x60FFFFFF, (304u << 16) | 0,
+                            (4u << 16) | 4};
+    SubmitGP0(set_left, 4);
+    SubmitGP0(check_quad, 6);
+    zexpect_u16_eq(0xFFFF, ReadPixel(1, 305));
+    zexpect_u16_eq(0x03E0, ReadPixel(9, 305));
+    /* uploads and copies under set and check mask */
+    u16 data[4] = {0x1111, 0x2222, 0x3333, 0x4444};
+    RECT upload = {0, 306, 4, 1};
+    const u32 unmask[] = {0xE6000000};
+    SubmitGP0(unmask, 1);
+    LoadImage(&upload, (u_long*)data);
+    DrawSync(0);
+    const u32 both[] = {0xE6000003};
+    SubmitGP0(both, 1);
+    u16 again[4] = {0x0001, 0x0002, 0x0003, 0x0004};
+    LoadImage(&upload, (u_long*)again);
+    DrawSync(0);
+    zexpect_u16_eq(0x8001, ReadPixel(0, 306)); /* written with bit 15 */
+    LoadImage(&upload, (u_long*)data);
+    DrawSync(0);
+    zexpect_u16_eq(0x8001, ReadPixel(0, 306)); /* now masked: kept */
+    const u32 set_only[] = {0xE6000001};
+    SubmitGP0(set_only, 1);
+    RECT from = {0, 306, 4, 1};
+    MoveImage(&from, 8, 306);
+    DrawSync(0);
+    zexpect_u16_eq(0x8001, ReadPixel(8, 306));
+    zexpect_u16_eq(0x8002, ReadPixel(9, 306));
+    /* a fill ignores the mask settings and clears bit 15 */
+    RECT fill = {0, 306, 16, 1};
+    ClearImage(&fill, 8, 0, 0);
+    DrawSync(0);
+    zexpect_u16_eq(0x0001, ReadPixel(0, 306));
+    SubmitGP0(unmask, 1);
+}
+
+/* A textured primitive loads the GPU's CLUT cache only when its CLUT (or
+ * the 8-bit depth) changes; GP0 01h, which LoadImage sends, invalidates it.
+ * A copy over the cached palette is not seen until then. */
+ZTEST(gpu, clut_cache_reloads_on_change_or_clear) {
+    zskip_targets("psp");
+    u16 texel = 0x1111; /* four 4-bit texels of index 1 */
+    RECT page = {640, 0, 1, 1};
+    LoadImage(&page, (u_long*)&texel);
+    u16 red[16] = {0, 0x001F}, green[16] = {0, 0x03E0};
+    RECT clut_a = {0, 480, 16, 1}, clut_b = {16, 480, 16, 1};
+    LoadImage(&clut_a, (u_long*)red);
+    LoadImage(&clut_b, (u_long*)green);
+    DrawSync(0);
+    const u32 state[] = {0xE3000000, 0xE4000000 | (511 << 10) | 1023,
+                         0xE5000000, 0xE6000000,
+                         0xE1000000 | (u32)getTPage(0, 0, 640, 0)};
+    SubmitGP0(state, 5);
+    const u32 clut = (u32)GetClut(0, 480) << 16;
+    const u32 sprite0[] = {0x7C808080, (310u << 16) | 0, clut | 0};
+    SubmitGP0(sprite0, 3); /* loads CLUT A: red */
+    RECT from = {16, 480, 16, 1};
+    MoveImage(&from, 0, 480); /* GP0 80h: the cache keeps red */
+    DrawSync(0);
+    const u32 sprite1[] = {0x7C808080, (310u << 16) | 16, clut | 0};
+    SubmitGP0(sprite1, 3);
+    const u32 clear[] = {0x01000000};
+    SubmitGP0(clear, 1);
+    const u32 sprite2[] = {0x7C808080, (310u << 16) | 32, clut | 0};
+    SubmitGP0(sprite2, 3);
+    zexpect_u16_eq(0x001F, ReadPixel(1, 310));
+    zexpect_u16_eq(0x001F, ReadPixel(17, 310));
+    zexpect_u16_eq(0x03E0, ReadPixel(33, 310));
+}
+
+/* GP0 48h..5Fh with bit 3 are polylines of any length up to the terminator
+ * (w & 0xF000F000) == 0x50005000; without bit 3 a line has two vertices and
+ * no terminator, whatever bit 2. */
+ZTEST(gpu, polylines_run_to_the_terminator) {
+    zskip_targets("psp");
+    RECT area = {0, 320, 64, 32};
+    ClearImage(&area, 0, 0, 0);
+    DrawSync(0);
+    const u32 state[] = {0xE3000000, 0xE4000000 | (511 << 10) | 1023,
+                         0xE5000000, 0xE1000000, 0xE6000000};
+    SubmitGP0(state, 5);
+    const u32 words[] = {
+        0x4800FF00,          (320u << 16) | 0, (320u << 16) | 10,
+        (330u << 16) | 10,   (330u << 16) | 20, (340u << 16) | 20,
+        0x55555555,
+        0x440000FF,          (345u << 16) | 0, (345u << 16) | 5,
+        0x40FF0000,          (348u << 16) | 0, (348u << 16) | 5};
+    SubmitGP0(words, LEN(words));
+    zexpect_u16_eq(0x03E0, ReadPixel(0, 320));
+    zexpect_u16_eq(0x03E0, ReadPixel(10, 325));
+    zexpect_u16_eq(0x03E0, ReadPixel(15, 330));
+    zexpect_u16_eq(0x03E0, ReadPixel(20, 335));
+    zexpect_u16_eq(0x03E0, ReadPixel(20, 340));
+    zexpect_u16_eq(0x001F, ReadPixel(3, 345));
+    zexpect_u16_eq(0x7C00, ReadPixel(3, 348));
+}
+
+/* Deterministic random GP0 streams (polygons, lines, rectangles, fills,
+ * copies and drawing state, including masks, texture windows, offsets that
+ * wrap and VRAM-edge pages) drawn over random VRAM. Textures and CLUTs stay
+ * in rows 0..255 and drawing in rows 256..511, so no primitive reads what
+ * it draws itself. */
+static u32 Lcg(u32* state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state >> 8;
+}
+
+static void RasterStream(u32 seed, u16* vram) {
+    u32 r = seed * 7919u + 1;
+    RECT all = {0, 0, 1024, 512};
+    for (int i = 0; i < 1024 * 512; i++)
+        vram[i] = (u16)(Lcg(&r) ^ (Lcg(&r) << 8));
+    LoadImage(&all, (u_long*)vram);
+    DrawSync(0);
+    const u32 reset[] = {0x01000000, 0xE1000000, 0xE2000000, 0xE3040000,
+                         0xE4000000 | (511 << 10) | 1023, 0xE5000000,
+                         0xE6000000};
+    SubmitGP0(reset, LEN(reset));
+    u32 w[32];
+    int queued = 0;
+    for (int command = 0; command < 300; command++) {
+        int n = 0;
+        u32 kind = Lcg(&r) % 100;
+        if (kind < 10) {
+            switch (Lcg(&r) % 6) {
+            case 0: w[n++] = 0xE1000000 | (Lcg(&r) & 0x7FF); break;
+            case 1: w[n++] = 0xE2000000 | (Lcg(&r) % 3 ? 0 : Lcg(&r) & 0xFFFFF); break;
+            case 2: w[n++] = 0xE3000000 | (Lcg(&r) % 1024) | ((256 + Lcg(&r) % 256) << 10); break;
+            case 3: w[n++] = 0xE4000000 | (Lcg(&r) % 1024) | ((256 + Lcg(&r) % 256) << 10); break;
+            case 4: w[n++] = 0xE5000000 | (Lcg(&r) & 0x3FFFFF); break;
+            default: w[n++] = 0xE6000000 | (Lcg(&r) & 3); break;
+            }
+        } else if (kind < 13) {
+            w[n++] = 0xE3040000;
+            w[n++] = 0xE4000000 | (511 << 10) | 1023;
+        } else if (kind < 55) {
+            const u32 code = 0x20 | (Lcg(&r) & 31);
+            const int count = code & 8 ? 4 : 3;
+            static const int spreads[] = {3, 20, 80, 300, 700};
+            const int spread = spreads[Lcg(&r) % 5];
+            const int cx = (int)(Lcg(&r) % 1100) - 100, cy = (int)(Lcg(&r) % 700) - 100;
+            w[n++] = (code << 24) | (Lcg(&r) & 0xFFFFFF);
+            for (int v = 0; v < count; v++) {
+                if ((code & 0x10) && v)
+                    w[n++] = Lcg(&r) & 0xFFFFFF;
+                const int x = cx + (int)(Lcg(&r) % (2 * spread)) - spread;
+                const int y = cy + (int)(Lcg(&r) % (2 * spread)) - spread;
+                w[n++] = ((u32)x & 0x7FF) | (((u32)y & 0x7FF) << 16);
+                if (code & 4) {
+                    u32 high = Lcg(&r) & 0xFFFF;
+                    if (v == 0) /* CLUT in rows 0..255 */
+                        high = (Lcg(&r) % 64) | ((Lcg(&r) % 256) << 6);
+                    if (v == 1) /* page in rows 0..255 */
+                        high = (Lcg(&r) % 16) | ((Lcg(&r) % 4) << 5) |
+                               ((Lcg(&r) % 3) << 7);
+                    w[n++] = (Lcg(&r) & 0xFFFF) | (high << 16);
+                }
+            }
+        } else if (kind < 70) {
+            const u32 code = 0x40 | (Lcg(&r) & 31);
+            static const int spreads[] = {1, 10, 100, 500};
+            const int spread = spreads[Lcg(&r) % 4];
+            const int count = code & 8 ? (code & 0x10 ? 2 : 3) + (int)(Lcg(&r) % 4) : 2;
+            const int cx = (int)(Lcg(&r) % 1100) - 100, cy = (int)(Lcg(&r) % 700) - 100;
+            w[n++] = (code << 24) | (Lcg(&r) & 0xFFFFFF);
+            for (int v = 0; v < count; v++) {
+                if ((code & 0x10) && v)
+                    w[n++] = Lcg(&r) & 0xFFFFFF;
+                const int x = cx + (int)(Lcg(&r) % (2 * spread)) - spread;
+                const int y = cy + (int)(Lcg(&r) % (2 * spread)) - spread;
+                w[n++] = ((u32)x & 0x7FF) | (((u32)y & 0x7FF) << 16);
+            }
+            if (code & 8)
+                w[n++] = 0x55555555;
+        } else if (kind < 90) {
+            const u32 code = 0x60 | (Lcg(&r) & 31);
+            w[n++] = (code << 24) | (Lcg(&r) & 0xFFFFFF);
+            w[n++] = Lcg(&r) % 5 ? ((Lcg(&r) % 1050) | ((Lcg(&r) % 570) << 16))
+                                 : (Lcg(&r) & 0x07FF07FF);
+            if (code & 4)
+                w[n++] = (Lcg(&r) & 0xFFFF) |
+                         (((Lcg(&r) % 64) | ((Lcg(&r) % 256) << 6)) << 16);
+            if (!(code & 0x18))
+                w[n++] = (1 + Lcg(&r) % 300) | ((1 + Lcg(&r) % 200) << 16);
+        } else if (kind < 95) {
+            w[n++] = 0x02000000 | (Lcg(&r) & 0xFFFFFF);
+            w[n++] = (Lcg(&r) % 1024) | ((Lcg(&r) % 512) << 16);
+            w[n++] = (1 + Lcg(&r) % 200) | ((1 + Lcg(&r) % 200) << 16);
+        } else {
+            w[n++] = 0x80000000;
+            w[n++] = (Lcg(&r) % 1024) | ((Lcg(&r) % 512) << 16);
+            w[n++] = (Lcg(&r) % 1024) | ((Lcg(&r) % 512) << 16);
+            w[n++] = (1 + Lcg(&r) % 128) | ((1 + Lcg(&r) % 128) << 16);
+            w[n++] = 0x01000000;
+        }
+        for (int i = 0; i < n; i++)
+            Psyz_GpuWriteGP0(w[i]);
+        queued += n;
+        if (queued > 2000) {
+            Psyz_GpuExeque();
+            queued = 0;
+        }
+    }
+    Psyz_GpuExeque();
+    const u32 unmask[] = {0xE6000000, 0xE3000000,
+                          0xE4000000 | (511 << 10) | 1023, 0xE5000000};
+    SubmitGP0(unmask, LEN(unmask));
+    StoreImage(&all, (u_long*)vram);
+    DrawSync(0);
+}
+
+static int CountDifferences(const u16* a, const u16* b, int* first) {
+    int n = 0;
+    *first = -1;
+    for (int i = 0; i < 1024 * 512; i++) {
+        if (a[i] != b[i]) {
+            if (*first < 0)
+                *first = i;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The SDL GPU rasterizer draws these streams exactly like the CPU
+ * rasterizer (which matches the PS1 GPU) at 1x, and at Nx the first target
+ * pixel of every VRAM pixel's NxN block is that 1x result, while the native
+ * VRAM it keeps for read-backs stays the 1x result. */
+ZTEST(gpu, sdl_gpu_rasterizer_matches_cpu_rasterizer_at_every_scale) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        zskip("requires SDL GPU");
+    static u16 cpu[1024 * 512], gpu[1024 * 512];
+    for (u32 seed = 1; seed <= 3; seed++) {
+        Psyz_VideoSetNativeRasterizer(1);
+        VSync(0);
+        RasterStream(seed, cpu);
+        Psyz_VideoSetNativeRasterizer(0);
+        VSync(0);
+        for (unsigned scale = 1; scale <= 3; scale++) {
+            zassert_s32_eq(0, Psyz_VideoSetInternalResolution(scale));
+            VSync(0);
+            RasterStream(seed, gpu);
+            int first, n = CountDifferences(cpu, gpu, &first);
+            if (n)
+                fprintf(stderr, "seed %u %ux: %d pixels differ, first (%d,%d) cpu %04x gpu %04x\n",
+                        seed, scale, n, first % 1024, first / 1024, cpu[first], gpu[first]);
+            zexpect_s32_eq(0, n);
+            int w, h;
+            unsigned char* rgba = Psyz_VideoAllocScaledVramDump(&w, &h);
+            zassert_ptr_ne(NULL, rgba);
+            zexpect_s32_eq(1024 * (int)scale, w);
+            zexpect_s32_eq(512 * (int)scale, h);
+            for (int i = 0; i < 1024 * 512; i++) {
+                const unsigned char* p =
+                    rgba + ((size_t)(i / 1024) * scale * w + (size_t)(i % 1024) * scale) * 4;
+                gpu[i] = (u16)(((p[0] * 31 + 127) / 255) |
+                               (((p[1] * 31 + 127) / 255) << 5) |
+                               (((p[2] * 31 + 127) / 255) << 10) |
+                               (p[3] > 127 ? 0x8000 : 0));
+            }
+            free(rgba);
+            n = CountDifferences(cpu, gpu, &first);
+            if (n)
+                fprintf(stderr, "seed %u %ux decimated: %d pixels differ, first (%d,%d)\n",
+                        seed, scale, n, first % 1024, first / 1024);
+            zexpect_s32_eq(0, n);
+        }
+    }
+    zassert_s32_eq(0, Psyz_VideoSetInternalResolution(1));
+#else
+    zskip("requires SDL GPU");
+#endif
 }

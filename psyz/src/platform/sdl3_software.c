@@ -204,7 +204,30 @@ static bool WritePixel(int x,int y,u16 src,bool semi,int abr) {
     return WritePixelSource(x,y,src,semi,abr,NULL);
 }
 
+/* The GPU's CLUT cache (Draw_ClearCache): the palette of the textured
+ * primitive that last loaded it. */
+static u16 clut_cache[256];
+static u32 clut_cache_reg = 0xFFFFFFFFu;
+static bool clut_cache_8bit;
+
+static void ClutCacheUpdate(u16 tpage, u16 clut) {
+    const int depth = (tpage >> 7) & 3;
+    if (depth >= 2 || (clut == clut_cache_reg && (depth == 0 || clut_cache_8bit)))
+        return;
+    clut_cache_reg = clut;
+    clut_cache_8bit = depth == 1;
+    const int cx = (clut & 0x3f) * 16, cy = (clut >> 6) & 511;
+    for (int i = 0; i < (depth ? 256 : 16); i++)
+        clut_cache[i] = vram[cy * VRAM_W + ((cx + i) & 1023)];
+}
+
+static void Software_ClearCache(void) {
+    clut_cache_reg = 0xFFFFFFFFu;
+    clut_cache_8bit = false;
+}
+
 static u16 SampleTexture(int u, int v, u16 tpage, u16 clut) {
+    (void)clut;
     u = ((u & twin_and_x) | twin_or_x) & 0xff;
     v = ((v & twin_and_y) | twin_or_y) & 0xff;
     int tx = (tpage & 0xf) * 64;
@@ -212,17 +235,11 @@ static u16 SampleTexture(int u, int v, u16 tpage, u16 clut) {
     int depth = (tpage >> 7) & 3;
     if (depth == 0) {
         u16 packed = vram[ty * VRAM_W + ((tx + u / 4) & 1023)];
-        int index = (packed >> ((u & 3) * 4)) & 15;
-        int cx = ((clut & 0x3f) * 16 + index) & 1023;
-        int cy = (clut >> 6) & 511;
-        return vram[cy * VRAM_W + cx];
+        return clut_cache[(packed >> ((u & 3) * 4)) & 15];
     }
     if (depth == 1) {
         u16 packed = vram[ty * VRAM_W + ((tx + u / 2) & 1023)];
-        int index = (packed >> ((u & 1) * 8)) & 255;
-        int cx = ((clut & 0x3f) * 16 + index) & 1023;
-        int cy = (clut >> 6) & 511;
-        return vram[cy * VRAM_W + cx];
+        return clut_cache[(packed >> ((u & 1) * 8)) & 255];
     }
     return vram[ty * VRAM_W + ((tx + u) & 1023)];
 }
@@ -776,6 +793,7 @@ static void Software_Reset(void) {
     draw_area_start = (Point){0, 0};
     draw_area_end = (Point){VRAM_W - 1, VRAM_H - 1};
     set_mask_bit = preserve_masked = false;
+    Software_ClearCache();
 }
 
 static void Software_SetTexpageMode(ParamDrawTexpageMode* p) {
@@ -919,12 +937,12 @@ static int Software_PushPrim(u_long* words, int max_len) {
     bool supported_line=code==0x40 || code==0x42 || code==0x48 || code==0x4a ||
         code==0x4c || code==0x4e || code==0x50 || code==0x52 ||
         code==0x58 || code==0x5a || code==0x5c || code==0x5e;
+    int line_length = 0, line_points = 0;
+    if ((code & 0xe0) == 0x40)
+        line_points = Draw_LineVertices(words, max_len, &line_length);
     if(supported_line) {
-        int points=((code>>2)&3)+1;if(points==1)points=2;
-        bool padding=(code&0x0c)!=0;
-        int required=1+points+(points-1)*((code&0x10)!=0)+padding;
-        if(max_len<required || (padding && words[required-1]!=0x55555555u)) {
-            Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();return max_len<required?max_len:required;
+        if(line_length>max_len || line_points<2) {
+            Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();
         }
         if(grid_source!=grid_target)Pe2Reject(&raster2x);
     }
@@ -974,6 +992,7 @@ static int Software_PushPrim(u_long* words, int max_len) {
             /* A textured polygon's page (bits 0-8) becomes the GPU's drawing
              * mode, as an E1h command would set it: later sprites use it. */
             cur_tpage = (u16)((cur_tpage & ~0x1ff) | (tpage & 0x1ff));
+            ClutCacheUpdate(tpage, clut);
         }
         if (!NativeTriangleCulled(&v[0], &v[1], &v[2]))
             RasterTriangle(v[0], v[1], v[2], textured, raw_texture, semi,
@@ -985,32 +1004,23 @@ static int Software_PushPrim(u_long* words, int max_len) {
         return at;
     }
     if (line) {
-        int points = ((code >> 2) & 3) + 1;
-        bool padding = points != 1;
-        if (points == 1) {
-            points = 2;
-        }
-        int required = 1 + points + (points - 1) * gouraud + padding;
-        if (max_len < required) {
+        /* two vertices, or a polyline up to its terminator */
+        if (line_length > max_len) {
             Pe2Reject(&raster2x); SoftwareRasterizer_WideReject();
             return max_len;
         }
         SwVertex prev = {0};
         u32 color = words[0];
-        for (int i = 0; i < points && at < max_len; i++) {
+        for (int i = 0; i < line_points; i++) {
+            if (gouraud && i)
+                color = words[at++];
             SwVertex cur = VertexXY(words[at++], color);
             if (i) {
                 DrawLine(prev, cur, semi, cur_tpage);
             }
             prev = cur;
-            if (gouraud && i + 1 < points && at < max_len) {
-                color = words[at++];
-            }
         }
-        if (padding && at < max_len) {
-            at++;
-        }
-        return at;
+        return line_length;
     }
     if ((code & 0x60) == 0x60) {
         int required = 2 + textured + ((code & 0x18) == 0);
@@ -1029,6 +1039,7 @@ static int Software_PushPrim(u_long* words, int max_len) {
             u = uv & 0xff;
             v = (uv >> 8) & 0xff;
             clut = uv >> 16;
+            ClutCacheUpdate(cur_tpage, clut);
         }
         int w, h;
         switch (code & ~3) {
@@ -1075,6 +1086,7 @@ const u16* SoftwareRasterizer_GetVram(void) { return vram; }
 
 void SoftwareRasterizer_SetVram(const u16* pixels) {
     SoftwareRasterizer_Reject2x();
+    Software_ClearCache();
     memcpy(vram, pixels, sizeof(vram));
 }
 
@@ -1091,6 +1103,7 @@ const DrawBackend software_rasterizer = {
     .offset = Software_SetOffset,
     .horizontal_grid = Software_SetHorizontalGrid,
     .mask = Software_SetMask,
+    .clear_cache = Software_ClearCache,
     .clear_image = Software_ClearImage,
     .load_image = Software_LoadImage,
     .store_image = Software_StoreImage,

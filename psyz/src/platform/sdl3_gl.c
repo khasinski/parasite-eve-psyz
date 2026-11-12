@@ -805,6 +805,30 @@ unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
     return AllocRgb888FboRegion(vram_fbo, 0, 0, VRAM_W, VRAM_H);
 }
 
+unsigned char* Psyz_VideoAllocScaledVramDump(int* w, int* h) {
+    *w = *h = 0;
+    if (!InitPlatform())
+        return NULL;
+    Draw_FlushBuffer();
+    GLuint fbo = internal_res > 1 && scaled_vram_fbo ? scaled_vram_fbo : vram_fbo;
+    int width = VRAM_W * (fbo == vram_fbo ? 1 : (int)internal_res);
+    int height = VRAM_H * (fbo == vram_fbo ? 1 : (int)internal_res);
+    u8* rgba = fbo ? malloc((size_t)width * height * 4) : NULL;
+    if (!rgba)
+        return NULL;
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    if (glGetError() != GL_NO_ERROR) {
+        free(rgba);
+        return NULL;
+    }
+    *w = width;
+    *h = height;
+    return rgba;
+}
+
 unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     if (w)
         *w = 0;
@@ -946,6 +970,8 @@ static void ApplyDisplayPendingChanges() {
 }
 
 void Draw_Reset() { NOT_IMPLEMENTED; }
+/* CLUTs are read from the VRAM as it is when the batch is drawn */
+void Draw_ClearCache(void) {}
 
 void Draw_DisplayEnable(unsigned int on) {
     disp_on = on;

@@ -421,6 +421,21 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h);
  */
 unsigned char* Psyz_VideoAllocVramDump(int* w, int* h);
 
+/**
+ * @brief Dump the whole drawn video memory at the internal resolution
+ *
+ * The VRAM as the backend rasterized it at the internal resolution, row by
+ * row from the top: (1024 * n) x (512 * n) pixels of RGBA8888 where alpha is
+ * the mask bit (0 or 255). At 1x, or on a backend without an upscaled
+ * target, this is the native VRAM. Meant for tests and tools comparing the
+ * upscaled rasterization with the native one.
+ *
+ * @param w Output width
+ * @param h Output height
+ * @return NULL on failure, or RGBA8888 buffer to be destroyed with free(ptr)
+ */
+unsigned char* Psyz_VideoAllocScaledVramDump(int* w, int* h);
+
 /* Native application-owned teardown runs after GPU retirement, before SDL teardown. */
 #ifdef PE_PS5_GPU_NATIVE
 void Psyz_VideoSetShutdownCallback(void (*callback)(void));

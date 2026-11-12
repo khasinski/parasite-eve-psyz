@@ -37,6 +37,13 @@ typedef struct {
     float pgxp_pos[3];
     float uv_bounds[4];
     float hd_uv[3];
+    /* Exact PS1 polygon (exact[0][3] != 0): the vertex is a corner of the
+     * triangle's bounding box and the fragment shader decides coverage and
+     * evaluates the attributes with the GPU's integer arithmetic.
+     * exact[0] = triangle vertices (x | y << 16, VRAM coordinates), flag;
+     * exact[1..3] = U, V, R, G at VRAM (0, 0), per X, per Y (12.12, mod
+     * 2^32); exact[4] = B at (0, 0), per X, per Y. */
+    unsigned int exact[5][4];
 } Vertex;
 
 #ifdef PSYZ_CAPTURE_INTERPOLATION
@@ -66,6 +73,7 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count);
 #define TRIANGLE 0x20
 
 static u_short cur_tpage = 0;
+static bool mask_set_bit, mask_check_bit; /* GP0 E6h */
 static Vertex vertex_buf[MAX_VERTEX_COUNT];
 static unsigned short index_buf[MAX_INDEX_COUNT];
 static Vertex* vertex_cur;
@@ -162,6 +170,7 @@ typedef enum {
     BLEND_SUB_OPAQUE,
     BLEND_MASK,
     BLEND_DIRECT,
+    BLEND_CHECK,
     BLEND_COUNT,
 } BlendMode;
 
@@ -230,9 +239,13 @@ void Draw_SetMask(int bit0, int bit1) {
         return;
     }
 #endif
-    if (bit0 || bit1) {
-        NOT_IMPLEMENTED;
-    }
+    /* GP0 E6h: bit 0 sets bit 15 of every pixel drawn, bit 1 keeps pixels
+     * whose bit 15 is set. Primitives queued before it keep the old mode. */
+    if (mask_set_bit == (bit0 != 0) && mask_check_bit == (bit1 != 0))
+        return;
+    Draw_FlushBuffer();
+    mask_set_bit = bit0 != 0;
+    mask_check_bit = bit1 != 0;
 }
 
 #endif

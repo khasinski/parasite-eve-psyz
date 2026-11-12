@@ -1259,6 +1259,8 @@ void Draw_SetOffset(int x, int y) {
     draw_offset.y = y;
 }
 
+void Draw_ClearCache(void) {}
+
 void Draw_SetMask(int bit0, int bit1) {
     if (bit0 || bit1) {
         NOT_IMPLEMENTED;

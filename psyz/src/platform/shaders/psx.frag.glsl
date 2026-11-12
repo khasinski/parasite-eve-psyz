@@ -1,4 +1,7 @@
 #version 450
+// PSYZ_SHADER_REVISION 1
+// The interface sdl3_gpu.c drives (its PSX_SHADER_REVISION): bump both when
+// it changes, so stale generated headers fall back to the old behaviour.
 
 layout(location = 0) in vec4 vertexColor;
 layout(location = 1) in vec2 rawUV;
@@ -16,21 +19,87 @@ layout(location = 12) flat in uint polygon;
 layout(location = 13) flat in uint model;
 layout(location = 14) flat in vec4 uvBounds;
 layout(location = 15) in vec3 hdUV;
+layout(location = 16) flat in uvec4 exTri;
+layout(location = 17) flat in uvec4 exBase;
+layout(location = 18) flat in uvec4 exPerX;
+layout(location = 19) flat in uvec4 exPerY;
+layout(location = 20) flat in uvec4 exBlue;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 layout(set = 2, binding = 1) uniform sampler2D texBlend;
 layout(set = 2, binding = 2) uniform sampler2D texHD;
+// The GPU's CLUT cache: one palette per row; exBlue.w is this primitive's.
+layout(set = 2, binding = 3) uniform sampler2D texClut;
+// passMode: x = pass (0 colour, 1 mask bit, 2 direct blend, 3 colour and
+// mask bit under check mask), y = target scale, z = 1 without a horizontal
+// draw grid, w = bit0 model filtering, bit1 high colour (no dithering or
+// RGB555 shading), bit2 sprite filtering, bit3 set mask, bit4 check mask.
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
 
 float attributeRoundingBias() {
     // Native 1:1 polygon attributes occupy a 1/4096 lattice. Half an LSB
     // repairs floating interpolation just below an exact integer without
     // rounding the preceding representable value up to it.
-    return polygon != 0u && passMode.y == 1u && passMode.z != 0u
-        ? 1.0 / 8192.0 : 0.0;
+    return polygon != 0u && passMode.z != 0u ? 1.0 / 8192.0 : 0.0;
+}
+
+// Exact PS1 polygon (exTri.w != 0, see sdl3_draw.h): U, V, R, G, B of this
+// fragment's sample from the GPU's integer attribute planes.
+bool exactPolygon = false;
+uvec2 exactUV;
+vec3 exactColor8;
+
+ivec2 exactVertex(uint packed) {
+    return ivec2(int(packed << 16) >> 16, int(packed) >> 16);
+}
+
+// Edge a -> b of a triangle with orientation sg (the sign of its area): the
+// sample s is inside, or on a top or left edge (the PS1 fills those).
+bool exactEdge(ivec2 a, ivec2 b, ivec2 s, int sg) {
+    ivec2 d = (b - a) * sg;
+    int e = d.x * (s.y - a.y) - d.y * (s.x - a.x);
+    return e > 0 || (e == 0 && (d.y < 0 || (d.y == 0 && d.x > 0)));
+}
+
+// floor(a / n) for n > 0
+int floorDiv(int a, int n) { return a >= 0 ? a / n : -((n - 1 - a) / n); }
+
+// The target pixel (i, j) samples the PS1 polygon at (i / N, j / N): returns
+// false when the PS1 does not cover it, else sets the attributes there.
+bool exactSample() {
+    int n = int(max(passMode.y, 1u));
+    // A piece drawn 2048 pixels further (exTri.w bits 1, 2) samples the
+    // triangle where the GPU's 11-bit wrap of the line start came from.
+    ivec2 s = ivec2(gl_FragCoord.xy) -
+        ivec2((exTri.w & 2u) != 0u ? 2048 * n : 0, (exTri.w & 4u) != 0u ? 2048 * n : 0);
+    ivec2 a = exactVertex(exTri.x) * n, b = exactVertex(exTri.y) * n,
+          c = exactVertex(exTri.z) * n;
+    int area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (area == 0) return false;
+    int sg = area > 0 ? 1 : -1;
+    if (!exactEdge(a, b, s, sg) || !exactEdge(b, c, s, sg) ||
+        !exactEdge(c, a, s, sg))
+        return false;
+    // VRAM pixel q plus r / N: the plane at q in 32-bit wrapping 12.12 like
+    // the GPU's registers, then the fraction r / N of a pixel's step.
+    ivec2 q = ivec2(floorDiv(s.x, n), floorDiv(s.y, n)), r = s - q * n;
+    uvec4 at = exBase + exPerX * uint(q.x) + exPerY * uint(q.y);
+    uint atB = exBlue.x + exBlue.y * uint(q.x) + exBlue.z * uint(q.y);
+    ivec4 frac4 = ivec4(exPerX) * r.x + ivec4(exPerY) * r.y;
+    int fracB = int(exBlue.y) * r.x + int(exBlue.z) * r.y;
+    if (n > 1) {
+        at += uvec4(floorDiv(frac4.x, n), floorDiv(frac4.y, n),
+                    floorDiv(frac4.z, n), floorDiv(frac4.w, n));
+        atB += uint(floorDiv(fracB, n));
+    }
+    // 8-bit registers: bits 12..19
+    exactUV = (at.xy >> 12) & 255u;
+    exactColor8 = vec3((uvec3(at.zw, atB) >> 12) & 255u);
+    return true;
 }
 
 uvec2 resolveTexel() {
+    if (exactPolygon) return (exactUV & texWindow.xy) | texWindow.zw;
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
     vec2 uv = polygon != 0u ? rawUV + attributeRoundingBias() :
         rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
@@ -57,31 +126,41 @@ const mat4 ditherMatrix = mat4(
     +2.0, -2.0, +3.0, -1.0,
     -3.0, +1.0, -4.0, +0.0,
     +3.0, -1.0, +2.0, -2.0);
-vec3 applyDither(vec3 c) {
-    // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
-    if ((passMode.w & 2u) != 0u) return clamp(c, 0.0, 1.0);
-    if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;
-    int dx = int(gl_FragCoord.x) & 3;
-    int dy = int(gl_FragCoord.y) & 3;
-    float off = ditherMatrix[dy][dx];
-    vec3 c8 = c * 255.0 + off;
-    vec3 c5 = clamp(floor(c8 / 8.0), 0.0, 31.0);
-    return c5 / 31.0;
+// The VRAM pixel this fragment belongs to: at Nx every target pixel of a
+// VRAM pixel takes that pixel's dither offset.
+ivec2 vramPixel() { return ivec2(gl_FragCoord.xy) / int(max(passMode.y, 1u)); }
+// PS1 RGB555 output of an 8-bit colour (integers 0..255): (c + d) >> 3 with
+// the 4x4 dither offset d when the primitive dithers, clamped to 0..31.
+vec3 quantize(vec3 c8) {
+    float off = 0.0;
+    if (dither != 0u) {
+        ivec2 p = vramPixel() & 3;
+        off = ditherMatrix[p.y][p.x];
+    }
+    return clamp(floor((c8 + off) / 8.0), 0.0, 31.0) / 31.0;
+}
+// A polygon's 8-bit colour: the PS1 keeps the interpolated value in an
+// 8-bit register, so it wraps instead of saturating.
+vec3 polygonColor8(vec3 c) {
+    return mod(floor(c + attributeRoundingBias()), 256.0);
 }
 
+// Texture pages and CLUTs running past VRAM x 1023 wrap to x 0.
+ivec2 wrapVram(ivec2 p) { return ivec2(p.x & 1023, p.y & 511); }
 vec4 fetchModelTexel(ivec2 position) {
     uvec2 wrapped=(uvec2(position)&uvec2(255u));
     ivec2 texel=ivec2((wrapped&texWindow.xy)|texWindow.zw);
-    if (textureMode==1u) return texelFetch(texVram,pageBase+texel,0);
+    if (textureMode==1u) return texelFetch(texVram,wrapVram(pageBase+texel),0);
     uint subPixel=uint(texel.x)&subPixelMask;
     ivec2 texelPos=ivec2(texel.x>>texelShift,texel.y);
-    uint word16=rgb5551ToU16(texelFetch(texVram,pageBase+texelPos,0));
+    uint word16=rgb5551ToU16(texelFetch(texVram,wrapVram(pageBase+texelPos),0));
     uint index=(word16>>(subPixel*indexShift))&indexMask;
-    ivec2 base=ivec2((clut%64u)*16u,clut/64u);
-    return texelFetch(texVram,base+ivec2(index,0),0);
+    return texelFetch(texClut,ivec2(index,exBlue.w),0);
 }
 
 void main() {
+    exactPolygon = exTri.w != 0u;
+    if (exactPolygon && !exactSample()) discard;
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
     // Explicit queued dialogue glyph: new alpha is presentation-only.
@@ -126,30 +205,44 @@ void main() {
         FragColor = vec4(0);
         return;
     }
+    // Mask bit of the written pixel: the texel's STP bit (0 untextured),
+    // forced by "set mask".
+    float maskBit = (passMode.w & 8u) != 0u ? 1.0 :
+        (textureMode == 0u ? 0.0 : texColor.a);
     if (passMode.x == 1u) {
-        FragColor = vec4(0,0,0,textureMode == 0u ? 0.0 : texColor.a);
+        FragColor = vec4(0,0,0,maskBit);
         return;
     }
+    // "Check mask" keeps pixels whose mask bit is set. The opaque pass 3
+    // blends with the destination's alpha instead, as its triangles overlap.
+    if (passMode.x == 2u && (passMode.w & 16u) != 0u &&
+        texelFetch(texBlend, ivec2(gl_FragCoord.xy), 0).a >= 0.5)
+        discard;
     // check for setSemiTrans(p, 1)
     bool isSemiTrans = vertexColor.a < 0.75;
     // when a color has the 0x8000 bit left then it has the semitrans flag on
     bool colorSemiTrans = texColor.a > 0;
     // PS1-accurate texture-color modulation: (tex5 * col8) >> 7, clamp to 31
     vec3 modColor;
-    if (textureMode == 0u) {
+    if ((passMode.w & 2u) != 0u) {
+        // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
+        modColor = clamp(textureMode == 0u ? vertexColor.rgb :
+                         texColor.rgb * vertexColor.rgb, 0.0, 1.0);
+    } else if (textureMode == 0u) {
         // untextured: PS1 uses color directly, no modulation
-        modColor = texColor.rgb * (vertexColor.rgb + attributeRoundingBias() / 255.0);
+        vec3 col8 = exactPolygon ? exactColor8 :
+            polygon != 0u ? polygonColor8(vertexColor.rgb * 255.0)
+                          : floor(vertexColor.rgb * 255.0 + 0.5);
+        modColor = quantize(col8);
     } else {
+        // (texel5 * colour8) >> 4, saturated to 8 bits, then dithered to
+        // RGB555; without dithering this is (texel5 * colour8) >> 7.
         vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);
-        vec3 col8 = min(floor(vertexColor.rgb * 127.5 +
-                             (polygon != 0u ? attributeRoundingBias() : 0.5)), vec3(255.0));
-        vec3 prod8 = min(tex5 * col8 / 16.0, vec3(255.0));
-        modColor = dither != 0u ? prod8 / 255.0
-                                : floor(prod8 / 8.0) / 31.0;
+        vec3 col8 = exactPolygon ? exactColor8 :
+            polygon != 0u ? polygonColor8(vertexColor.rgb * 127.5)
+                          : min(floor(vertexColor.rgb * 127.5 + 0.5), vec3(255.0));
+        modColor = quantize(min(floor(tex5 * col8 / 16.0), vec3(255.0)));
     }
-    if ((passMode.w & 2u) != 0u && textureMode != 0u)
-        modColor = texColor.rgb * vertexColor.rgb;
-    modColor = applyDither(modColor);
     bool enhancedPixel=false;
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
@@ -180,7 +273,7 @@ void main() {
             else if (abr == 2u) modColor = back - modColor;
             else modColor = back + modColor * 0.25;
         }
-        FragColor = vec4(clamp(modColor, 0.0, 1.0), textureMode == 0u ? 0.0 : texColor.a);
+        FragColor = vec4(clamp(modColor, 0.0, 1.0), maskBit);
         return;
     }
     if (passMode.x == 2u) {
@@ -194,8 +287,11 @@ void main() {
             else if (abr == 2u) color = back - color;
             else color = back + (color >> 2);
         }
-        FragColor = vec4(vec3(clamp(color,ivec3(0),ivec3(31))) / 31.0,
-                         textureMode == 0u ? 0.0 : texColor.a);
+        FragColor = vec4(vec3(clamp(color,ivec3(0),ivec3(31))) / 31.0, maskBit);
+        return;
+    }
+    if (passMode.x == 3u) {
+        FragColor = vec4(modColor, maskBit);
         return;
     }
     // pre-multiplied alpha output for ONE, ONE_MINUS_SRC_ALPHA blending

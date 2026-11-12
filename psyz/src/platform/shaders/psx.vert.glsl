@@ -1,4 +1,7 @@
 #version 450
+// PSYZ_SHADER_REVISION 1
+// The interface sdl3_gpu.c drives (its PSX_SHADER_REVISION): bump both when
+// it changes, so stale generated headers fall back to the old behaviour.
 
 layout(location = 0) in ivec2 pos;  // SDL_GPU_VERTEXELEMENTFORMAT_SHORT2
 layout(location = 1) in uvec4 tex;  // SDL_GPU_VERTEXELEMENTFORMAT_USHORT4
@@ -9,6 +12,12 @@ layout(location = 5) in vec3 polygonRGB;
 layout(location = 6) in vec3 pgxpPos;
 layout(location = 7) in vec4 atlasBounds;
 layout(location = 8) in vec3 hdCoordinates;
+// exact PS1 polygon: triangle and integer attribute planes (sdl3_draw.h)
+layout(location = 9) in uvec4 exactTriangle;
+layout(location = 10) in uvec4 exactBase;
+layout(location = 11) in uvec4 exactPerX;
+layout(location = 12) in uvec4 exactPerY;
+layout(location = 13) in uvec4 exactBlue;
 
 // widescreen: {x squeeze, centre x before the draw-grid viewport,
 //              sub-pixel shift x, y (game pixels)}
@@ -32,17 +41,33 @@ layout(location = 13) flat out uint model;
 layout(location = 14) flat out vec4 uvBounds;
 
 layout(location = 15) out vec3 hdUV;
+layout(location = 16) flat out uvec4 exTri;
+layout(location = 17) flat out uvec4 exBase;
+layout(location = 18) flat out uvec4 exPerX;
+layout(location = 19) flat out uvec4 exPerY;
+layout(location = 20) flat out uvec4 exBlue;
 
 void main() {
     hdUV=hdCoordinates;
+    exTri = exactTriangle;
+    exBase = exactBase;
+    exPerX = exactPerX;
+    exPerY = exactPerY;
+    exBlue = exactBlue;
     model = (tex.w & 0x1000u) != 0u ? 1u : 0u;
     uvBounds = atlasBounds;
     polygon = (tex.w & 0x2000u) != 0u ? 1u : 0u;
     // drawOffset.z is a bitfield: bit0=ordinary PGXP, bit1=midpoint position.
     bool usePgxp = polygon != 0u && (uint(drawOffset.z)&1u)!=0u && pgxpPos.z > 0.0;
     bool midpoint = (uint(drawOffset.z)&2u)!=0u && pgxpPos.z>0.0;
-    bool hiRes = drawOffset.w != 0.0;
-    float bias = (polygon != 0u && !hiRes) ? 0.5 : 0.0;
+    // drawOffset.w: the target's scale (VRAM pixel -> target pixels).
+    // The PS1 samples a polygon at integer coordinates, the GPU at pixel
+    // centres: half a target pixel puts the first target pixel of every VRAM
+    // pixel on the PS1 sample, so the NxN block's top-left pixel matches 1x.
+    float scale = max(drawOffset.w, 1.0);
+    // An exact polygon's bounding box lies on VRAM pixel edges.
+    bool exact = exactTriangle.w != 0u;
+    float bias = polygon != 0u && !exact ? 0.5 / scale : 0.0;
     float vx = (usePgxp || midpoint) ? pgxpPos.x : (float(pos.x) + bias);
     float vy = (usePgxp || midpoint) ? pgxpPos.y : (float(pos.y) + bias);
     float w = usePgxp ? pgxpPos.z : 1.0;
@@ -68,9 +93,8 @@ void main() {
     uint texWord = tex.w;
     tpage = texWord & 0x1FFu;
     dither = (texWord & 0x4000u) != 0u ? 1u : 0u;
-    vec2 polyUV = hiRes ? (polygonUV - vec2(0.5)) : polygonUV;
     rawUV = polygon != 0u
-                ? ((usePgxp || midpoint) ? vec2(tex.xy) : polyUV)
+                ? ((usePgxp || midpoint) ? vec2(tex.xy) : polygonUV)
                 : vec2(tex.xy);
     // Determine texture mode and pre-compute parameters
     subPixelMask = 0u;

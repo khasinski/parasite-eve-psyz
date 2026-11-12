@@ -73,6 +73,11 @@ void Draw_SetOffset(int x, int y);
 int Draw_SetHorizontalGrid(
     unsigned int source_width, unsigned int target_width);
 void Draw_SetMask(int bit0, int bit1);
+// GP0 01h: invalidates the GPU's CLUT cache. A textured primitive loads the
+// cache when its CLUT differs from the cached one (or an 8-bit page needs
+// the 256 entries a 4-bit one did not load); until then later primitives
+// read the cached palette even if the VRAM under it changed.
+void Draw_ClearCache(void);
 void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b);
 void Draw_LoadImage(RECT* rect, u_long* p);
 void Draw_StoreImage(RECT* rect, u_long* p);
@@ -82,5 +87,35 @@ void Draw_ResetBuffer(void);
 void Draw_FlushBuffer(void);
 int Draw_PushPrim(u_long* packets, int max_len);
 int Draw_ExequeSync();
+
+/* GP0 40h..5Fh: the vertex count of the line command at words[0], and in
+ * *length its words. A line has two vertices; a polyline (bit 3) runs until
+ * a terminator, a word w with (w & 0xF000F000) == 0x50005000 in the place of
+ * a vertex's first word (its colour when Gouraud shaded), which is consumed.
+ * As in DuckStation the GPU takes the first three words of a flat polyline
+ * and the first two vertices of a shaded one without testing them. Without a
+ * terminator in max_len words the vertices read so far are returned. */
+static inline int Draw_LineVertices(const u_long* words, int max_len, int* length) {
+    const unsigned code = (unsigned)(words[0] >> 24) & 0xFF;
+    const int shaded = (code & 0x10) != 0;
+    if (!(code & 0x08)) {
+        *length = 3 + shaded;
+        return 2;
+    }
+    int at = 2, count = 1; /* command (first colour) and first vertex */
+    while (at < max_len) {
+        if (count >= (shaded ? 2 : 3) &&
+            ((unsigned)words[at] & 0xF000F000u) == 0x50005000u) {
+            *length = at + 1;
+            return count;
+        }
+        if (at + shaded >= max_len)
+            break;
+        at += 1 + shaded;
+        count++;
+    }
+    *length = max_len;
+    return count;
+}
 
 #endif

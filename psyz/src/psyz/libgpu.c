@@ -30,7 +30,7 @@ typedef enum {
     GPU_V2, // 2MB VRAM, PSone
 } GpuVersion;
 
-static void GPU_clear_cache() { NOT_IMPLEMENTED; }
+static void GPU_clear_cache() { Draw_ClearCache(); }
 
 // Optional CPU copy of the VRAM, kept from image uploads, fills and copies
 // (Psyz_GpuSetVramCopy). Primitives are not rasterized into it: the first
@@ -490,14 +490,23 @@ static int GPU_EnqueueTrampoline(u_long p1, u_long p2) {
     return 0;
 }
 
+/* PSY-Q's transfers (_dws, _drs) clear the CLUT cache (GP0 01h) first */
+static void GPU_TransferClearCache(void) {
+    u_long clear = 0x01000000;
+    Draw_ClearCache();
+    GpuDump_GP0(&clear, 1);
+}
+
 static int GPU_DataWrite(RECT* rect, u_long* data) {
     Psyz_GpuExeque();
+    GPU_TransferClearCache();
     GpuDump_Image(rect, data);
     VramTransfer(rect, data, 0);
     return 0;
 }
 static int GPU_DataRead(RECT* rect, u_long* data) {
     Psyz_GpuExeque();
+    GPU_TransferClearCache();
     VramTransfer(rect, data, 1);
     return 0;
 }

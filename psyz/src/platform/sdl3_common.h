@@ -695,8 +695,10 @@ static inline int GetCurrentDither(void) {
 
 static inline void SetDither(int dither) { s_dither = dither; }
 
+/* Gouraud shading or a modulated texture dithers; a raw texture never does,
+ * not even with Gouraud colours (which it ignores). */
 static inline int CanPolyDither(int isGouraud, int isTextured, int isShadeTex) {
-    return GetCurrentDither() && (isGouraud || (isTextured && isShadeTex));
+    return GetCurrentDither() && isShadeTex && (isGouraud || isTextured);
 }
 
 static int CanLineDither(void) { return GetCurrentDither(); }
