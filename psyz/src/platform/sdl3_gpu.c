@@ -29,6 +29,10 @@ static bool UseSoftwareBackend(void);
 #define PSYZ_SOFTWARE_ROUTING
 static const void *interpolation_packet_current;
 #define PSYZ_CAPTURE_INTERPOLATION(v,n) InterpCapture(interpolation_packet_current,v,n)
+/* Drawing state changes between queued primitives (mask bits, drawing area,
+ * offset) are recorded as marks instead of flushing (Draw_FlushBuffer). */
+#define DRAW_STATE_MARKS 1
+static void DrawStateChanging(void);
 #include "sdl3_draw.h"
 
 #if defined(_WIN32)
@@ -3144,6 +3148,21 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
  * start (a menu row's clip collapsed to zero width) draws nothing on the
  * PS1: the scissor becomes empty and Draw_FlushBuffer drops such batches
  * instead of keeping the previous area. */
+/* The drawing area's rectangle; primitives queued before keep theirs. */
+static void SetScissorFromArea(void) {
+    int width = draw_area_end.x - draw_area_start.x + 1;
+    int height = draw_area_end.y - draw_area_start.y + 1;
+
+    if (!sdl3_window || !InitPlatform()) {
+        return;
+    }
+    DrawStateChanging();
+    scissor_rect.x = draw_area_start.x;
+    scissor_rect.y = draw_area_start.y;
+    scissor_rect.w = width > 0 ? width : 0;
+    scissor_rect.h = height > 0 ? height : 0;
+}
+
 static void UpdateScissor() {
     int width = draw_area_end.x - draw_area_start.x + 1;
     int height = draw_area_end.y - draw_area_start.y + 1;
@@ -4471,10 +4490,13 @@ void Draw_SetAreaStart(int x, int y) {
         draw_area_start.x=x;draw_area_start.y=y;
         return;
     }
+    if (draw_area_start.x == x && draw_area_start.y == y)
+        return;
+    DrawStateChanging();
     draw_area_start.x = x;
     draw_area_start.y = y;
     /* GP0 E3 and E4 each take effect on their own */
-    UpdateScissor();
+    SetScissorFromArea();
 }
 void Draw_SetAreaEnd(int x, int y) {
     if (UseSoftwareBackend()) {
@@ -4482,18 +4504,22 @@ void Draw_SetAreaEnd(int x, int y) {
         draw_area_end.x=x;draw_area_end.y=y;
         return;
     }
+    if (draw_area_end.x == x && draw_area_end.y == y)
+        return;
+    DrawStateChanging();
     draw_area_end.x = x;
     draw_area_end.y = y;
-    UpdateScissor();
+    SetScissorFromArea();
 }
 void Draw_SetOffset(int x, int y) {
     if (UseSoftwareBackend()) {
         software_rasterizer.offset(x, y);
         return;
     }
-    Draw_FlushBuffer();
-
     /* GP0 E5h: signed 11-bit offsets */
+    if (draw_offset.x == s11((short)x) && draw_offset.y == s11((short)y))
+        return;
+    DrawStateChanging();
     draw_offset.x = s11((short)x);
     draw_offset.y = s11((short)y);
 }
@@ -4784,8 +4810,50 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         SyncNativeVramToScaled(dst_x, dst_y, copy_w, copy_h);
 }
 
+/* The drawing state of queued primitives: mark k holds the state of the
+ * indices before draw_marks[k].end (from the previous mark's end). The
+ * primitives after the last mark have the current state. */
+typedef struct DrawState {
+    Posi offset, area_start, area_end;
+    SDL_Rect scissor;
+    bool mask_set, mask_check;
+} DrawState;
+#define DRAW_MARKS_MAX 1024
+static struct {
+    int end;
+    DrawState state;
+} draw_marks[DRAW_MARKS_MAX + 1];
+static int n_draw_marks;
+
+static DrawState CurrentDrawState(void) {
+    return (DrawState){draw_offset, draw_area_start, draw_area_end,
+                       scissor_rect, mask_set_bit, mask_check_bit};
+}
+static void ApplyDrawState(const DrawState* st) {
+    draw_offset = st->offset;
+    draw_area_start = st->area_start;
+    draw_area_end = st->area_end;
+    scissor_rect = st->scissor;
+    mask_set_bit = st->mask_set;
+    mask_check_bit = st->mask_check;
+}
+/* Called before the drawing state changes. */
+static void DrawStateChanging(void) {
+    if (!n_indices)
+        return;
+    if (n_draw_marks && draw_marks[n_draw_marks - 1].end == n_indices)
+        return; /* no primitive has the state the last mark ended with */
+    if (n_draw_marks == DRAW_MARKS_MAX) {
+        Draw_FlushBuffer();
+        return;
+    }
+    draw_marks[n_draw_marks].end = n_indices;
+    draw_marks[n_draw_marks++].state = CurrentDrawState();
+}
+
 void Draw_ResetBuffer(void) {
     dialogue_font_batch=-1;
+    n_draw_marks = 0;
     if (UseSoftwareBackend()) {
         software_rasterizer.reset_buffer();
         return;
@@ -4808,13 +4876,14 @@ typedef struct SemiBox {
 typedef struct DrawSegment {
     int start, end;
     bool semi;
+    int mark; /* draw_marks index of its drawing state */
 } DrawSegment;
 #define DRAW_SEGMENTS_MAX 32
 /* Runs in one pass when the shader fetches the destination (no copies). */
 #define DRAW_SEGMENTS_FETCH_MAX 512
 static bool PrimitiveBox(int start, int end, bool midpoint,
                          bool scaled_target, unsigned target_scale,
-                         float sub_x, float sub_y, float target_centre,
+                         Posi offset, float sub_x, float sub_y, float target_centre,
                          float ws_squeeze, SDL_Rect clip, SemiBox* box) {
     float min_x = 1e9f, min_y = 1e9f, max_x = -1e9f, max_y = -1e9f;
     /* Sprites and rectangles on whole target pixels cover exactly
@@ -4833,9 +4902,9 @@ static bool PrimitiveBox(int start, int end, bool midpoint,
             v->pgxp_pos[2] > 0.0f;
         float vx = (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
         float vy = (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
-        float x = draw_offset.x + (vx + bias) * GetDrawGridXScale();
+        float x = offset.x + (vx + bias) * GetDrawGridXScale();
         x = (target_centre + (x - target_centre) * ws_squeeze) * target_scale;
-        float y = (draw_offset.y + vy + bias) * target_scale;
+        float y = (offset.y + vy + bias) * target_scale;
         rectangle &= !(v->t & TPAGE_POLYGON) && x == SDL_floorf(x) &&
                      y == SDL_floorf(y);
         min_x = SDL_min(min_x, x);
@@ -4864,6 +4933,94 @@ static int SharedVertices(int a, int b) {
     return shared;
 }
 
+/* What a target's draws need from one drawing state (ApplyDrawState). */
+typedef struct DrawView {
+    bool visible; /* the drawing area is not empty */
+    SDL_Rect clip; /* drawing area, squeezed in widescreen (VRAM pixels) */
+    Posi offset;
+    float ws_squeeze, target_centre, sub_x, sub_y;
+    SDL_GPUViewport viewport;
+    SDL_Rect scissor; /* target pixels */
+    float offset_ubo[8];
+    u32 pass_flags;
+    bool mask_check;
+} DrawView;
+
+static void ComputeDrawView(DrawView* view, unsigned target_index,
+                            bool midpoint, unsigned target_scale) {
+    view->visible = scissor_rect.w > 0 && scissor_rect.h > 0;
+    view->offset = draw_offset;
+    /* Widescreen squeezes X around the display buffer's centre. A clip
+     * narrower than the screen (a menu list) is squeezed with its contents;
+     * the full-width one is kept, so what lies past the screen's edges stays.
+     */
+    const float ws_squeeze = WidescreenDraw() ? WS_SQUEEZE : 1.0f;
+    const float ws_centre = WidescreenCentre();
+    SDL_Rect clip = scissor_rect;
+    if (ws_squeeze < 1.0f && clip.w < display_size.x) {
+        float x0 = ws_centre + ((float)clip.x - ws_centre) * ws_squeeze;
+        float x1 =
+            ws_centre + ((float)(clip.x + clip.w) - ws_centre) * ws_squeeze;
+        clip.x = (int)SDL_floorf(x0);
+        clip.w = (int)SDL_ceilf(x1) - clip.x;
+    }
+    /* Widescreen: the room moves by its whole-pixel step (WidescreenFieldStep)
+     * in the shown picture; native VRAM under a high-resolution one keeps
+     * the game's own picture for read-backs. */
+    const int field_picture =
+        ws_field && WidescreenDraw() ? WidescreenDrawPicture() : -1;
+    const float target_centre=midpoint&&!ws_centred&&WidescreenDrawPicture()>=0 ?
+        (float)display_area.x+WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()]) : ws_centre;
+    float sub_x = 0.0f, sub_y = 0.0f;
+    if (target_index || !scaled_vram_render)
+        WidescreenFieldStep(
+            field_picture, (float)target_scale, &sub_x, &sub_y);
+    if(midpoint&&field_picture>=0){sub_x=ws_mid_qx[field_picture];sub_y=ws_mid_qy[field_picture];}
+    view->clip = clip;
+    view->ws_squeeze = ws_squeeze;
+    view->target_centre = target_centre;
+    view->sub_x = sub_x;
+    view->sub_y = sub_y;
+    const float grid_x = GetDrawGridXScale();
+    const float render_scale = (float)target_scale;
+    view->viewport = (SDL_GPUViewport){
+        .x = (float)draw_offset.x * render_scale * (1.0f - grid_x),
+        .y = 0.0f,
+        .w = (float)VRAM_W * render_scale * grid_x,
+        .h = (float)VRAM_H * render_scale,
+        .min_depth = 0.0f,
+        .max_depth = 1.0f,
+    };
+    view->scissor = (SDL_Rect){
+        clip.x * (int)target_scale, clip.y * (int)target_scale,
+        clip.w * (int)target_scale, clip.h * (int)target_scale};
+    /* The viewport maps shader x to offset * (1 - grid) + x * grid;
+     * the shader squeezes around the centre in its own space, so
+     * VRAM x = centre + (offset + x * grid - centre) * squeeze. */
+    const float offset_ubo[8] = {
+        (float)draw_offset.x,
+        (float)draw_offset.y,
+        ((target_index != 0 &&
+          (geometry_correction || effect_geometry_correction))
+             ? 1.0f
+             : 0.0f) +
+            (midpoint ? 2.0f : 0.0f),
+        PSX_SHADERS_CURRENT ? (float)target_scale
+                            : (target_scale > 1 ? 1.0f : 0.0f),
+        ws_squeeze,
+        (target_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,
+        sub_x,
+        sub_y};
+    memcpy(view->offset_ubo, offset_ubo, sizeof(offset_ubo));
+    view->pass_flags =
+        (target_index && model_filtering ? 1u : 0u) |
+        (target_index && sprite_filtering ? 4u : 0u) |
+        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+        (PSX_SHADERS_CURRENT && mask_set_bit ? 8u : 0u) |
+        (PSX_SHADERS_CURRENT && mask_check_bit ? 16u : 0u);
+    view->mask_check = mask_check_bit;
+}
+
 void Draw_FlushBuffer(void) {
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
@@ -4872,7 +5029,7 @@ void Draw_FlushBuffer(void) {
     if (n_vertices == 0) {
         return;
     }
-    if (scissor_rect.w <= 0 || scissor_rect.h <= 0) {
+    if (!n_draw_marks && (scissor_rect.w <= 0 || scissor_rect.h <= 0)) {
         /* an empty drawing area (UpdateScissor) draws nothing */
         Draw_ResetBuffer();
         return;
@@ -4925,25 +5082,13 @@ void Draw_FlushBuffer(void) {
     }
     SDL_EndGPUCopyPass(copy);
 
-    /* Widescreen squeezes X around the display buffer's centre. A clip
-     * narrower than the screen (a menu list) is squeezed with its contents;
-     * the full-width one is kept, so what lies past the screen's edges stays.
-     */
-    const float ws_squeeze = WidescreenDraw() ? WS_SQUEEZE : 1.0f;
-    const float ws_centre = WidescreenCentre();
-    SDL_Rect clip = scissor_rect;
-    if (ws_squeeze < 1.0f && clip.w < display_size.x) {
-        float x0 = ws_centre + ((float)clip.x - ws_centre) * ws_squeeze;
-        float x1 =
-            ws_centre + ((float)(clip.x + clip.w) - ws_centre) * ws_squeeze;
-        clip.x = (int)SDL_floorf(x0);
-        clip.w = (int)SDL_ceilf(x1) - clip.x;
-    }
-    /* Widescreen: the room moves by its whole-pixel step (WidescreenFieldStep)
-     * in the shown picture; native VRAM under a high-resolution one keeps
-     * the game's own picture for read-backs. */
-    const int field_picture =
-        ws_field && WidescreenDraw() ? WidescreenDrawPicture() : -1;
+    /* The drawing state of each range of queued primitives (draw_marks):
+     * the primitives after the last mark have the current state. */
+    const DrawState current_state = CurrentDrawState();
+    draw_marks[n_draw_marks].end = n_indices;
+    draw_marks[n_draw_marks].state = current_state;
+    const int n_marks = n_draw_marks + 1;
+    static DrawView views[DRAW_MARKS_MAX + 1];
 
     /* Native VRAM is independently rasterized: gameplay readback and texture
      * feedback must not depend on high-resolution sample positions. The
@@ -4955,24 +5100,21 @@ void Draw_FlushBuffer(void) {
         SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
         if(midpoint){
             u8 *mid_map=SDL_MapGPUTransferBuffer(device,vtx_transfer,true);
-            if(!mid_map){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation transfer map",false);Draw_ResetBuffer();return;}
+            if(!mid_map){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation transfer map",false);goto abort_flush;}
             memcpy(mid_map,interpolated_vertices,vtx_size);SDL_UnmapGPUTransferBuffer(device,vtx_transfer);
-            cmd=AcquireCmd();if(!cmd){interp_pair_ready=false;interp_matches=0;Draw_ResetBuffer();return;}
+            cmd=AcquireCmd();if(!cmd){interp_pair_ready=false;interp_matches=0;goto abort_flush;}
             SDL_GPUCopyPass *mid_copy=SDL_BeginGPUCopyPass(cmd);
-            if(!mid_copy){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation copy pass",false);Draw_ResetBuffer();return;}
+            if(!mid_copy){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation copy pass",false);goto abort_flush;}
             SDL_UploadToGPUBuffer(mid_copy,&vtx_src,&vtx_dst,true);SDL_EndGPUCopyPass(mid_copy);
         }
-        const float target_centre=midpoint&&!ws_centred&&WidescreenDrawPicture()>=0 ?
-            (float)display_area.x+WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()]) : ws_centre;
         unsigned target_scale = target_index ? internal_res : 1;
-        float sub_x = 0.0f, sub_y = 0.0f;
-        if (target_index || !scaled_vram_render)
-            WidescreenFieldStep(
-                field_picture, (float)target_scale, &sub_x, &sub_y);
-        if(midpoint&&field_picture>=0){sub_x=ws_mid_qx[field_picture];sub_y=ws_mid_qy[field_picture];}
+        for (int k = 0; k < n_marks; ++k) {
+            ApplyDrawState(&draw_marks[k].state);
+            ComputeDrawView(&views[k], target_index, midpoint, target_scale);
+        }
         SDL_GPUTexture* destination_sample =
             target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
-        int start = 0;
+        int start = 0, mark = 0;
         while (start < n_indices) {
             /* A semi-transparent primitive blends with a copy of the VRAM
              * made before it: one triangle, or one bounding box (two
@@ -4984,7 +5126,9 @@ void Draw_FlushBuffer(void) {
              * earlier segment of the run, so the copy still holds its
              * destination. With destination_fetch the shader reads the
              * destination from the target itself: a run of semi-transparent
-             * primitives is one draw and nothing breaks the pass. */
+             * primitives is one draw and nothing breaks the pass. A segment
+             * keeps to one drawing state (mark); the pass sets each one's
+             * viewport, scissor and uniforms. */
             DrawSegment segments[DRAW_SEGMENTS_FETCH_MAX];
             SemiBox boxes[DRAW_SEGMENTS_FETCH_MAX];
             const int max_segments = destination_fetch ? DRAW_SEGMENTS_FETCH_MAX
@@ -4992,29 +5136,37 @@ void Draw_FlushBuffer(void) {
             int n_segments = 0, n_draws = 0;
             int end = start;
             while (end < n_indices && n_segments < max_segments) {
+                while (draw_marks[mark].end <= end)
+                    ++mark;
+                const int mark_end = draw_marks[mark].end;
+                const DrawView* view = &views[mark];
+                if (!view->visible) {
+                    end = mark_end; // an empty drawing area draws nothing
+                    continue;
+                }
                 int seg_start = end;
                 bool semi = vertex_buf[index_buf[seg_start]].a != 0xFF;
                 int seg_end =
                     seg_start + (vertex_buf[index_buf[seg_start]].exact[0][3] ? 6 : 3);
                 /* The two triangles of one quad (two shared vertices) cover
                  * disjoint pixels: they read the same copy. */
-                if (semi && seg_end + 3 <= n_indices &&
+                if (semi && seg_end + 3 <= mark_end &&
                     !vertex_buf[index_buf[seg_start]].exact[0][3] &&
                     vertex_buf[index_buf[seg_end]].a != 0xFF &&
                     SharedVertices(seg_start, seg_end) >= 2)
                     seg_end += 3;
                 if (!semi || destination_fetch) {
-                    while (seg_end < n_indices &&
+                    while (seg_end < mark_end &&
                            (vertex_buf[index_buf[seg_end]].a != 0xFF) == semi)
                         seg_end += 3;
                 }
-                if (seg_end > n_indices)
-                    seg_end = n_indices;
+                if (seg_end > mark_end)
+                    seg_end = mark_end;
                 SemiBox box;
                 bool visible = PrimitiveBox(
                     seg_start, seg_end, midpoint, target_index != 0,
-                    target_scale, sub_x, sub_y, target_centre, ws_squeeze, clip,
-                    &box);
+                    target_scale, view->offset, view->sub_x, view->sub_y,
+                    view->target_centre, view->ws_squeeze, view->clip, &box);
                 if (semi && n_segments && !destination_fetch) {
                     bool overlaps = false;
                     for (int i = 0; visible && i < n_segments; ++i)
@@ -5031,7 +5183,8 @@ void Draw_FlushBuffer(void) {
                 if (!visible)
                     box.x0 = box.x1 = 0;
                 boxes[n_segments] = box;
-                segments[n_segments++] = (DrawSegment){seg_start, seg_end, semi};
+                segments[n_segments++] =
+                    (DrawSegment){seg_start, seg_end, semi, mark};
                 n_draws += semi ? 1 : 2;
             }
             if (!n_segments) {
@@ -5041,10 +5194,8 @@ void Draw_FlushBuffer(void) {
             /* Up to four sampled textures for each draw. Reserve both heaps'
              * worst-case sampler use before any destination copy. */
             cmd = ReserveDrawDescriptors(4u * (unsigned)n_draws);
-            if (!cmd) {
-                Draw_ResetBuffer();
-                return;
-            }
+            if (!cmd)
+                goto abort_flush;
             SDL_GPUCopyPass* blend_copy = NULL;
             for (int i = 0; i < n_segments && !destination_fetch; ++i) {
                 if (!segments[i].semi)
@@ -5072,24 +5223,6 @@ void Draw_FlushBuffer(void) {
             ++frame_stats_batches;
             SDL_GPURenderPass* pass =
                 SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
-            {
-                const float grid_scale_x = GetDrawGridXScale();
-                const float render_scale = (float)target_scale;
-                const SDL_GPUViewport grid_viewport = {
-                    .x = (float)draw_offset.x * render_scale *
-                         (1.0f - grid_scale_x),
-                    .y = 0.0f,
-                    .w = (float)VRAM_W * render_scale * grid_scale_x,
-                    .h = (float)VRAM_H * render_scale,
-                    .min_depth = 0.0f,
-                    .max_depth = 1.0f,
-                };
-                SDL_SetGPUViewport(pass, &grid_viewport);
-            }
-            SDL_Rect scaled_scissor = {
-                clip.x * (int)target_scale, clip.y * (int)target_scale,
-                clip.w * (int)target_scale, clip.h * (int)target_scale};
-            SDL_SetGPUScissor(pass, &scaled_scissor);
             const SDL_GPUBufferBinding vb = {.buffer = vbuf};
             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
             const SDL_GPUBufferBinding ib = {.buffer = ibuf};
@@ -5101,33 +5234,17 @@ void Draw_FlushBuffer(void) {
                  .sampler=dialogue_font_batch>=0?native_fonts[dialogue_font_batch].sampler:(sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_sampler : vram_sampler},
                 {.texture=clut_cache,.sampler=vram_sampler}};
             SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,PSX_SHADERS_CURRENT ? 4 : 3);
-            /* The viewport maps shader x to offset * (1 - grid) + x * grid;
-             * the shader squeezes around the centre in its own space, so
-             * VRAM x = centre + (offset + x * grid - centre) * squeeze. */
-            const float grid_x = GetDrawGridXScale();
-            const float offset_ubo[8] = {
-                (float)draw_offset.x,
-                (float)draw_offset.y,
-                ((target_index != 0 &&
-                  (geometry_correction || effect_geometry_correction))
-                     ? 1.0f
-                     : 0.0f) +
-                    (midpoint ? 2.0f : 0.0f),
-                PSX_SHADERS_CURRENT ? (float)target_scale
-                                    : (target_scale > 1 ? 1.0f : 0.0f),
-                ws_squeeze,
-                (target_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,
-                sub_x,
-                sub_y};
-            SDL_PushGPUVertexUniformData(
-                cmd, 0, offset_ubo, sizeof(offset_ubo));
-            const u32 pass_flags =
-                (target_index && model_filtering ? 1u : 0u) |
-                (target_index && sprite_filtering ? 4u : 0u) |
-                (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
-                (PSX_SHADERS_CURRENT && mask_set_bit ? 8u : 0u) |
-                (PSX_SHADERS_CURRENT && mask_check_bit ? 16u : 0u);
+            int pass_mark = -1;
             for (int s = 0; s < n_segments; ++s) {
+                const DrawView* view = &views[segments[s].mark];
+                if (segments[s].mark != pass_mark) {
+                    pass_mark = segments[s].mark;
+                    SDL_SetGPUViewport(pass, &view->viewport);
+                    SDL_SetGPUScissor(pass, &view->scissor);
+                    SDL_PushGPUVertexUniformData(
+                        cmd, 0, view->offset_ubo, sizeof(view->offset_ubo));
+                }
+                const u32 pass_flags = view->pass_flags;
                 const bool semi = segments[s].semi;
                 const Uint32 first = (Uint32)segments[s].start;
                 const Uint32 count = (Uint32)(segments[s].end - segments[s].start);
@@ -5135,7 +5252,7 @@ void Draw_FlushBuffer(void) {
                  * one draw: pass 3 writes colour and mask bit together,
                  * blended by the destination's mask bit (alpha), so a pixel
                  * masked by an earlier primitive of the batch is kept. */
-                const bool checked = PSX_SHADERS_CURRENT && !semi && mask_check_bit;
+                const bool checked = PSX_SHADERS_CURRENT && !semi && view->mask_check;
                 const u32 color_pass[4] = {
                     semi ? 2u : checked ? 3u : 0u, target_scale,
                     draw_grid_source_width == draw_grid_target_width, pass_flags};
@@ -5166,10 +5283,19 @@ void Draw_FlushBuffer(void) {
             start = end;
         }
     }
-    MarkVramDirty(scissor_rect);
+    ApplyDrawState(&current_state);
+    for (int k = 0; k < n_marks; ++k) {
+        const SDL_Rect area = draw_marks[k].state.scissor;
+        if (area.w > 0 && area.h > 0)
+            MarkVramDirty(area);
+    }
 #ifdef PE_PS5_GPU_NATIVE
     CommitDrawPresentation();
 #endif
+    Draw_ResetBuffer();
+    return;
+abort_flush:
+    ApplyDrawState(&current_state);
     Draw_ResetBuffer();
 }
 

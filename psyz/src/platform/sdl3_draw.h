@@ -243,7 +243,11 @@ void Draw_SetMask(int bit0, int bit1) {
      * whose bit 15 is set. Primitives queued before it keep the old mode. */
     if (mask_set_bit == (bit0 != 0) && mask_check_bit == (bit1 != 0))
         return;
+#ifdef DRAW_STATE_MARKS
+    DrawStateChanging();
+#else
     Draw_FlushBuffer();
+#endif
     mask_set_bit = bit0 != 0;
     mask_check_bit = bit1 != 0;
 }
