@@ -2159,6 +2159,17 @@ static void MaskWidescreenEnds(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target
     }
 }
 
+/* A shift of the widescreen view's source, in buffer pixels, as whole
+ * pixels of the output it is shown on (per_pixel of them a buffer pixel),
+ * picked out by the nearest whole pixels of its k times prescale. */
+static float WidescreenRestOnOutput(float shift, float per_pixel, Uint32 k) {
+    if (!(per_pixel > 0.0f))
+        return shift;
+    k = SDL_max(k, 1u);
+    const float output = SDL_roundf(shift * per_pixel);
+    return SDL_roundf(output / per_pixel * (float)k) / (float)k;
+}
+
 #ifdef PE_PS5
 /* Unsqueezed CPU equivalent of WidescreenFieldStep. Quantize at the actual
  * destination grid; retain the fractional remainder for presentation. */
@@ -2535,7 +2546,18 @@ static void PlatformBackend_Present(void) {
                     float sx0 = f0 * (float)src.w, sx1 = f1 * (float)src.w;
                     /* a buffer pixel off the top and bottom leaves room to
                      * show the room up to half a pixel up or down */
-                    const float sy = rest_y * (float)n;
+                    float sy = rest_y * (float)n;
+                    /* The view is sharp: a shift by part of an output row
+                     * shows as a whole row in some bands of the screen and
+                     * as none or a blend in others, so things a few bands
+                     * apart shook against each other while a camera panned
+                     * (a chest's lid on its body). Shown by whole output
+                     * rows, the picture moves as one. Across, the 4/3
+                     * stretch moves edges unevenly for whole-pixel pans as
+                     * much, so the rest keeps its finer steps there. */
+                    if (src.h > 2)
+                        sy = WidescreenRestOnOutput(
+                            sy, (float)dst.h / (float)(src.h - 2), ky);
                     ws_view = true;
 #ifdef PE_PS5_GPU_NATIVE
                     fsr_wide_crop=fsr1_requested;
