@@ -4162,16 +4162,8 @@ void Draw_FlushBuffer(void) {
      * narrower than the screen (a menu list) is squeezed with its contents;
      * the full-width one is kept, so what lies past the screen's edges stays.
      */
-    const float ws_squeeze = WidescreenDraw() ? WS_SQUEEZE : 1.0f;
-    const float ws_centre = WidescreenCentre();
-    SDL_Rect clip = scissor_rect;
-    if (ws_squeeze < 1.0f && clip.w < display_size.x) {
-        float x0 = ws_centre + ((float)clip.x - ws_centre) * ws_squeeze;
-        float x1 =
-            ws_centre + ((float)(clip.x + clip.w) - ws_centre) * ws_squeeze;
-        clip.x = (int)SDL_floorf(x0);
-        clip.w = (int)SDL_ceilf(x1) - clip.x;
-    }
+    const float wide_squeeze = WidescreenDraw() ? WS_SQUEEZE : 1.0f;
+    const float wide_centre = WidescreenCentre();
     /* Widescreen: the room moves by its whole-pixel step (WidescreenFieldStep)
      * in the shown picture; native VRAM under a high-resolution one keeps
      * the game's own picture for read-backs. */
@@ -4193,8 +4185,22 @@ void Draw_FlushBuffer(void) {
             if(!mid_copy){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation copy pass",false);Draw_ResetBuffer();return;}
             SDL_UploadToGPUBuffer(mid_copy,&vtx_src,&vtx_dst,true);SDL_EndGPUCopyPass(mid_copy);
         }
-        const float target_centre=midpoint&&!ws_centred&&WidescreenDrawPicture()>=0 ?
-            (float)display_area.x+WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()]) : ws_centre;
+        /* The high-resolution picture owns framing. The independent native
+         * target must retain original coordinates and clipping for StoreImage
+         * and texture feedback, including when the view slides at a room edge. */
+        const bool native_reference = scaled_vram_render && target_index == 0;
+        const float ws_squeeze = native_reference ? 1.0f : wide_squeeze;
+        const float target_centre = native_reference ?
+            (float)display_area.x + (float)display_size.x * 0.5f :
+            (midpoint && !ws_centred && WidescreenDrawPicture() >= 0 ?
+                (float)display_area.x + WidescreenPivot(ws_mid_shift[WidescreenDrawPicture()]) : wide_centre);
+        SDL_Rect clip = scissor_rect;
+        if (ws_squeeze < 1.0f && clip.w < display_size.x) {
+            float x0 = wide_centre + ((float)clip.x - wide_centre) * ws_squeeze;
+            float x1 = wide_centre + ((float)(clip.x + clip.w) - wide_centre) * ws_squeeze;
+            clip.x = (int)SDL_floorf(x0);
+            clip.w = (int)SDL_ceilf(x1) - clip.x;
+        }
         unsigned target_scale = target_index ? internal_res : 1;
         float sub_x = 0.0f, sub_y = 0.0f;
         if (target_index || !scaled_vram_render)
