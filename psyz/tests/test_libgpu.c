@@ -724,6 +724,92 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 #endif
 }
 
+/* The dark-to-bright edges of a captured frame along rows (vertical) or
+ * columns, averaged over a band across them, each to the fraction of an
+ * output pixel: the dark share of a window before it. */
+static int WideEdges(const u8 *pixels, int w, int h, int vertical, int across0,
+                     int across1, float *edges, int max) {
+    const int length = vertical ? h : w;
+    float *profile = calloc((size_t)length, sizeof(float));
+    if (!profile)
+        return 0;
+    for (int p = 0; p < length; ++p) {
+        for (int a = across0; a < across1; ++a) {
+            const int x = vertical ? a : p, y = vertical ? p : a;
+            profile[p] += pixels[((size_t)y * w + x) * 3] / 255.0f;
+        }
+        profile[p] /= (float)(across1 - across0);
+    }
+    int count = 0;
+    for (int p = 7; p + 6 < length && count < max; ++p) {
+        if (profile[p - 1] >= 0.5f || profile[p] < 0.5f)
+            continue;
+        float dark = 0.0f;
+        for (int q = p - 6; q < p + 6; ++q)
+            dark += 1.0f - profile[q];
+        edges[count++] = (float)(p - 6) + dark;
+    }
+    free(profile);
+    return count;
+}
+
+/* How far apart the edges of stripes down and across a widescreen frame
+ * move, at most, over shifts of the room (pan 0) or of the drawing by whole
+ * game pixels (pan 1). */
+static void WideEdgeSpread(int pan, float spread[2]) {
+    enum {ROWS=7,COLUMNS=8};
+    RECT area={0,0,320,224};float first[2][COLUMNS];
+    spread[0]=spread[1]=0.0f;
+    for(int step=0;step<48;++step){
+        const float d=pan?0.0f:(float)step/48.0f;const int moved=pan?step%6:0;
+        Psyz_VideoSetWidescreenPictureShifted(0,-112,432,d,d,0);
+        ClearImage(&area,0,0,0);DrawSync(0);
+        for(int i=0;i<ROWS+COLUMNS;++i){
+            TILE tile={0};setTile(&tile);setRGB0(&tile,255,255,255);
+            if(i<ROWS){setXY0(&tile,100+moved,16+32*i+moved);setWH(&tile,120,16);}
+            else{setXY0(&tile,8+40*(i-ROWS)+moved,190+moved);setWH(&tile,20,20);}
+            DrawPrim(&tile);
+        }
+        DrawSync(0);
+        int w,h;u8 *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+        float edges[2][COLUMNS];
+        zassert_s32_eq(ROWS,WideEdges(pixels,w,h,1,w/2-w/20,w/2+w/20,edges[0],COLUMNS));
+        zassert_s32_eq(COLUMNS,WideEdges(pixels,w,h,0,h*200/224-h/60,h*200/224+h/60,edges[1],COLUMNS));
+        free(pixels);
+        for(int axis=0;axis<2;++axis)for(int i=1;i<(axis?COLUMNS:ROWS);++i){
+            const float apart=edges[axis][i]-edges[axis][0];
+            if(!step)first[axis][i]=apart;
+            spread[axis]=SDL_max(spread[axis],SDL_fabsf(apart-first[axis][i]));
+        }
+    }
+}
+
+/* The presenter's part of a room's sub-pixel shift moves the whole widescreen
+ * picture alike: edges down the screen keep their distances whatever the
+ * shift, as over pans of whole pixels. A chest lid shook a pixel against its
+ * body while the camera panned, as screen bands moved by different whole
+ * pixels for the same shift (issue 207). Across, the 4/3 stretch moves edges
+ * unevenly for any pan; the shift adds nothing to it. */
+ZTEST(gpu, widescreen_subpixel_shift_moves_picture_uniformly) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);SetDispMask(1);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;draw.isbg=0;PutDrawEnv(&draw);
+    const unsigned scales[]={1,4,8};
+    for(unsigned i=0;i<3;++i){
+        Psyz_VideoSetInternalResolution(scales[i]);Psyz_VideoSetWidescreen(1);
+        float shifted[2],panned[2];
+        WideEdgeSpread(0,shifted);WideEdgeSpread(1,panned);
+        printf("widescreen %ux: edge distances vary by %.3f px down, %.3f across over sub-pixel shifts; %.3f, %.3f over whole-pixel pans\n",
+            scales[i],shifted[0],shifted[1],panned[0],panned[1]);
+        zexpect_s32_eq(1,shifted[0]<=0.05f);
+        zexpect_s32_eq(1,shifted[0]<=panned[0]+0.01f);
+        zexpect_s32_eq(1,shifted[1]<=panned[1]+0.01f);
+    }
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
 ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");
