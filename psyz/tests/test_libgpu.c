@@ -656,8 +656,8 @@ ZTEST(gpu, scaled_widescreen_keeps_native_readback) {
 }
 
 ZTEST(gpu, widescreen_margin_color_is_independent_of_atlas_slot) {
-#if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU atlases");
     Psyz_GpuResetSpriteAtlases();
     const uint64_t key=UINT64_C(0x7a73123400000000);
     char path[512],filler_path[512];
@@ -709,6 +709,8 @@ ZTEST(gpu, widescreen_margin_color_is_independent_of_atlas_slot) {
     }
     Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
     Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU atlases");
 #endif
 }
 
