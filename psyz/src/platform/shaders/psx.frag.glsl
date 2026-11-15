@@ -29,6 +29,25 @@ layout(set = 2, binding = 1) uniform sampler2D texBlend;
 layout(set = 2, binding = 2) uniform sampler2D texHD;
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
 
+// Presentation-only margins can use different tile grids for the same RGB
+// surface. Quantize the interpolation phase before integer filtering so atlas
+// placement cannot change a half-way color rounding decision.
+vec4 sampleMarginMaterial() {
+    ivec2 size = textureSize(texHD, 0);
+    // Margin UVs are cell-local. Their integer atlas origin travels flat in
+    // uvBounds.xy, avoiding precision loss from interpolating large UVs.
+    ivec2 fixedUV = ivec2(floor((hdUV.xy - 0.5) * 256.0 + 0.5));
+    ivec2 base = (fixedUV >> 8) + ivec2(uvBounds.xy);
+    uvec2 f = uvec2(fixedUV & 255);
+    uvec4 a = uvec4(floor(texelFetch(texHD, clamp(base, ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 b = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(1,0), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 c = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(0,1), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 d = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(1,1), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 color = (a*(256u-f.x)*(256u-f.y) + b*f.x*(256u-f.y) +
+                  c*(256u-f.x)*f.y + d*f.x*f.y + 32768u) >> 16;
+    return vec4(color)/255.0;
+}
+
 bool nativeAffineAttributes() {
     return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeOriginRGB.w != 0;
 }
@@ -160,7 +179,7 @@ void main() {
     if (hdUV.z>1.5 && hdUV.z<3.5) {
         if (hdUV.z>2.5 || passMode.y<=1u) discard;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
-        vec4 material=texture(texHD,hdUV.xy);
+        vec4 material=sampleMarginMaterial();
         if (material.a<0.5) discard;
         FragColor=vec4(clamp(material.rgb*tint,0.0,1.0),passMode.x==1u?0.0:1.0);
         return;

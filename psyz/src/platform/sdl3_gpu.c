@@ -3923,6 +3923,15 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
+                if (atlas_extension) {
+                    // Presentation-only margins do not consume native UV
+                    // bounds. Keep their interpolated UVs local to the cell;
+                    // carry the exact integer atlas origin without interpolation.
+                    vertex_cur[i].hd_uv[0]=(i&1)?64.0f:0.0f;
+                    vertex_cur[i].hd_uv[1]=(i&2)?64.0f:0.0f;
+                    vertex_cur[i].uv_bounds[0]=left;
+                    vertex_cur[i].uv_bounds[1]=top;
+                }
                 vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
                     (sprite_atlases_enabled?coverage:0);
             }

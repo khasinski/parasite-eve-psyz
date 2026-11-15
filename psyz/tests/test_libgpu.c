@@ -655,6 +655,63 @@ ZTEST(gpu, scaled_widescreen_keeps_native_readback) {
 #endif
 }
 
+ZTEST(gpu, widescreen_margin_color_is_independent_of_atlas_slot) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    Psyz_GpuResetSpriteAtlases();
+    const uint64_t key=UINT64_C(0x7a73123400000000);
+    char path[512],filler_path[512];
+    snprintf(path,sizeof(path),"%spsyz-margin-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    snprintf(filler_path,sizeof(filler_path),"%s.filler.png",path);
+    SDL_Surface *image=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
+    for(int y=0;y<136;++y)for(int x=0;x<68;++x){
+        int sx=x<2?0:x>65?63:x-2,sy=y%68;sy=sy<2?0:sy>65?63:sy-2;
+        u8 *p=(u8 *)image->pixels+y*image->pitch+x*4;
+        p[0]=(u8)(sx*37+sy*19);p[1]=(u8)(sx*11+sy*53);p[2]=(u8)(sx*71+sy*7);p[3]=255;
+    }
+    zassert_s32_eq(1,SDL_SavePNG(image,path));SDL_DestroySurface(image);
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,path));
+    // Place the identical second material near the far edge of the large GPU
+    // atlas. Interpolating absolute normalized UVs used to change its colors.
+    image=SDL_CreateSurface(4*68,59*136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
+    SDL_FillSurfaceRect(image,NULL,SDL_MapSurfaceRGB(image,0,0,0));
+    zassert_s32_eq(1,SDL_SavePNG(image,filler_path));SDL_DestroySurface(image);
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+1,filler_path));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+2,path));SDL_RemovePath(path);SDL_RemovePath(filler_path);
+    zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);Psyz_VideoSetWidescreenPicture(0,-56,432);
+    const int scales[]={2,4,7,8};RECT area={0,0,320,224};
+    for(unsigned s=0;s<sizeof(scales)/sizeof(scales[0]);++s)for(int wide=0;wide<2;++wide){
+        Psyz_VideoSetInternalResolution(scales[s]);Psyz_VideoSetWidescreen(wide);
+        u8 *reference=NULL;int rw=0,rh=0;
+        for(unsigned variant=0;variant<2;++variant){
+            ClearImage(&area,16,24,32);DrawSync(0);
+            struct {u_long address,length;u32 words[7];} packet={0};
+            uint64_t material=key+variant*2;
+            packet.length=7;packet.words[0]=0xF7800000;packet.words[1]=(u32)material;packet.words[2]=(u32)(material>>32);
+            packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;packet.words[5]=(u16)-32|(16u<<16);
+            termPrim(&packet);DrawOTag((OT_TYPE *)&packet);DrawSync(0);
+            int w,h;u8 *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+            if(wide){
+                unsigned bright=0;int margin=(w-320*scales[s])/2;
+                for(int y=0;y<h;++y)for(int x=0;x<margin;++x){
+                    const u8 *p=pixels+((size_t)y*w+x)*3;
+                    bright+=p[0]>120 && p[1]>120 && p[2]>60;
+                }
+                zassert_s32_eq(1,bright>(unsigned)scales[s]*16);
+            }
+            if(!variant){reference=pixels;rw=w;rh=h;}
+            else{zassert_s32_eq(rw,w);zassert_s32_eq(rh,h);zassert_s32_eq(0,memcmp(reference,pixels,(size_t)w*h*3));free(pixels);}
+        }
+        free(reference);
+    }
+    Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
 ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
