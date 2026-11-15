@@ -880,10 +880,10 @@ static void WideEdgeSpread(int pan, float spread[2]) {
 
 /* The presenter's part of a room's sub-pixel shift moves the whole widescreen
  * picture alike: edges down the screen keep their distances whatever the
- * shift, as they do over pans of whole pixels. A chest lid shook a pixel
- * against its body while the camera panned, as screen bands moved by
- * different whole pixels for the same shift (issue 207). Across, the 4/3
- * stretch moves edges unevenly for any pan; the shift adds nothing to it. */
+ * shift, as over pans of whole pixels. A chest lid shook a pixel against its
+ * body while the camera panned, as screen bands moved by different whole
+ * pixels for the same shift (issue 207). Across, the 4/3 stretch moves edges
+ * unevenly for any pan; the shift adds nothing to it. */
 ZTEST(gpu, widescreen_subpixel_shift_moves_picture_uniformly) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
@@ -896,7 +896,7 @@ ZTEST(gpu, widescreen_subpixel_shift_moves_picture_uniformly) {
         WideEdgeSpread(0,shifted);WideEdgeSpread(1,panned);
         printf("widescreen %ux: edge distances vary by %.3f px down, %.3f across over sub-pixel shifts; %.3f, %.3f over whole-pixel pans\n",
             scales[i],shifted[0],shifted[1],panned[0],panned[1]);
-        zexpect_s32_eq(1,shifted[0]<=0.1f);
+        zexpect_s32_eq(1,shifted[0]<=0.05f);
         zexpect_s32_eq(1,shifted[0]<=panned[0]+0.01f);
         zexpect_s32_eq(1,shifted[1]<=panned[1]+0.01f);
     }
