@@ -447,6 +447,7 @@ static bool widescreen;
 /* Rendered-frame capture uses the same final widescreen crop and scaling as
  * presentation, into an offscreen texture even when the window is hidden. */
 static SDL_GPUTexture* ws_capture;
+static SDL_GPUTexture* ws_black;
 static Uint32 ws_capture_width, ws_capture_height;
 static bool ws_capture_active;
 static struct {
@@ -2126,6 +2127,38 @@ static SDL_GPUBlitRegion PrescaleWidescreen(
             SDL_clamp((Uint32)SDL_lroundf((y1 - y0) * (float)ky), 1u, ph - py)};
 }
 
+/* Clip room ends after scaling the complete view. Cropping the source and
+ * independently rounding a smaller destination changes the sample grid of
+ * the original picture whenever optional side artwork changes its bounds. */
+static void MaskWidescreenEnds(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
+                               SDL_Rect dst, float left, float right) {
+    if (left <= 0.0f && right >= 1.0f) return;
+    if (!ws_black) {
+        const SDL_GPUTextureCreateInfo info = {
+            .type=SDL_GPU_TEXTURETYPE_2D, .format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER|SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+            .width=1, .height=1, .layer_count_or_depth=1, .num_levels=1};
+        ws_black=SDL_CreateGPUTexture(device,&info);
+        if (!ws_black) return;
+        SDL_GPUColorTargetInfo clear={.texture=ws_black,.load_op=SDL_GPU_LOADOP_CLEAR,
+            .store_op=SDL_GPU_STOREOP_STORE,.clear_color={0,0,0,1}};
+        SDL_GPURenderPass *pass=SDL_BeginGPURenderPass(cmd,&clear,1,NULL);
+        SDL_EndGPURenderPass(pass);
+    }
+    const int ends[2]={SDL_clamp((int)SDL_lroundf(left*dst.w),0,dst.w),
+                       SDL_clamp((int)SDL_lroundf(right*dst.w),0,dst.w)};
+    for (int side=0;side<2;++side) {
+        int start=side?ends[1]:0, width=side?dst.w-ends[1]:ends[0];
+        if (width<=0) continue;
+        const SDL_GPUBlitInfo mask={
+            .source={.texture=ws_black,.w=1,.h=1},
+            .destination={.texture=target,.x=(Uint32)(dst.x+start),.y=(Uint32)dst.y,
+                          .w=(Uint32)width,.h=(Uint32)dst.h},
+            .load_op=SDL_GPU_LOADOP_LOAD,.filter=SDL_GPU_FILTER_NEAREST};
+        SDL_BlitGPUTexture(cmd,&mask);
+    }
+}
+
 #ifdef PE_PS5
 /* Unsqueezed CPU equivalent of WidescreenFieldStep. Quantize at the actual
  * destination grid; retain the fractional remainder for presentation. */
@@ -2425,6 +2458,7 @@ static void PlatformBackend_Present(void) {
                 WndSize win = {(int)sc_w, (int)sc_h};
                 SDL_Rect dst = FitGameToWindow(game_aspect, win);
                 bool ws_view = false;
+                float ws_clip_left=0.0f,ws_clip_right=1.0f;
 #ifdef PE_PS5_GPU_NATIVE
                 bool fsr_wide_crop=false;
                 SDL_GPUBlitRegion fsr_wide_source={0};
@@ -2481,11 +2515,13 @@ static void PlatformBackend_Present(void) {
                     const float shown_l = SDL_max(view_l, left);
                     const float shown_r =
                         SDL_max(shown_l, SDL_min(view_r, right));
+                    ws_clip_left=SDL_clamp((shown_l-view_l)/(2.0f*half),0.0f,1.0f);
+                    ws_clip_right=SDL_clamp((shown_r-view_l)/(2.0f*half),0.0f,1.0f);
                     /* game x -> fraction of the squeezed buffer */
                     const float f0 =
-                        (pivot + (shown_l - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (view_l - rest_x - pivot) * WS_SQUEEZE) / w;
                     const float f1 =
-                        (pivot + (shown_r - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (view_r - rest_x - pivot) * WS_SQUEEZE) / w;
                     dst = FitGameToWindow(16.0f / 9.0f, win);
                     /* whole prescale factors from the view's size, so they
                      * hold while a picture end moves through the view */
@@ -2496,20 +2532,7 @@ static void PlatformBackend_Present(void) {
                     const Uint32 ky =
                         src.h > 2 ? ((Uint32)dst.h + src.h - 3) / (src.h - 2)
                                   : 1;
-                    const int dx0 =
-                        dst.x + (int)SDL_lroundf((shown_l - view_l) /
-                                                 (2.0f * half) * (float)dst.w);
-                    const int dx1 =
-                        dst.x + (int)SDL_lroundf((shown_r - view_l) /
-                                                 (2.0f * half) * (float)dst.w);
                     float sx0 = f0 * (float)src.w, sx1 = f1 * (float)src.w;
-                    if (sx1 > sx0 && dx1 > dx0) {
-                        dst.x = dx0;
-                        dst.w = dx1 - dx0;
-                    } else {
-                        sx0 = 0.0f;
-                        sx1 = (float)src.w;
-                    }
                     /* a buffer pixel off the top and bottom leaves room to
                      * show the room up to half a pixel up or down */
                     const float sy = rest_y * (float)n;
@@ -2577,6 +2600,7 @@ static void PlatformBackend_Present(void) {
                                       : SDL_GPU_FILTER_NEAREST,
                 };
                 SDL_BlitGPUTexture(cmd, &blit);
+                if (ws_view) MaskWidescreenEnds(cmd,swapchain,dst,ws_clip_left,ws_clip_right);
 #ifdef PE_PS5_GPU_NATIVE
                 EndCommittedPresentation(&committed_scope);
 #endif
@@ -2672,6 +2696,8 @@ static void QuitPlatform(void) {
         if (ws_capture)
             SDL_ReleaseGPUTexture(device, ws_capture);
         ws_capture = NULL;
+        if (ws_black) SDL_ReleaseGPUTexture(device,ws_black);
+        ws_black=NULL;
         ws_capture_width = ws_capture_height = 0;
         ws_capture_active = false;
         for (int i = 0; i < BLEND_COUNT; i++) {

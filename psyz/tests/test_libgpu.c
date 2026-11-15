@@ -655,6 +655,41 @@ ZTEST(gpu, scaled_widescreen_keeps_native_readback) {
 #endif
 }
 
+ZTEST(gpu, widescreen_picture_bounds_do_not_rescale_native_content) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");
+    if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU presentation");
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_VideoSetWidescreen(1);Psyz_VideoSetGeometryCorrection(0);
+    const int scales[]={2,4,7,8};RECT area={0,0,320,224};
+    for(unsigned s=0;s<sizeof(scales)/sizeof(scales[0]);++s){
+        Psyz_VideoSetInternalResolution(scales[s]);
+        ClearImage(&area,16,24,32);
+        for(int x=0;x<320;x+=16){
+            TILE tile={0};setTile(&tile);setXY0(&tile,x,24);setWH(&tile,16,176);
+            setRGB0(&tile,(x*13+31)&255,(x*7+63)&255,(x*3+127)&255);DrawPrim(&tile);
+        }
+        DrawSync(0);
+        Psyz_VideoSetWidescreenPicture(0,0,320);
+        int w,h,ow,oh;u8 *narrow=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,narrow);
+        Psyz_VideoSetWidescreenPicture(0,-56,376);
+        u8 *wide=Psyz_VideoAllocRenderedFrame(&ow,&oh);zassert_ptr_ne(NULL,wide);
+        zassert_s32_eq(w,ow);zassert_s32_eq(h,oh);
+        int left=(w-320*scales[s]+1)/2+2,right=(w+320*scales[s])/2-2;
+        unsigned bright=0;
+        for(int y=0;y<h;++y){
+            for(int x=left;x<right;++x)bright+=narrow[((size_t)y*w+x)*3]>64;
+            zassert_s32_eq(0,memcmp(narrow+((size_t)y*w+left)*3,wide+((size_t)y*w+left)*3,(size_t)(right-left)*3));
+        }
+        zassert_s32_eq(1,bright>1000);free(narrow);free(wide);
+    }
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU presentation");
+#endif
+}
+
 ZTEST(gpu, widescreen_margin_color_is_independent_of_atlas_slot) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU atlases");
