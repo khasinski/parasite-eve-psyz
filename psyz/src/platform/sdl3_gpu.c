@@ -584,6 +584,22 @@ static void WidescreenFieldStep(int picture, float n, float* qx, float* qy) {
     *qy = SDL_roundf(ws_picture[picture].ey * n) / n;
 }
 
+/* The dither matrix's origin, as passMode.w bits 8-11 of the triangle passes:
+ * the room's step (WidescreenFieldStep) in buffer pixels across and down,
+ * mod 4. The matrix is anchored to the buffer, so a room moved by part of a
+ * game pixel took another dither each frame, and dithered parts of one model
+ * (a chest's lid and body) shifted against each other by a pixel at 8x while
+ * a camera panned. With the matrix moved along, the step moves the room's
+ * picture as a whole. Drawing not moved (and all without widescreen) keeps
+ * the matrix where it was. */
+static u32 WidescreenDitherOrigin(float step_x, float step_y, unsigned scale) {
+    if (!widescreen)
+        return 0;
+    const int x = (int)SDL_lroundf(step_x * (float)scale);
+    const int y = (int)SDL_lroundf(step_y * (float)scale);
+    return ((u32)(x & 3) | ((u32)(y & 3) << 2)) << 8;
+}
+
 /* The squeeze's fixed point. It moves 3 pixels against each pixel of view
  * shift, so the buffer holds the shifted view around its own centre: game x
  * centre + shift lands on the buffer's centre. */
@@ -4520,6 +4536,8 @@ void Draw_FlushBuffer(void) {
         const int clip_x1 = SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale;
         const int clip_y1 = SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale;
         const float grid_scale_x = GetDrawGridXScale();
+        const u32 dither_origin = WidescreenDitherOrigin(
+            sub_x * grid_scale_x * ws_squeeze, sub_y, target_scale);
         int start = 0;
         while (start < n_indices) {
             bool semi = vertex_buf[index_buf[start]].a != 0xFF;
@@ -4677,7 +4695,8 @@ void Draw_FlushBuffer(void) {
                 draw_grid_source_width == draw_grid_target_width,
                 (target_index && model_filtering ? 1u : 0u) |
                     (target_index && sprite_filtering ? 4u : 0u) |
-                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+                    dither_origin};
             SDL_PushGPUFragmentUniformData(
                 cmd, 0, color_pass, sizeof(color_pass));
 
@@ -4694,7 +4713,8 @@ void Draw_FlushBuffer(void) {
                     draw_grid_source_width == draw_grid_target_width,
                     (target_index && model_filtering ? 1u : 0u) |
                     (target_index && sprite_filtering ? 4u : 0u) |
-                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+                    dither_origin};
                 SDL_PushGPUFragmentUniformData(
                     cmd, 0, mask_pass, sizeof(mask_pass));
                 SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);

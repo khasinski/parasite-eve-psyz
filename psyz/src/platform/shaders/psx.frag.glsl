@@ -118,8 +118,10 @@ vec3 applyDither(vec3 c) {
     // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
     if ((passMode.w & 2u) != 0u) return clamp(c, 0.0, 1.0);
     if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;
-    int dx = int(gl_FragCoord.x) & 3;
-    int dy = int(gl_FragCoord.y) & 3;
+    // passMode.w bits 8-11: the matrix's origin (x, y), where widescreen
+    // moved the room by part of a game pixel, so the room keeps its dither.
+    int dx = (int(gl_FragCoord.x) - int((passMode.w >> 8u) & 3u)) & 3;
+    int dy = (int(gl_FragCoord.y) - int((passMode.w >> 10u) & 3u)) & 3;
     float off = ditherMatrix[dy][dx];
     vec3 c8 = c * 255.0 + off;
     vec3 c5 = clamp(floor(c8 / 8.0), 0.0, 31.0);

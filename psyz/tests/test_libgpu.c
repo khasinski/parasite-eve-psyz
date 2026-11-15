@@ -810,6 +810,57 @@ ZTEST(gpu, widescreen_subpixel_shift_moves_picture_uniformly) {
 #endif
 }
 
+/* A dithered room drawn moved by its widescreen step (k/8 of a game pixel
+ * down at 8x, all of it in the drawing) against the same room unmoved: the
+ * mean difference of the shown pixels below the room's top edge, which
+ * moves with it. */
+static float WideDitherDrift(unsigned step) {
+    Psyz_VideoSetWidescreenPictureShifted(0,-112,432,0.0f,(float)step/8.0f,0);
+    Psyz_VideoSetWidescreenField(1);
+    RECT area={0,0,320,224};ClearImage(&area,0,0,0);DrawSync(0);
+    POLY_G4 poly;SetPolyG4(&poly);setXYWH(&poly,100,60,120,100);
+    setRGB0(&poly,130,130,130);setRGB1(&poly,130,130,130);
+    setRGB2(&poly,130,130,130);setRGB3(&poly,130,130,130);
+    DrawPrim(&poly);DrawSync(0);
+    int w,h;u8 *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);
+    zassert_ptr_ne(NULL,pixels);
+    static u8 first[64*256];
+    int top=0;
+    while(top<h && pixels[((size_t)top*w+w/2)*3]<64)++top;
+    zassert_s32_eq(1,top>8 && top+80<h);
+    float diff=0.0f;
+    for(int y=0;y<64;++y)for(int x=0;x<256;++x){
+        const u8 p=pixels[((size_t)(top+8+y)*w+w/2-128+x)*3];
+        if(!step)first[y*256+x]=p;
+        else diff+=(float)abs((int)p-(int)first[y*256+x]);
+    }
+    free(pixels);
+    return diff/(64.0f*256.0f);
+}
+
+/* The room's widescreen step moves its dither with it: the dither matrix
+ * stays on the buffer, so a room moved by part of a game pixel took another
+ * dither each frame, and dithered parts of one model (a chest's lid and
+ * body, issue 207) shifted against each other by a pixel at 8x while the
+ * camera panned. */
+ZTEST(gpu, widescreen_room_step_keeps_its_dither) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);SetDispMask(1);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=1;draw.isbg=0;PutDrawEnv(&draw);
+    Psyz_VideoSetInternalResolution(8);Psyz_VideoSetWidescreen(1);
+    float worst=0.0f;
+    for(unsigned step=0;step<8;++step){
+        const float diff=WideDitherDrift(step);
+        worst=SDL_max(worst,diff);
+        printf("widescreen 8x: room moved %u/8 px down differs from unmoved by %.3f\n",step,diff);
+    }
+    zexpect_s32_eq(1,worst<=0.5f);
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+    draw.dtd=0;PutDrawEnv(&draw);
+#endif
+}
+
 ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");
