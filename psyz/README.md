@@ -18,7 +18,7 @@ texels including its gutter; the paired reference plane does not add bitmap cell
 At least one material cell must contain authored alpha. Selected static cells
 may cross a native staircase only with a reviewed, coherent backdrop. Unselected
 cells retain their own original alpha policy; fully opaque unmarked cells keep
-legacy feathering. Live-palette witnesses continue to guard black reference
+exact native coverage. Live-palette witnesses continue to guard black reference
 pixels. These markers are not blanket permission to extend moving silhouettes.
 Review every animation pose behind an affected static foreground. GPU checkpoint
 resource identities include selective masks, so a different selection cannot be

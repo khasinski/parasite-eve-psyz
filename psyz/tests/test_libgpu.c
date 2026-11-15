@@ -803,14 +803,16 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
             zassert_s32_eq(0,memcmp(a,b,3));
     }
     zassert_s32_eq(1,changed>500);
-    // The opaque texels next to the native transparent hole feather into the
-    // clear background; the hole itself and the interior remain authoritative.
+    // Opaque texels next to the native transparent hole keep full HD
+    // coverage: fading them would expose whatever lies beneath the hole
+    // (issue #208). The hole itself was checked against native above.
     // Compare with the same HD material away from the hole (constant R/G).
-    const u8 *edge=images[1]+(48*w+47)*3;
     const u8 *inside=images[1]+(44*w+50)*3;
-    zassert_s32_eq(1,edge[0]>16 && edge[0]<inside[0]);
-    zassert_s32_eq(1,edge[1]>24 && edge[1]<inside[1]);
-    // Empty neighbouring VRAM must not feather the rectangular tile border.
+    zassert_s32_eq(0,memcmp(images[1]+(48*w+47)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(48*w+50)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(47*w+48)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(50*w+49)*3,inside,2));
+    // Empty neighbouring VRAM must not change the rectangular tile border.
     zassert_s32_eq(0,memcmp(images[1]+(32*w+32)*3,inside,2));
     zassert_s32_eq(0,memcmp(images[1]+(63*w+63)*3,inside,2));
     /* A different room must be able to reuse the bounded cache. Resetting it
@@ -831,6 +833,71 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
 
 /* Authored HD mattes affect presentation only. Legacy RGB materials and PS1
  * semitransparent primitives retain their original coverage/blend rules. */
+/* Room backgrounds are stacks of complementary cutouts: a foreground layer's
+ * opaque texels are exactly the base layer's transparent hole, and nothing is
+ * drawn beneath that hole. With HD materials above 1x, both layers together
+ * must still cover every pixel at full material colour. Fading coverage along
+ * either silhouette darkened the shared staircase towards the clear colour,
+ * outlining every foreground object (issue #208). */
+ZTEST(gpu, hd_room_layers_keep_shared_cutout_edges_opaque) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");
+    if(!backend || strcmp(backend,"gpu"))return;
+    const u16 native_color=25|(20<<5)|(15<<10);
+    const u8 material[3]={200,160,120};
+    SDL_Surface *bmp=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);
+    zassert_ptr_ne(NULL,bmp);
+    for(int y=0;y<136;++y)for(int x=0;x<68;++x){
+        u8 *p=(u8 *)bmp->pixels+y*bmp->pitch+x*4;
+        if(y<68){p[0]=material[0];p[1]=material[1];p[2]=material[2];}
+        else{p[0]=(u8)(25*255/31);p[1]=(u8)(20*255/31);p[2]=(u8)(15*255/31);}
+        p[3]=255;
+    }
+    char path[512];snprintf(path,sizeof(path),"%spsyz-layers-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    zassert_s32_eq(1,SDL_SavePNG(bmp,path));SDL_DestroySurface(bmp);
+    const uint64_t key=UINT64_C(0x5ea3ed9e5ea3ed9e);
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,path));SDL_RemovePath(path);
+    zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);
+    /* A diagonal staircase with a one-texel notch: the base keeps texels on
+     * one side, the foreground (stored next to it in VRAM) exactly the rest. */
+    u16 pixels[16*32];
+    for(int y=0;y<16;++y)for(int x=0;x<16;++x){
+        int front=x+y>=16 || (x==3&&y==3);
+        pixels[y*32+x]=front?0:native_color;
+        pixels[y*32+16+x]=front?native_color:0;
+    }
+    RECT texture={512,0,32,16};LoadImage(&texture,(u_long *)pixels);
+    for(int scale=2;scale<=4;scale+=2){
+        Psyz_VideoSetInternalResolution(scale);
+        RECT clear={0,0,64,64};ClearImage(&clear,0,0,0);
+        DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
+        for(int layer=0;layer<2;++layer){
+            struct {u_long address,length;u32 words[7];} packet={0};
+            packet.length=7;packet.words[0]=0xF7000000;
+            packet.words[1]=(u32)key;packet.words[2]=(u32)(key>>32);
+            packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;
+            packet.words[5]=16u|(16u<<16);packet.words[6]=layer?16u:0u;
+            termPrim(&packet);DrawOTag((OT_TYPE *)&packet);
+        }
+        extern void Psyz_PgxpNextFrame(void);Psyz_PgxpNextFrame();DrawSync(0);
+        int w,h;u8 *image=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,image);
+        zassert_s32_eq(1,w>=32*scale && h>=32*scale);
+        unsigned dark=0;
+        for(int y=16*scale;y<32*scale;++y)for(int x=16*scale;x<32*scale;++x){
+            const u8 *p=image+((size_t)y*w+x)*3;
+            for(int c=0;c<3;++c)if(p[c]+2<material[c])++dark;
+        }
+        free(image);
+        zassert_s32_eq(0,dark);
+    }
+    Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
+    Psyz_GpuSelectSpriteAtlas(0,0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
 ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");
@@ -976,7 +1043,7 @@ ZTEST(gpu, authored_alpha_does_not_change_other_atlas_cells) {
         }
         for(int mode=1;mode<4;++mode)zassert_s32_eq(0,memcmp(native[0],native[mode],sizeof(native[0])));
         /* The edited cell changes only at HD resolution. The untouched
-         * neighbour retains the exact legacy native-silhouette feather. */
+         * neighbour retains its exact native silhouette. */
         zassert_s32_eq(scale>1,memcmp(images[0],images[1],(size_t)w*h*3)!=0);
         zassert_s32_eq(0,memcmp(images[2],images[3],(size_t)w*h*3));
         for(int mode=0;mode<4;++mode)free(images[mode]);
