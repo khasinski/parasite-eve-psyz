@@ -873,7 +873,9 @@ static void WideEdgeSpread(int pan, float spread[2]) {
         for(int axis=0;axis<2;++axis)for(int i=1;i<(axis?COLUMNS:ROWS);++i){
             const float apart=edges[axis][i]-edges[axis][0];
             if(!step)first[axis][i]=apart;
-            spread[axis]=SDL_max(spread[axis],SDL_fabsf(apart-first[axis][i]));
+            float delta=apart-first[axis][i];
+            if(delta<0)delta=-delta;
+            if(delta>spread[axis])spread[axis]=delta;
         }
     }
 }
