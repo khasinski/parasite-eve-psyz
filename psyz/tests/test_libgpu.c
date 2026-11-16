@@ -194,6 +194,68 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 #endif
 }
 
+/* A textureless face has no UV identity. Reusing the vertex buffer for a
+ * textured draw must not split its history from the textured parts beside it. */
+ZTEST(gpu, untextured_geometry_keeps_interpolation_with_textured_neighbors) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend||strcmp(backend,"gpu"))zskip("requires SDL GPU");
+    const unsigned scales[]={2,8,8};
+    for(unsigned scenario=0;scenario<3;++scenario)for(unsigned wide=0;wide<2;++wide){
+        unsigned scale=scales[scenario];
+        Psyz_VideoSetInternalResolution(scale);Psyz_VideoSetAntialiasing(scenario==2);
+        Psyz_VideoSetGeometryCorrection(0);Psyz_VideoSetWidescreen(wide);
+        Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
+        Psyz_GpuSetFrameInterpolation(1);Psyz_GpuResetInterpolation();
+        u16 white[32*16];for(unsigned i=0;i<32*16;++i)white[i]=0x7fff;
+        RECT texture={512,0,32,16};LoadImage(&texture,(u_long *)white);DrawSync(0);
+        RECT clear={0,0,320,480};ClearImage(&clear,0,0,0);DrawSync(0);
+        POLY_F4 face[2]={{0}};POLY_FT4 reference[2]={{0}},poison[2]={{0}};
+        for(unsigned i=0;i<2;++i){
+            int x=40+20*i;
+            setPolyF4(face+i);setRGB0(face+i,0,255,0);setXY4(face+i,x,30,x+16,30,x,46,x+16,46);
+            setPolyFT4(reference+i);setRGB0(reference+i,255,0,0);
+            setXY4(reference+i,x,70,x+16,70,x,86,x+16,86);
+            setUV4(reference+i,0,0,15,0,0,15,15,15);reference[i].tpage=getTPage(2,0,512,0);
+            poison[i]=reference[i];setRGB0(poison+i,0,0,255);
+            setXY4(poison+i,200,100,216,100,200,116,216,116);
+            int u=i?8:0;setUV4(poison+i,u,0,u+15,0,u,15,u+15,15);
+        }
+        Psyz_GpuRegisterInterpolationPair(&face[0].r0,&face[1].r0);
+        Psyz_GpuRegisterInterpolationPair(&reference[0].r0,&reference[1].r0);
+        for(unsigned i=0;i<2;++i){
+            Psyz_GpuBeginInterpolationFrame();
+            DRAWENV draw;SetDefDrawEnv(&draw,0,240*i,320,240);draw.isbg=0;draw.dtd=0;PutDrawEnv(&draw);
+            /* Flush leaves these UVs in the reusable vertex slot. */
+            DrawPrim(poison+i);DrawSync(0);
+            DrawPrim(face+i);DrawPrim(reference+i);DrawSync(0);
+        }
+        DISPENV display;SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);SetDispMask(1);
+        int nw,nh;unsigned char *native=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,native);
+        Psyz_GpuPrepareInterpolatedPresent(240);
+        int red[3],green[3];
+        for(unsigned sample=0;sample<3;++sample){
+            if(sample==2){SetDefDispEnv(&display,0,240,320,240);PutDispEnv(&display);Psyz_GpuPrepareInterpolatedPresent(-1);}
+            VSync(0);int w,h;unsigned char *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+            red[sample]=green[sample]=w;
+            for(unsigned y=20*scale;y<90*scale;++y)for(int x=0;x<w;++x){
+                unsigned char *p=pixels+((size_t)y*w+x)*3;
+                if(p[0]>240&&p[1]<10&&p[2]<10&&x<red[sample])red[sample]=x;
+                if(p[1]>240&&p[0]<10&&p[2]<10&&x<green[sample])green[sample]=x;
+            }
+            printf("Untextured interpolation %ux AA=%u wide=%u sample=%u red=%d green=%d\n",scale,scenario==2,wide,sample,red[sample],green[sample]);
+            zexpect_s32_eq(red[sample],green[sample]);free(pixels);
+        }
+        zexpect_s32_eq(1,red[0]<red[1]&&red[1]<red[2]);
+        SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);
+        unsigned char *after=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,after);
+        zexpect_s32_eq(0,memcmp(native,after,(size_t)nw*nh*3));free(native);free(after);
+        Psyz_GpuSetFrameInterpolation(0);Psyz_VideoSetAntialiasing(0);Psyz_VideoSetWidescreen(0);Psyz_VideoSetInternalResolution(1);
+    }
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, interpolated_widescreen_capture_keeps_midpoint) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU");
@@ -655,6 +717,100 @@ ZTEST(gpu, scaled_widescreen_keeps_native_readback) {
 #endif
 }
 
+ZTEST(gpu, widescreen_picture_bounds_do_not_rescale_native_content) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");
+    if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU presentation");
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_VideoSetWidescreen(1);Psyz_VideoSetGeometryCorrection(0);
+    const int scales[]={2,4,7,8};RECT area={0,0,320,224};
+    for(unsigned s=0;s<sizeof(scales)/sizeof(scales[0]);++s){
+        Psyz_VideoSetInternalResolution(scales[s]);
+        ClearImage(&area,16,24,32);
+        for(int x=0;x<320;x+=16){
+            TILE tile={0};setTile(&tile);setXY0(&tile,x,24);setWH(&tile,16,176);
+            setRGB0(&tile,(x*13+31)&255,(x*7+63)&255,(x*3+127)&255);DrawPrim(&tile);
+        }
+        DrawSync(0);
+        Psyz_VideoSetWidescreenPicture(0,0,320);
+        int w,h,ow,oh;u8 *narrow=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,narrow);
+        Psyz_VideoSetWidescreenPicture(0,-56,376);
+        u8 *wide=Psyz_VideoAllocRenderedFrame(&ow,&oh);zassert_ptr_ne(NULL,wide);
+        zassert_s32_eq(w,ow);zassert_s32_eq(h,oh);
+        int left=(w-320*scales[s]+1)/2+2,right=(w+320*scales[s])/2-2;
+        unsigned bright=0;
+        for(int y=0;y<h;++y){
+            for(int x=left;x<right;++x)bright+=narrow[((size_t)y*w+x)*3]>64;
+            zassert_s32_eq(0,memcmp(narrow+((size_t)y*w+left)*3,wide+((size_t)y*w+left)*3,(size_t)(right-left)*3));
+        }
+        zassert_s32_eq(1,bright>1000);free(narrow);free(wide);
+    }
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU presentation");
+#endif
+}
+
+ZTEST(gpu, widescreen_margin_color_is_independent_of_atlas_slot) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU atlases");
+    Psyz_GpuResetSpriteAtlases();
+    const uint64_t key=UINT64_C(0x7a73123400000000);
+    char path[512],filler_path[512];
+    snprintf(path,sizeof(path),"%spsyz-margin-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    snprintf(filler_path,sizeof(filler_path),"%s.filler.png",path);
+    SDL_Surface *image=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
+    for(int y=0;y<136;++y)for(int x=0;x<68;++x){
+        int sx=x<2?0:x>65?63:x-2,sy=y%68;sy=sy<2?0:sy>65?63:sy-2;
+        u8 *p=(u8 *)image->pixels+y*image->pitch+x*4;
+        p[0]=(u8)(sx*37+sy*19);p[1]=(u8)(sx*11+sy*53);p[2]=(u8)(sx*71+sy*7);p[3]=255;
+    }
+    zassert_s32_eq(1,SDL_SavePNG(image,path));SDL_DestroySurface(image);
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,path));
+    // Place the identical second material near the far edge of the large GPU
+    // atlas. Interpolating absolute normalized UVs used to change its colors.
+    image=SDL_CreateSurface(4*68,59*136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
+    SDL_FillSurfaceRect(image,NULL,SDL_MapSurfaceRGB(image,0,0,0));
+    zassert_s32_eq(1,SDL_SavePNG(image,filler_path));SDL_DestroySurface(image);
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+1,filler_path));
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key+2,path));SDL_RemovePath(path);SDL_RemovePath(filler_path);
+    zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);Psyz_VideoSetWidescreenPicture(0,-56,432);
+    const int scales[]={2,4,7,8};RECT area={0,0,320,224};
+    for(unsigned s=0;s<sizeof(scales)/sizeof(scales[0]);++s)for(int wide=0;wide<2;++wide){
+        Psyz_VideoSetInternalResolution(scales[s]);Psyz_VideoSetWidescreen(wide);
+        u8 *reference=NULL;int rw=0,rh=0;
+        for(unsigned variant=0;variant<2;++variant){
+            ClearImage(&area,16,24,32);DrawSync(0);
+            struct {u_long address,length;u32 words[7];} packet={0};
+            uint64_t material=key+variant*2;
+            packet.length=7;packet.words[0]=0xF7800000;packet.words[1]=(u32)material;packet.words[2]=(u32)(material>>32);
+            packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;packet.words[5]=(u16)-32|(16u<<16);
+            termPrim(&packet);DrawOTag((OT_TYPE *)&packet);DrawSync(0);
+            int w,h;u8 *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+            if(wide){
+                unsigned bright=0;int margin=(w-320*scales[s])/2;
+                for(int y=0;y<h;++y)for(int x=0;x<margin;++x){
+                    const u8 *p=pixels+((size_t)y*w+x)*3;
+                    bright+=p[0]>120 && p[1]>120 && p[2]>60;
+                }
+                zassert_s32_eq(1,bright>(unsigned)scales[s]*16);
+            }
+            if(!variant){reference=pixels;rw=w;rh=h;}
+            else{zassert_s32_eq(rw,w);zassert_s32_eq(rh,h);zassert_s32_eq(0,memcmp(reference,pixels,(size_t)w*h*3));free(pixels);}
+        }
+        free(reference);
+    }
+    Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU atlases");
+#endif
+}
+
 ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
@@ -721,6 +877,145 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
     Psyz_GpuSetSpriteAtlasesEnabled(1);
     free(baseline);free(native);Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
     Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
+/* The dark-to-bright edges of a captured frame along rows (vertical) or
+ * columns, averaged over a band across them, each to the fraction of an
+ * output pixel: the dark share of a window before it. */
+static int WideEdges(const u8 *pixels, int w, int h, int vertical, int across0,
+                     int across1, float *edges, int max) {
+    const int length = vertical ? h : w;
+    float *profile = calloc((size_t)length, sizeof(float));
+    if (!profile)
+        return 0;
+    for (int p = 0; p < length; ++p) {
+        for (int a = across0; a < across1; ++a) {
+            const int x = vertical ? a : p, y = vertical ? p : a;
+            profile[p] += pixels[((size_t)y * w + x) * 3] / 255.0f;
+        }
+        profile[p] /= (float)(across1 - across0);
+    }
+    int count = 0;
+    for (int p = 7; p + 6 < length && count < max; ++p) {
+        if (profile[p - 1] >= 0.5f || profile[p] < 0.5f)
+            continue;
+        float dark = 0.0f;
+        for (int q = p - 6; q < p + 6; ++q)
+            dark += 1.0f - profile[q];
+        edges[count++] = (float)(p - 6) + dark;
+    }
+    free(profile);
+    return count;
+}
+
+/* How far apart the edges of stripes down and across a widescreen frame
+ * move, at most, over shifts of the room (pan 0) or of the drawing by whole
+ * game pixels (pan 1). */
+static void WideEdgeSpread(int pan, float spread[2]) {
+    enum {ROWS=7,COLUMNS=8};
+    RECT area={0,0,320,224};float first[2][COLUMNS];
+    spread[0]=spread[1]=0.0f;
+    for(int step=0;step<48;++step){
+        const float d=pan?0.0f:(float)step/48.0f;const int moved=pan?step%6:0;
+        Psyz_VideoSetWidescreenPictureShifted(0,-112,432,d,d,0);
+        ClearImage(&area,0,0,0);DrawSync(0);
+        for(int i=0;i<ROWS+COLUMNS;++i){
+            TILE tile={0};setTile(&tile);setRGB0(&tile,255,255,255);
+            if(i<ROWS){setXY0(&tile,100+moved,16+32*i+moved);setWH(&tile,120,16);}
+            else{setXY0(&tile,8+40*(i-ROWS)+moved,190+moved);setWH(&tile,20,20);}
+            DrawPrim(&tile);
+        }
+        DrawSync(0);
+        int w,h;u8 *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+        float edges[2][COLUMNS];
+        zassert_s32_eq(ROWS,WideEdges(pixels,w,h,1,w/2-w/20,w/2+w/20,edges[0],COLUMNS));
+        zassert_s32_eq(COLUMNS,WideEdges(pixels,w,h,0,h*200/224-h/60,h*200/224+h/60,edges[1],COLUMNS));
+        free(pixels);
+        for(int axis=0;axis<2;++axis)for(int i=1;i<(axis?COLUMNS:ROWS);++i){
+            const float apart=edges[axis][i]-edges[axis][0];
+            if(!step)first[axis][i]=apart;
+            float delta=apart-first[axis][i];
+            if(delta<0)delta=-delta;
+            if(delta>spread[axis])spread[axis]=delta;
+        }
+    }
+}
+
+/* The presenter's part of a room's sub-pixel shift moves the whole widescreen
+ * picture alike: edges down the screen keep their distances whatever the
+ * shift, as over pans of whole pixels. A chest lid shook a pixel against its
+ * body while the camera panned, as screen bands moved by different whole
+ * pixels for the same shift (issue 207). Across, the 4/3 stretch moves edges
+ * unevenly for any pan; the shift adds nothing to it. */
+ZTEST(gpu, widescreen_subpixel_shift_moves_picture_uniformly) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);SetDispMask(1);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;draw.isbg=0;PutDrawEnv(&draw);
+    const unsigned scales[]={1,4,8};
+    for(unsigned i=0;i<3;++i){
+        Psyz_VideoSetInternalResolution(scales[i]);Psyz_VideoSetWidescreen(1);
+        float shifted[2],panned[2];
+        WideEdgeSpread(0,shifted);WideEdgeSpread(1,panned);
+        printf("widescreen %ux: edge distances vary by %.3f px down, %.3f across over sub-pixel shifts; %.3f, %.3f over whole-pixel pans\n",
+            scales[i],shifted[0],shifted[1],panned[0],panned[1]);
+        zexpect_s32_eq(1,shifted[0]<=0.05f);
+        zexpect_s32_eq(1,shifted[0]<=panned[0]+0.01f);
+        zexpect_s32_eq(1,shifted[1]<=panned[1]+0.01f);
+    }
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
+/* A dithered room drawn moved by its widescreen step (k/8 of a game pixel
+ * down at 8x, all of it in the drawing) against the same room unmoved: the
+ * mean difference of the shown pixels below the room's top edge, which
+ * moves with it. */
+static float WideDitherDrift(unsigned step) {
+    Psyz_VideoSetWidescreenPictureShifted(0,-112,432,0.0f,(float)step/8.0f,0);
+    Psyz_VideoSetWidescreenField(1);
+    RECT area={0,0,320,224};ClearImage(&area,0,0,0);DrawSync(0);
+    POLY_G4 poly;SetPolyG4(&poly);setXYWH(&poly,100,60,120,100);
+    setRGB0(&poly,130,130,130);setRGB1(&poly,130,130,130);
+    setRGB2(&poly,130,130,130);setRGB3(&poly,130,130,130);
+    DrawPrim(&poly);DrawSync(0);
+    int w,h;u8 *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);
+    zassert_ptr_ne(NULL,pixels);
+    static u8 first[64*256];
+    int top=0;
+    while(top<h && pixels[((size_t)top*w+w/2)*3]<64)++top;
+    zassert_s32_eq(1,top>8 && top+80<h);
+    float diff=0.0f;
+    for(int y=0;y<64;++y)for(int x=0;x<256;++x){
+        const u8 p=pixels[((size_t)(top+8+y)*w+w/2-128+x)*3];
+        if(!step)first[y*256+x]=p;
+        else diff+=(float)abs((int)p-(int)first[y*256+x]);
+    }
+    free(pixels);
+    return diff/(64.0f*256.0f);
+}
+
+/* The room's widescreen step moves its dither with it: the dither matrix
+ * stays on the buffer, so a room moved by part of a game pixel took another
+ * dither each frame, and dithered parts of one model (a chest's lid and
+ * body, issue 207) shifted against each other by a pixel at 8x while the
+ * camera panned. */
+ZTEST(gpu, widescreen_room_step_keeps_its_dither) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);SetDispMask(1);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=1;draw.isbg=0;PutDrawEnv(&draw);
+    Psyz_VideoSetInternalResolution(8);Psyz_VideoSetWidescreen(1);
+    float worst=0.0f;
+    for(unsigned step=0;step<8;++step){
+        const float diff=WideDitherDrift(step);
+        worst=SDL_max(worst,diff);
+        printf("widescreen 8x: room moved %u/8 px down differs from unmoved by %.3f\n",step,diff);
+    }
+    zexpect_s32_eq(1,worst<=0.5f);
+    Psyz_VideoSetWidescreen(0);Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
+    draw.dtd=0;PutDrawEnv(&draw);
 #endif
 }
 
@@ -803,14 +1098,16 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
             zassert_s32_eq(0,memcmp(a,b,3));
     }
     zassert_s32_eq(1,changed>500);
-    // The opaque texels next to the native transparent hole feather into the
-    // clear background; the hole itself and the interior remain authoritative.
+    // Opaque texels next to the native transparent hole keep full HD
+    // coverage: fading them would expose whatever lies beneath the hole
+    // (issue #208). The hole itself was checked against native above.
     // Compare with the same HD material away from the hole (constant R/G).
-    const u8 *edge=images[1]+(48*w+47)*3;
     const u8 *inside=images[1]+(44*w+50)*3;
-    zassert_s32_eq(1,edge[0]>16 && edge[0]<inside[0]);
-    zassert_s32_eq(1,edge[1]>24 && edge[1]<inside[1]);
-    // Empty neighbouring VRAM must not feather the rectangular tile border.
+    zassert_s32_eq(0,memcmp(images[1]+(48*w+47)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(48*w+50)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(47*w+48)*3,inside,2));
+    zassert_s32_eq(0,memcmp(images[1]+(50*w+49)*3,inside,2));
+    // Empty neighbouring VRAM must not change the rectangular tile border.
     zassert_s32_eq(0,memcmp(images[1]+(32*w+32)*3,inside,2));
     zassert_s32_eq(0,memcmp(images[1]+(63*w+63)*3,inside,2));
     /* A different room must be able to reuse the bounded cache. Resetting it
@@ -831,6 +1128,71 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
 
 /* Authored HD mattes affect presentation only. Legacy RGB materials and PS1
  * semitransparent primitives retain their original coverage/blend rules. */
+/* Room backgrounds are stacks of complementary cutouts: a foreground layer's
+ * opaque texels are exactly the base layer's transparent hole, and nothing is
+ * drawn beneath that hole. With HD materials above 1x, both layers together
+ * must still cover every pixel at full material colour. Fading coverage along
+ * either silhouette darkened the shared staircase towards the clear colour,
+ * outlining every foreground object (issue #208). */
+ZTEST(gpu, hd_room_layers_keep_shared_cutout_edges_opaque) {
+#if defined(__psyz) && !defined(__PSP__)
+    const char *backend=getenv("PSYZ_HEADLESS");
+    if(!backend || strcmp(backend,"gpu"))return;
+    const u16 native_color=25|(20<<5)|(15<<10);
+    const u8 material[3]={200,160,120};
+    SDL_Surface *bmp=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);
+    zassert_ptr_ne(NULL,bmp);
+    for(int y=0;y<136;++y)for(int x=0;x<68;++x){
+        u8 *p=(u8 *)bmp->pixels+y*bmp->pitch+x*4;
+        if(y<68){p[0]=material[0];p[1]=material[1];p[2]=material[2];}
+        else{p[0]=(u8)(25*255/31);p[1]=(u8)(20*255/31);p[2]=(u8)(15*255/31);}
+        p[3]=255;
+    }
+    char path[512];snprintf(path,sizeof(path),"%spsyz-layers-%llu.png",SDL_GetBasePath(),(unsigned long long)SDL_GetPerformanceCounter());
+    zassert_s32_eq(1,SDL_SavePNG(bmp,path));SDL_DestroySurface(bmp);
+    const uint64_t key=UINT64_C(0x5ea3ed9e5ea3ed9e);
+    zassert_s32_eq(1,Psyz_GpuLoadSpriteAtlas(key,path));SDL_RemovePath(path);
+    zassert_s32_eq(0,Psyz_GpuRegisterCommandHandler(0xF7,TestSpriteAtlasCommand,NULL));
+    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
+    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);
+    /* A diagonal staircase with a one-texel notch: the base keeps texels on
+     * one side, the foreground (stored next to it in VRAM) exactly the rest. */
+    u16 pixels[16*32];
+    for(int y=0;y<16;++y)for(int x=0;x<16;++x){
+        int front=x+y>=16 || (x==3&&y==3);
+        pixels[y*32+x]=front?0:native_color;
+        pixels[y*32+16+x]=front?native_color:0;
+    }
+    RECT texture={512,0,32,16};LoadImage(&texture,(u_long *)pixels);
+    for(int scale=2;scale<=4;scale+=2){
+        Psyz_VideoSetInternalResolution(scale);
+        RECT clear={0,0,64,64};ClearImage(&clear,0,0,0);
+        DR_TPAGE page;SetDrawTPage(&page,0,0,GetTPage(2,0,512,0));DrawPrim(&page);
+        for(int layer=0;layer<2;++layer){
+            struct {u_long address,length;u32 words[7];} packet={0};
+            packet.length=7;packet.words[0]=0xF7000000;
+            packet.words[1]=(u32)key;packet.words[2]=(u32)(key>>32);
+            packet.words[3]=PSYZ_MERGED_PRIM_NOP;packet.words[4]=0x7c808080;
+            packet.words[5]=16u|(16u<<16);packet.words[6]=layer?16u:0u;
+            termPrim(&packet);DrawOTag((OT_TYPE *)&packet);
+        }
+        extern void Psyz_PgxpNextFrame(void);Psyz_PgxpNextFrame();DrawSync(0);
+        int w,h;u8 *image=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,image);
+        zassert_s32_eq(1,w>=32*scale && h>=32*scale);
+        unsigned dark=0;
+        for(int y=16*scale;y<32*scale;++y)for(int x=16*scale;x<32*scale;++x){
+            const u8 *p=image+((size_t)y*w+x)*3;
+            for(int c=0;c<3;++c)if(p[c]+2<material[c])++dark;
+        }
+        free(image);
+        zassert_s32_eq(0,dark);
+    }
+    Psyz_GpuResetSpriteAtlases();Psyz_GpuRegisterCommandHandler(0xF7,NULL,NULL);
+    Psyz_GpuSelectSpriteAtlas(0,0);Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
 ZTEST(gpu, authored_hd_coverage_is_display_only_and_opt_in) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");
@@ -976,7 +1338,7 @@ ZTEST(gpu, authored_alpha_does_not_change_other_atlas_cells) {
         }
         for(int mode=1;mode<4;++mode)zassert_s32_eq(0,memcmp(native[0],native[mode],sizeof(native[0])));
         /* The edited cell changes only at HD resolution. The untouched
-         * neighbour retains the exact legacy native-silhouette feather. */
+         * neighbour retains its exact native silhouette. */
         zassert_s32_eq(scale>1,memcmp(images[0],images[1],(size_t)w*h*3)!=0);
         zassert_s32_eq(0,memcmp(images[2],images[3],(size_t)w*h*3));
         for(int mode=0;mode<4;++mode)free(images[mode]);

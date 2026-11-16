@@ -29,6 +29,25 @@ layout(set = 2, binding = 1) uniform sampler2D texBlend;
 layout(set = 2, binding = 2) uniform sampler2D texHD;
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
 
+// Presentation-only margins can use different tile grids for the same RGB
+// surface. Quantize the interpolation phase before integer filtering so atlas
+// placement cannot change a half-way color rounding decision.
+vec4 sampleMarginMaterial() {
+    ivec2 size = textureSize(texHD, 0);
+    // Margin UVs are cell-local. Their integer atlas origin travels flat in
+    // uvBounds.xy, avoiding precision loss from interpolating large UVs.
+    ivec2 fixedUV = ivec2(floor((hdUV.xy - 0.5) * 256.0 + 0.5));
+    ivec2 base = (fixedUV >> 8) + ivec2(uvBounds.xy);
+    uvec2 f = uvec2(fixedUV & 255);
+    uvec4 a = uvec4(floor(texelFetch(texHD, clamp(base, ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 b = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(1,0), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 c = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(0,1), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 d = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(1,1), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 color = (a*(256u-f.x)*(256u-f.y) + b*f.x*(256u-f.y) +
+                  c*(256u-f.x)*f.y + d*f.x*f.y + 32768u) >> 16;
+    return vec4(color)/255.0;
+}
+
 bool nativeAffineAttributes() {
     return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeOriginRGB.w != 0;
 }
@@ -118,8 +137,10 @@ vec3 applyDither(vec3 c) {
     // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
     if ((passMode.w & 2u) != 0u) return clamp(c, 0.0, 1.0);
     if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;
-    int dx = int(gl_FragCoord.x) & 3;
-    int dy = int(gl_FragCoord.y) & 3;
+    // passMode.w bits 8-11: the matrix's origin (x, y), where widescreen
+    // moved the room by part of a game pixel, so the room keeps its dither.
+    int dx = (int(gl_FragCoord.x) - int((passMode.w >> 8u) & 3u)) & 3;
+    int dy = (int(gl_FragCoord.y) - int((passMode.w >> 10u) & 3u)) & 3;
     float off = ditherMatrix[dy][dx];
     vec3 c8 = c * 255.0 + off;
     vec3 c5 = clamp(floor(c8 / 8.0), 0.0, 31.0);
@@ -160,7 +181,7 @@ void main() {
     if (hdUV.z>1.5 && hdUV.z<3.5) {
         if (hdUV.z>2.5 || passMode.y<=1u) discard;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
-        vec4 material=texture(texHD,hdUV.xy);
+        vec4 material=sampleMarginMaterial();
         if (material.a<0.5) discard;
         FragColor=vec4(clamp(material.rgb*tint,0.0,1.0),passMode.x==1u?0.0:1.0);
         return;
@@ -272,28 +293,12 @@ void main() {
             enhancedPixel=true;
         }
     }
-    // Feather only matched opaque HD room pixels on the presentation target.
-    // Filter coverage, never RGB/STP: black+STP is covered, transparent zero
-    // is not. Clamp to the sprite's native UV bounds to avoid neighbouring
-    // VRAM tiles. Keeping this band inside native coverage preserves cutouts
-    // and avoids introducing foreground color over actors outside the mask.
-    if (enhancedPixel && hdUV.z<1.5 && polygon==0u &&
-        !isSemiTrans && passMode.x==0u) {
-        vec2 pos=rawUV-vec2(0.5);
-        ivec2 origin=ivec2(floor(pos));
-        // Each 16x16 tile occupies 64 HD texels plus a two-texel gutter.
-        // Derive its native bounds even when widescreen UV clamping is off.
-        vec2 local=(mod(hdUV.xy*vec2(textureSize(texHD,0)),68.0)-2.0)/4.0;
-        ivec2 lo=ivec2(round(rawUV-local)),hi=lo+ivec2(15);
-        vec2 weight=fract(pos);
-        float a=fetchModelTexel(clamp(origin,lo,hi))!=vec4(0)?1.0:0.0;
-        float b=fetchModelTexel(clamp(origin+ivec2(1,0),lo,hi))!=vec4(0)?1.0:0.0;
-        float c=fetchModelTexel(clamp(origin+ivec2(0,1),lo,hi))!=vec4(0)?1.0:0.0;
-        float d=fetchModelTexel(clamp(origin+ivec2(1,1),lo,hi))!=vec4(0)?1.0:0.0;
-        float coverage=mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
-        FragColor=vec4(modColor*coverage,coverage);
-        return;
-    }
+    // Matched opaque room texels keep full native coverage. Room layers are
+    // complementary cutouts: the transparent hole under a foreground is
+    // exactly the foreground's opaque mask, with nothing drawn beneath it.
+    // Fading coverage inside either silhouette therefore blends both layers
+    // towards that empty hole and leaves a dark staircase along every shared
+    // edge (issue #208). Reviewed mattes and underlays refine edges instead.
     // Exact source-page/CLUT matching owns identity; native texel still owns
     // transparent cutouts, STP, mask writes and blend classification.
     if (passMode.y>1u && hdUV.z>4.5 && hdUV.z<5.5 && polygon!=0u && textureMode!=0u) {

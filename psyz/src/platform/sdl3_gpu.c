@@ -376,8 +376,15 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     if(!e||!e->serial)return;
     InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial)return;
     uint64_t signature=14695981039346656037ULL;
-    for(unsigned i=0;i<count;++i){const unsigned char *s=(const void *)&v[i].u;
-        for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
+    for(unsigned i=0;i<count;++i){
+        /* Textureless primitives do not write UV/CLUT fields. Those slots
+         * retain the previous batch's texture data, which is not identity:
+         * hashing it drops their midpoint while textured neighbours move. */
+        const unsigned char *s=(const void *)&v[i].u;
+        unsigned bytes=8;
+        if(v[i].t&TPAGE_NOTEXTURE){s=(const void *)&v[i].t;bytes=sizeof(v[i].t);}
+        for(unsigned j=0;j<bytes;++j)signature=(signature^s[j])*1099511628211ULL;
+    }
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&p->signature==signature;
     float position[6][3];
     for(unsigned i=0;i<count;++i){bool projected=(geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0;
@@ -447,6 +454,7 @@ static bool widescreen;
 /* Rendered-frame capture uses the same final widescreen crop and scaling as
  * presentation, into an offscreen texture even when the window is hidden. */
 static SDL_GPUTexture* ws_capture;
+static SDL_GPUTexture* ws_black;
 static Uint32 ws_capture_width, ws_capture_height;
 static bool ws_capture_active;
 static struct {
@@ -582,6 +590,22 @@ static void WidescreenFieldStep(int picture, float n, float* qx, float* qy) {
         (float)(ws_picture[picture].camera_x + ws_picture[picture].shift);
     *qx = SDL_roundf((ws_picture[picture].ex - base) * sx) / sx + base;
     *qy = SDL_roundf(ws_picture[picture].ey * n) / n;
+}
+
+/* The dither matrix's origin, as passMode.w bits 8-11 of the triangle passes:
+ * the room's step (WidescreenFieldStep) in buffer pixels across and down,
+ * mod 4. The matrix is anchored to the buffer, so a room moved by part of a
+ * game pixel took another dither each frame, and dithered parts of one model
+ * (a chest's lid and body) shifted against each other by a pixel at 8x while
+ * a camera panned. With the matrix moved along, the step moves the room's
+ * picture as a whole. Drawing not moved (and all without widescreen) keeps
+ * the matrix where it was. */
+static u32 WidescreenDitherOrigin(float step_x, float step_y, unsigned scale) {
+    if (!widescreen)
+        return 0;
+    const int x = (int)SDL_lroundf(step_x * (float)scale);
+    const int y = (int)SDL_lroundf(step_y * (float)scale);
+    return ((u32)(x & 3) | ((u32)(y & 3) << 2)) << 8;
 }
 
 /* The squeeze's fixed point. It moves 3 pixels against each pixel of view
@@ -2126,6 +2150,49 @@ static SDL_GPUBlitRegion PrescaleWidescreen(
             SDL_clamp((Uint32)SDL_lroundf((y1 - y0) * (float)ky), 1u, ph - py)};
 }
 
+/* Clip room ends after scaling the complete view. Cropping the source and
+ * independently rounding a smaller destination changes the sample grid of
+ * the original picture whenever optional side artwork changes its bounds. */
+static void MaskWidescreenEnds(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
+                               SDL_Rect dst, float left, float right) {
+    if (left <= 0.0f && right >= 1.0f) return;
+    if (!ws_black) {
+        const SDL_GPUTextureCreateInfo info = {
+            .type=SDL_GPU_TEXTURETYPE_2D, .format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER|SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+            .width=1, .height=1, .layer_count_or_depth=1, .num_levels=1};
+        ws_black=SDL_CreateGPUTexture(device,&info);
+        if (!ws_black) return;
+        SDL_GPUColorTargetInfo clear={.texture=ws_black,.load_op=SDL_GPU_LOADOP_CLEAR,
+            .store_op=SDL_GPU_STOREOP_STORE,.clear_color={0,0,0,1}};
+        SDL_GPURenderPass *pass=SDL_BeginGPURenderPass(cmd,&clear,1,NULL);
+        SDL_EndGPURenderPass(pass);
+    }
+    const int ends[2]={SDL_clamp((int)SDL_lroundf(left*dst.w),0,dst.w),
+                       SDL_clamp((int)SDL_lroundf(right*dst.w),0,dst.w)};
+    for (int side=0;side<2;++side) {
+        int start=side?ends[1]:0, width=side?dst.w-ends[1]:ends[0];
+        if (width<=0) continue;
+        const SDL_GPUBlitInfo mask={
+            .source={.texture=ws_black,.w=1,.h=1},
+            .destination={.texture=target,.x=(Uint32)(dst.x+start),.y=(Uint32)dst.y,
+                          .w=(Uint32)width,.h=(Uint32)dst.h},
+            .load_op=SDL_GPU_LOADOP_LOAD,.filter=SDL_GPU_FILTER_NEAREST};
+        SDL_BlitGPUTexture(cmd,&mask);
+    }
+}
+
+/* A shift of the widescreen view's source, in buffer pixels, as whole
+ * pixels of the output it is shown on (per_pixel of them a buffer pixel),
+ * picked out by the nearest whole pixels of its k times prescale. */
+static float WidescreenRestOnOutput(float shift, float per_pixel, Uint32 k) {
+    if (!(per_pixel > 0.0f))
+        return shift;
+    k = SDL_max(k, 1u);
+    const float output = SDL_roundf(shift * per_pixel);
+    return SDL_roundf(output / per_pixel * (float)k) / (float)k;
+}
+
 #ifdef PE_PS5
 /* Unsqueezed CPU equivalent of WidescreenFieldStep. Quantize at the actual
  * destination grid; retain the fractional remainder for presentation. */
@@ -2425,6 +2492,7 @@ static void PlatformBackend_Present(void) {
                 WndSize win = {(int)sc_w, (int)sc_h};
                 SDL_Rect dst = FitGameToWindow(game_aspect, win);
                 bool ws_view = false;
+                float ws_clip_left=0.0f,ws_clip_right=1.0f;
 #ifdef PE_PS5_GPU_NATIVE
                 bool fsr_wide_crop=false;
                 SDL_GPUBlitRegion fsr_wide_source={0};
@@ -2481,11 +2549,13 @@ static void PlatformBackend_Present(void) {
                     const float shown_l = SDL_max(view_l, left);
                     const float shown_r =
                         SDL_max(shown_l, SDL_min(view_r, right));
+                    ws_clip_left=SDL_clamp((shown_l-view_l)/(2.0f*half),0.0f,1.0f);
+                    ws_clip_right=SDL_clamp((shown_r-view_l)/(2.0f*half),0.0f,1.0f);
                     /* game x -> fraction of the squeezed buffer */
                     const float f0 =
-                        (pivot + (shown_l - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (view_l - rest_x - pivot) * WS_SQUEEZE) / w;
                     const float f1 =
-                        (pivot + (shown_r - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (view_r - rest_x - pivot) * WS_SQUEEZE) / w;
                     dst = FitGameToWindow(16.0f / 9.0f, win);
                     /* whole prescale factors from the view's size, so they
                      * hold while a picture end moves through the view */
@@ -2496,23 +2566,21 @@ static void PlatformBackend_Present(void) {
                     const Uint32 ky =
                         src.h > 2 ? ((Uint32)dst.h + src.h - 3) / (src.h - 2)
                                   : 1;
-                    const int dx0 =
-                        dst.x + (int)SDL_lroundf((shown_l - view_l) /
-                                                 (2.0f * half) * (float)dst.w);
-                    const int dx1 =
-                        dst.x + (int)SDL_lroundf((shown_r - view_l) /
-                                                 (2.0f * half) * (float)dst.w);
                     float sx0 = f0 * (float)src.w, sx1 = f1 * (float)src.w;
-                    if (sx1 > sx0 && dx1 > dx0) {
-                        dst.x = dx0;
-                        dst.w = dx1 - dx0;
-                    } else {
-                        sx0 = 0.0f;
-                        sx1 = (float)src.w;
-                    }
                     /* a buffer pixel off the top and bottom leaves room to
                      * show the room up to half a pixel up or down */
-                    const float sy = rest_y * (float)n;
+                    float sy = rest_y * (float)n;
+                    /* The view is sharp: a shift by part of an output row
+                     * shows as a whole row in some bands of the screen and
+                     * as none or a blend in others, so things a few bands
+                     * apart shook against each other while a camera panned
+                     * (a chest's lid on its body). Shown by whole output
+                     * rows, the picture moves as one. Across, the 4/3
+                     * stretch moves edges unevenly for whole-pixel pans as
+                     * much, so the rest keeps its finer steps there. */
+                    if (src.h > 2)
+                        sy = WidescreenRestOnOutput(
+                            sy, (float)dst.h / (float)(src.h - 2), ky);
                     ws_view = true;
 #ifdef PE_PS5_GPU_NATIVE
                     fsr_wide_crop=fsr1_requested;
@@ -2577,6 +2645,7 @@ static void PlatformBackend_Present(void) {
                                       : SDL_GPU_FILTER_NEAREST,
                 };
                 SDL_BlitGPUTexture(cmd, &blit);
+                if (ws_view) MaskWidescreenEnds(cmd,swapchain,dst,ws_clip_left,ws_clip_right);
 #ifdef PE_PS5_GPU_NATIVE
                 EndCommittedPresentation(&committed_scope);
 #endif
@@ -2672,6 +2741,8 @@ static void QuitPlatform(void) {
         if (ws_capture)
             SDL_ReleaseGPUTexture(device, ws_capture);
         ws_capture = NULL;
+        if (ws_black) SDL_ReleaseGPUTexture(device,ws_black);
+        ws_black=NULL;
         ws_capture_width = ws_capture_height = 0;
         ws_capture_active = false;
         for (int i = 0; i < BLEND_COUNT; i++) {
@@ -3923,6 +3994,15 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
+                if (atlas_extension) {
+                    // Presentation-only margins do not consume native UV
+                    // bounds. Keep their interpolated UVs local to the cell;
+                    // carry the exact integer atlas origin without interpolation.
+                    vertex_cur[i].hd_uv[0]=(i&1)?64.0f:0.0f;
+                    vertex_cur[i].hd_uv[1]=(i&2)?64.0f:0.0f;
+                    vertex_cur[i].uv_bounds[0]=left;
+                    vertex_cur[i].uv_bounds[1]=top;
+                }
                 vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
                     (sprite_atlases_enabled?coverage:0);
             }
@@ -4498,6 +4578,8 @@ void Draw_FlushBuffer(void) {
         const int clip_x1 = SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale;
         const int clip_y1 = SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale;
         const float grid_scale_x = GetDrawGridXScale();
+        const u32 dither_origin = WidescreenDitherOrigin(
+            sub_x * grid_scale_x * ws_squeeze, sub_y, target_scale);
         int start = 0;
         while (start < n_indices) {
             bool semi = vertex_buf[index_buf[start]].a != 0xFF;
@@ -4655,7 +4737,8 @@ void Draw_FlushBuffer(void) {
                 draw_grid_source_width == draw_grid_target_width,
                 (target_index && model_filtering ? 1u : 0u) |
                     (target_index && sprite_filtering ? 4u : 0u) |
-                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+                    dither_origin};
             SDL_PushGPUFragmentUniformData(
                 cmd, 0, color_pass, sizeof(color_pass));
 
@@ -4672,7 +4755,8 @@ void Draw_FlushBuffer(void) {
                     draw_grid_source_width == draw_grid_target_width,
                     (target_index && model_filtering ? 1u : 0u) |
                     (target_index && sprite_filtering ? 4u : 0u) |
-                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+                    dither_origin};
                 SDL_PushGPUFragmentUniformData(
                     cmd, 0, mask_pass, sizeof(mask_pass));
                 SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
