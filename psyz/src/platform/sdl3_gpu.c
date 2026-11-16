@@ -376,8 +376,15 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     if(!e||!e->serial)return;
     InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial)return;
     uint64_t signature=14695981039346656037ULL;
-    for(unsigned i=0;i<count;++i){const unsigned char *s=(const void *)&v[i].u;
-        for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
+    for(unsigned i=0;i<count;++i){
+        /* Textureless primitives do not write UV/CLUT fields. Those slots
+         * retain the previous batch's texture data, which is not identity:
+         * hashing it drops their midpoint while textured neighbours move. */
+        const unsigned char *s=(const void *)&v[i].u;
+        unsigned bytes=8;
+        if(v[i].t&TPAGE_NOTEXTURE){s=(const void *)&v[i].t;bytes=sizeof(v[i].t);}
+        for(unsigned j=0;j<bytes;++j)signature=(signature^s[j])*1099511628211ULL;
+    }
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&p->signature==signature;
     float position[6][3];
     for(unsigned i=0;i<count;++i){bool projected=(geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0;

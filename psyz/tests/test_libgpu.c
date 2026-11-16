@@ -194,6 +194,68 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 #endif
 }
 
+/* A textureless face has no UV identity. Reusing the vertex buffer for a
+ * textured draw must not split its history from the textured parts beside it. */
+ZTEST(gpu, untextured_geometry_keeps_interpolation_with_textured_neighbors) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend=getenv("PSYZ_HEADLESS");if(!backend||strcmp(backend,"gpu"))zskip("requires SDL GPU");
+    const unsigned scales[]={2,8,8};
+    for(unsigned scenario=0;scenario<3;++scenario)for(unsigned wide=0;wide<2;++wide){
+        unsigned scale=scales[scenario];
+        Psyz_VideoSetInternalResolution(scale);Psyz_VideoSetAntialiasing(scenario==2);
+        Psyz_VideoSetGeometryCorrection(0);Psyz_VideoSetWidescreen(wide);
+        Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
+        Psyz_GpuSetFrameInterpolation(1);Psyz_GpuResetInterpolation();
+        u16 white[32*16];for(unsigned i=0;i<32*16;++i)white[i]=0x7fff;
+        RECT texture={512,0,32,16};LoadImage(&texture,(u_long *)white);DrawSync(0);
+        RECT clear={0,0,320,480};ClearImage(&clear,0,0,0);DrawSync(0);
+        POLY_F4 face[2]={{0}};POLY_FT4 reference[2]={{0}},poison[2]={{0}};
+        for(unsigned i=0;i<2;++i){
+            int x=40+20*i;
+            setPolyF4(face+i);setRGB0(face+i,0,255,0);setXY4(face+i,x,30,x+16,30,x,46,x+16,46);
+            setPolyFT4(reference+i);setRGB0(reference+i,255,0,0);
+            setXY4(reference+i,x,70,x+16,70,x,86,x+16,86);
+            setUV4(reference+i,0,0,15,0,0,15,15,15);reference[i].tpage=getTPage(2,0,512,0);
+            poison[i]=reference[i];setRGB0(poison+i,0,0,255);
+            setXY4(poison+i,200,100,216,100,200,116,216,116);
+            int u=i?8:0;setUV4(poison+i,u,0,u+15,0,u,15,u+15,15);
+        }
+        Psyz_GpuRegisterInterpolationPair(&face[0].r0,&face[1].r0);
+        Psyz_GpuRegisterInterpolationPair(&reference[0].r0,&reference[1].r0);
+        for(unsigned i=0;i<2;++i){
+            Psyz_GpuBeginInterpolationFrame();
+            DRAWENV draw;SetDefDrawEnv(&draw,0,240*i,320,240);draw.isbg=0;draw.dtd=0;PutDrawEnv(&draw);
+            /* Flush leaves these UVs in the reusable vertex slot. */
+            DrawPrim(poison+i);DrawSync(0);
+            DrawPrim(face+i);DrawPrim(reference+i);DrawSync(0);
+        }
+        DISPENV display;SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);SetDispMask(1);
+        int nw,nh;unsigned char *native=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,native);
+        Psyz_GpuPrepareInterpolatedPresent(240);
+        int red[3],green[3];
+        for(unsigned sample=0;sample<3;++sample){
+            if(sample==2){SetDefDispEnv(&display,0,240,320,240);PutDispEnv(&display);Psyz_GpuPrepareInterpolatedPresent(-1);}
+            VSync(0);int w,h;unsigned char *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+            red[sample]=green[sample]=w;
+            for(unsigned y=20*scale;y<90*scale;++y)for(int x=0;x<w;++x){
+                unsigned char *p=pixels+((size_t)y*w+x)*3;
+                if(p[0]>240&&p[1]<10&&p[2]<10&&x<red[sample])red[sample]=x;
+                if(p[1]>240&&p[0]<10&&p[2]<10&&x<green[sample])green[sample]=x;
+            }
+            printf("Untextured interpolation %ux AA=%u wide=%u sample=%u red=%d green=%d\n",scale,scenario==2,wide,sample,red[sample],green[sample]);
+            zexpect_s32_eq(red[sample],green[sample]);free(pixels);
+        }
+        zexpect_s32_eq(1,red[0]<red[1]&&red[1]<red[2]);
+        SetDefDispEnv(&display,0,0,320,240);PutDispEnv(&display);
+        unsigned char *after=Psyz_VideoAllocCapturedFrame(&nw,&nh);zassert_ptr_ne(NULL,after);
+        zexpect_s32_eq(0,memcmp(native,after,(size_t)nw*nh*3));free(native);free(after);
+        Psyz_GpuSetFrameInterpolation(0);Psyz_VideoSetAntialiasing(0);Psyz_VideoSetWidescreen(0);Psyz_VideoSetInternalResolution(1);
+    }
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, interpolated_widescreen_capture_keeps_midpoint) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))zskip("requires SDL GPU");
