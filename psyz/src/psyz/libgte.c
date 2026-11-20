@@ -1825,7 +1825,7 @@ typedef struct {
     float x, y, w;
 } PgxpSxyEntry;
 
-#define PGXP_ADDR_SETS 8192u
+#define PGXP_ADDR_SETS 65536u  /* PC-side skins: ~250k vertex/packet addresses a frame (was 8192) */
 #define PGXP_ADDR_WAYS 8u
 #define PGXP_SXY_SETS 4096u
 #define PGXP_SXY_WAYS 2u
