@@ -152,7 +152,7 @@ static void GPU_write_image() { NOT_IMPLEMENTED; }
 static void GPU_read_image() { NOT_IMPLEMENTED; }
 
 static int queue_len = 0;
-static u_long queue_buf[0x4000];
+static u_long queue_buf[0x100000]; /* PC-side skins send ~700k words a frame (was 0x4000) */
 
 typedef struct {
     PsyzGpuCommandHandler handler;
@@ -334,7 +334,7 @@ static void GPU_Enqueue(u_long* packets) {
             if (env->len > 0x100) {
                 ERRORF("packet 0x%X long, likely corrupted", env->len);
             }
-            INFOF("GPU queue full, calling exeque");
+            { static int s_warned; if (!s_warned) { s_warned = 1; INFOF("GPU queue full, calling exeque (logged once)"); } }
             Psyz_GpuExeque();
         }
         // a flush empties the queue; the packet that did not fit still goes in

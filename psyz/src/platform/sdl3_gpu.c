@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <psyz.h>
 #include <psyz/overlay.h>
 #include <psyz/overlay_sdl3_gpu.h>
@@ -196,8 +197,8 @@ static bool SubmitCmdAndWait(void);
 static bool InterpEnsureTarget(void);
 /* Presentation-only geometry history. Packet pairs belong to the original
  * double buffers; UI packets are deliberately never registered. */
-#define INTERP_PAIRS 16384u
-#define INTERP_MAP 65536u
+#define INTERP_PAIRS 262144u   /* big PC-side models (skins) register one pair per face */
+#define INTERP_MAP 1048576u
 typedef struct { const void *address; unsigned pair, serial; } InterpAddress;
 typedef struct {
     const void *a,*b;
@@ -407,6 +408,16 @@ static SpriteAtlas sprite_atlases[512];
 static unsigned sprite_atlas_count;
 static size_t sprite_atlas_bytes;
 static SpriteAtlas *next_sprite_atlas;
+static int next_sprite_tile_u=-1,next_sprite_tile_v; /* polygon tile origin, -1: sprites only */
+/* Psyz_GpuSetPageHd: one texture page shown from a 1024x1024 HD picture kept in a reserved
+ * 16x16-cell corner of the shared atlas (material rows PAGE_HD_ROW0.., columns PAGE_HD_COL0..). */
+#define PAGE_HD_ROW0 29u   /* 31x31 cells: room for a 2048x2048 picture (was 44: 16x16, 1024) */
+#define PAGE_HD_COL0 209u
+static struct { bool active, reserved; unsigned tpage, clut_y0, clut_y1, size; } page_hd;
+/* Optional windows: palette k of the page (16 per CLUT row from clut_y0) shows the square
+ * x,y,size of the picture, so 8-bit UVs address it at size/256 pixels per step. */
+static unsigned short page_hd_win[64][3];
+static unsigned page_hd_wins;
 static SDL_GPUTexture *sprite_atlas_texture;
 static unsigned sprite_atlas_cells;
 #define HD_ATLAS_COLUMNS 240u
@@ -704,6 +715,7 @@ void Psyz_GpuResetSpriteAtlases(void) {
     sprite_atlas_bytes=0;
     next_sprite_atlas=NULL;
     next_sprite_cell=0;
+    next_sprite_tile_u=-1;
 }
 
 /* The lossy material and lossless native-reference plane are deliberately
@@ -725,6 +737,76 @@ static SDL_Surface *LoadHdImage(const char *filename) {
 }
 
 #include "cpu-material-adapter.h"
+
+static int UploadSpriteAtlas(uint64_t key, SDL_Surface *source, const char *name);
+
+/* The shared atlas texture and its sampler, made on first use. */
+static SDL_GPUTexture *EnsureSpriteAtlasTexture(void) {
+    SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=HD_ATLAS_WIDTH,.height=HD_ATLAS_HEIGHT,.layer_count_or_depth=1,.num_levels=1};
+    if (!sprite_atlas_texture) sprite_atlas_texture=SDL_CreateGPUTexture(device,&info);
+    if (!sprite_atlas_sampler) {
+        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
+        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
+    }
+    return sprite_atlas_texture && sprite_atlas_sampler ? sprite_atlas_texture : NULL;
+}
+
+int Psyz_GpuSetPageHd(unsigned tpage, unsigned clut_y0, unsigned clut_y1,
+                      const void *rgba, const void *ref, int width, int height, int pitch) {
+    if (!rgba) { page_hd.active=false; return 1; }
+    if (UseSoftwareBackend() || gpu_failed || !device) return 0;
+    if (!ref || (width!=1024 && width!=2048) || height!=width || pitch<width*4) return -1;
+    const int last=width-1;
+    /* the corner must be free of ordinary atlas cells */
+    if (!page_hd.reserved && sprite_atlas_cells>HD_ATLAS_COLUMNS*PAGE_HD_ROW0) return 0;
+    SDL_GPUTexture *texture=EnsureSpriteAtlasTexture();
+    if (!texture) return 0;
+    Draw_FlushBuffer();                              /* draws queued so far keep the old picture */
+    const unsigned side=31u*68u;                     /* 2108: the picture at +2,+2 with edge gutters */
+    /* picture in the material half, native colours at the same place in the reference half */
+    SDL_GPUTransferBufferCreateInfo upload_info={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=2u*side*side*4u};
+    SDL_GPUTransferBuffer *upload=SDL_CreateGPUTransferBuffer(device,&upload_info);
+    u8 *mapped=upload ? (u8 *)SDL_MapGPUTransferBuffer(device,upload,false) : NULL;
+    if (!mapped) { if (upload) SDL_ReleaseGPUTransferBuffer(device,upload); return 0; }
+    for (unsigned plane=0;plane<2;++plane) for (unsigned y=0;y<side;++y) {
+        int sy=(int)y-2; sy=sy<0?0:sy>last?last:sy;
+        const u8 *src=(const u8 *)(plane?ref:rgba)+(size_t)sy*(size_t)pitch;
+        u8 *dst=mapped+((size_t)plane*side+y)*side*4u;
+        for (unsigned x=0;x<side;++x) {
+            int sx=(int)x-2; sx=sx<0?0:sx>last?last:sx;
+            memcpy(dst+x*4u,src+(size_t)sx*4u,3); dst[x*4u+3]=255;
+        }
+    }
+    SDL_UnmapGPUTransferBuffer(device,upload);
+    SDL_GPUCommandBuffer *cmd=AcquireCmd();
+    SDL_GPUCopyPass *copy=cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
+    if (!copy) { SDL_ReleaseGPUTransferBuffer(device,upload); return 0; }
+    for (unsigned plane=0;plane<2;++plane) {
+        SDL_GPUTextureTransferInfo from={.transfer_buffer=upload,.offset=plane*side*side*4u,.pixels_per_row=side,.rows_per_layer=side};
+        SDL_GPUTextureRegion to={.texture=texture,.x=PAGE_HD_COL0*68u,.y=PAGE_HD_ROW0*68u+plane*HD_ATLAS_HEIGHT/2u,.w=side,.h=side,.d=1};
+        SDL_UploadToGPUTexture(copy,&from,&to,false);
+    }
+    SDL_EndGPUCopyPass(copy);
+    SDL_ReleaseGPUTransferBuffer(device,upload);
+    page_hd.reserved=true; page_hd.active=true;
+    page_hd.tpage=tpage&31u; page_hd.clut_y0=clut_y0; page_hd.clut_y1=clut_y1; page_hd.size=(unsigned)width;
+    INFOF("HD page %u (VRAM %u,%u) for CLUT rows %u-%u",page_hd.tpage,(page_hd.tpage&15u)*64u,
+          ((page_hd.tpage>>4)&1u)*256u,clut_y0,clut_y1);
+    return 1;
+}
+
+int Psyz_GpuSetPageHdWindows(const unsigned short *xys, int count) {
+    if (!xys || count <= 0) { page_hd_wins = 0; return 1; }
+    if (count > 64) count = 64;
+    Draw_FlushBuffer();
+    memcpy(page_hd_win, xys, (size_t)count * 3u * sizeof(unsigned short));
+    page_hd_wins = (unsigned)count;
+    INFOF("HD page windows: %d", count);
+    return 1;
+}
 
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     if (UseSoftwareBackend()) return CpuMaterialLoad(key,filename);
@@ -750,24 +832,35 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
         SDL_DestroySurface(reference);SDL_DestroySurface(source);source=combined;
     }
     if (!source) return 0;
+    return UploadSpriteAtlas(key,source,filename);
+}
+
+/* Like Psyz_GpuLoadSpriteAtlas, from RGBA32 pixels in memory laid out as a
+ * PNG/BMP atlas: material cells in the upper half, references in the lower. */
+int Psyz_GpuLoadSpriteAtlasPixels(uint64_t key, const void *rgba, int width, int height, int pitch) {
+    if (UseSoftwareBackend() || gpu_failed || !key || !rgba || !device) return 0;
+    for (unsigned i=0;i<sprite_atlas_count;++i)
+        if (sprite_atlases[i].key==key) return 1;
+    if (width<=0 || height<=0 || pitch<width*4) return -1;
+    SDL_Surface *view=SDL_CreateSurfaceFrom(width,height,SDL_PIXELFORMAT_RGBA32,(void *)rgba,pitch);
+    if (!view) return -1;
+    return UploadSpriteAtlas(key,view,"(memory)");
+}
+
+/* Uploads one two-plane atlas into the shared cells; takes source. */
+static int UploadSpriteAtlas(uint64_t key, SDL_Surface *source, const char *name) {
     int w=source->w,h=source->h;
     size_t bytes=(size_t)w*(size_t)h*4;
+    /* the reserved page corner starts at material row PAGE_HD_ROW0: cells stop above it once used */
+    unsigned capacity=HD_ATLAS_COLUMNS*(page_hd.reserved?PAGE_HD_ROW0:HD_ATLAS_ROWS);
     if (w<=0 || h<=0 || w%68 || h%136 || w>16*68 || h>16384 ||
-        sprite_atlas_count>=512 || (unsigned)(w/68)*(unsigned)(h/136)>HD_ATLAS_COLUMNS*HD_ATLAS_ROWS-sprite_atlas_cells) {
-        SDL_DestroySurface(source); WARNF("Invalid or over-budget HD sprite atlas: %s",filename); return -1;
+        sprite_atlas_count>=512 || sprite_atlas_cells>capacity ||
+        (unsigned)(w/68)*(unsigned)(h/136)>capacity-sprite_atlas_cells) {
+        SDL_DestroySurface(source); WARNF("Invalid or over-budget HD sprite atlas: %s",name); return -1;
     }
     SDL_Surface *rgba=SDL_ConvertSurface(source,SDL_PIXELFORMAT_RGBA32);
     SDL_DestroySurface(source); if (!rgba) return -1;
-    SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=HD_ATLAS_WIDTH,.height=HD_ATLAS_HEIGHT,.layer_count_or_depth=1,.num_levels=1};
-    if (!sprite_atlas_texture) sprite_atlas_texture=SDL_CreateGPUTexture(device,&info);
-    if (!sprite_atlas_sampler) {
-        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
-            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
-        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
-    }
-    SDL_GPUTexture *texture=sprite_atlas_texture;
+    SDL_GPUTexture *texture=EnsureSpriteAtlasTexture();
     SDL_GPUTransferBufferCreateInfo upload_info={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=(Uint32)bytes};
     SDL_GPUTransferBuffer *upload=(texture && sprite_atlas_sampler) ? SDL_CreateGPUTransferBuffer(device,&upload_info) : NULL;
     void *mapped=upload ? SDL_MapGPUTransferBuffer(device,upload,false) : NULL;
@@ -844,6 +937,7 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
 
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned cell) {
     next_sprite_atlas=NULL;
+    next_sprite_tile_u=-1;
     next_sprite_extension=(cell&0x800000u)!=0;
     if (UseSoftwareBackend()) { CpuMaterialSelect(key,cell); return; }
     cell&=0x7fffffu;
@@ -853,6 +947,12 @@ void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned cell) {
             next_sprite_atlas=atlas;next_sprite_cell=cell;return;
         }
     }
+}
+
+void Psyz_GpuSelectSpriteAtlasTile(uint64_t key, unsigned cell, unsigned u0, unsigned v0) {
+    if (UseSoftwareBackend()) { next_sprite_atlas=NULL;next_sprite_tile_u=-1;return; }
+    Psyz_GpuSelectSpriteAtlas(key,cell&0x7fffffu);
+    if (next_sprite_atlas) { next_sprite_tile_u=(int)(u0&255u);next_sprite_tile_v=(int)(v0&255u); }
 }
 
 
@@ -3415,9 +3515,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool isTextured = (code & TEXTURED) != 0;
     bool isGouraud = (code & GOURAUD) != 0;
     SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C) ? next_sprite_atlas : NULL;
+    SpriteAtlas *poly_atlas=(isPoly && isTextured && next_sprite_tile_u>=0) ? next_sprite_atlas : NULL;
+    int poly_tile_u=next_sprite_tile_u,poly_tile_v=next_sprite_tile_v;
     unsigned atlas_cell=next_sprite_cell;
     bool atlas_extension=next_sprite_extension;
-    next_sprite_atlas=NULL;next_sprite_extension=false;
+    next_sprite_atlas=NULL;next_sprite_extension=false;next_sprite_tile_u=-1;
     /* One shared atlas: selecting a replacement must not split PS1 batches. */
 
     bool isShadeTex = !((code & 1) && isTextured && !isLine);
@@ -3571,6 +3673,33 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 }
             }
             #endif
+            /* A polygon cut from a 16x16 sprite: each corner samples the HD cell where
+             * its texel sits in the tile (texels past 255 wrap, as the u8 UVs do). */
+            if (poly_atlas && sprite_atlases_enabled) {
+                unsigned cell=atlas_cell+poly_atlas->first_cell;
+                float left=(float)((cell%HD_ATLAS_COLUMNS)*68+2),top=(float)((cell/HD_ATLAS_COLUMNS)*68+2);
+                for (int i=0;i<nVertices;++i) {
+                    int du=((int)vertex_cur[i].u-poly_tile_u)&255,dv=((int)vertex_cur[i].v-poly_tile_v)&255;
+                    if (du>16) du=0; if (dv>16) dv=0;
+                    vertex_cur[i].hd_uv[0]=(left+du*4.0f)/(float)HD_ATLAS_WIDTH;
+                    vertex_cur[i].hd_uv[1]=(top+dv*4.0f)/(float)HD_ATLAS_HEIGHT;
+                    vertex_cur[i].hd_uv[2]=1.0f;
+                }
+            } else if (page_hd.active && sprite_atlases_enabled && isTextured &&
+                       (tpage&31u)==page_hd.tpage && (unsigned)(clut>>6)>=page_hd.clut_y0 &&
+                       (unsigned)(clut>>6)<=page_hd.clut_y1) {
+                /* A polygon from the HD page: each corner samples the picture where its texel sits
+                 * (mode 1, as HD sprite tiles: the picture where the texel matches its reference). */
+                float left=(float)(PAGE_HD_COL0*68u+2u),top=(float)(PAGE_HD_ROW0*68u+2u);
+                for (int i=0;i<nVertices;++i) {
+                    float k=(float)page_hd.size/256.0f,ox=0.0f,oy=0.0f;
+                    unsigned w=(((unsigned)clut>>6)-page_hd.clut_y0)*16u+((unsigned)clut&15u);
+                    if (w<page_hd_wins) { ox=page_hd_win[w][0]; oy=page_hd_win[w][1]; k=(float)page_hd_win[w][2]/256.0f; }
+                    vertex_cur[i].hd_uv[0]=(left+ox+((float)(vertex_cur[i].u&255u)+0.5f)*k)/(float)HD_ATLAS_WIDTH;
+                    vertex_cur[i].hd_uv[1]=(top+oy+((float)(vertex_cur[i].v&255u)+0.5f)*k)/(float)HD_ATLAS_HEIGHT;
+                    vertex_cur[i].hd_uv[2]=5.0f;   /* unconditional HD (as HD model replacements): no reference match */
+                }
+            }
             if (isTextured) DuckApply(vertex_cur,(unsigned)nVertices,tpage,clut);
             if(dialogue_glyph>=0&&font_context==1&&nVertices==4&&tpage==5&&clut==0x089c){
                 unsigned u=(dialogue_glyph%21)*12+font_crop,vv=(dialogue_glyph/21)*12;int valid=1;
@@ -4102,6 +4231,87 @@ void Draw_ResetBuffer(void) {
     batch_has_texture = false;
 }
 
+/* Semi-transparent runs. Each run blends against one copy of the destination taken before it,
+ * so a run may hold several semi-transparent triangles as long as no two of them cover the
+ * same pixel. Triangles that only share an edge (the pieces of one cut-up surface) don't. One
+ * triangle per run, as before, cost a framebuffer copy and a render pass per triangle per target. */
+#define SEMI_RUN_MAX 48
+static int semi_run_end[MAX_INDEX_COUNT / 3 + 1];
+
+/* Do the two triangles' interiors overlap? Separating axis test on their edges' normals;
+ * touching (sharing an edge or a point) counts as apart. Degenerate triangles cover nothing. */
+static bool SemiTrianglesOverlap(const double a[3][2], const double b[3][2]) {
+    const double (*tri[2])[2] = {a, b};
+    for (int t = 0; t < 2; ++t) {
+        const double (*p)[2] = tri[t];
+        double area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+        if (area == 0.0) return false;
+        for (int e = 0; e < 3; ++e) {
+            const double *e0 = p[e], *e1 = p[(e + 1) % 3];
+            double nx = e1[1] - e0[1], ny = -(e1[0] - e0[0]);
+            double amin = 1e300, amax = -1e300, bmin = 1e300, bmax = -1e300;
+            for (int k = 0; k < 3; ++k) {
+                double da = nx * a[k][0] + ny * a[k][1], db = nx * b[k][0] + ny * b[k][1];
+                if (da < amin) amin = da;
+                if (da > amax) amax = da;
+                if (db < bmin) bmin = db;
+                if (db > bmax) bmax = db;
+            }
+            if (amax <= bmin || bmax <= amin) return false;
+        }
+    }
+    return true;
+}
+
+/* The corners of triangle `first` as one target draws them: plane 0 the native target (integer
+ * corners), 1 the scaled targets (precise PGXP corners where the vertex has them), 2 the 60 Hz
+ * midpoint frame (interpolated corners). Testing only the integer corners let two triangles that
+ * just touch there overlap at the internal resolution; the later one then blended against the
+ * copy taken before the run and wiped the earlier one, which flickered as the camera moved. */
+static void SemiCorners(int first, int plane, double out[3][2]) {
+    for (int k = 0; k < 3; ++k) {
+        unsigned i = index_buf[first + k];
+        const Vertex *v = plane == 2 ? &interpolated_vertices[i] : &vertex_buf[i];
+        bool precise = plane && v->pgxp_pos[2] > 0.0f;
+        out[k][0] = precise ? (double)v->pgxp_pos[0] : (double)v->x;
+        out[k][1] = precise ? (double)v->pgxp_pos[1] : (double)v->y;
+    }
+}
+static bool SemiTrianglePairOverlaps(int a, int b) {
+    double ta[3][2], tb[3][2];
+    for (int plane = 0; plane < 3; ++plane) {
+        SemiCorners(a, plane, ta);
+        SemiCorners(b, plane, tb);
+        double ax0 = SDL_min(ta[0][0], SDL_min(ta[1][0], ta[2][0])), ax1 = SDL_max(ta[0][0], SDL_max(ta[1][0], ta[2][0]));
+        double ay0 = SDL_min(ta[0][1], SDL_min(ta[1][1], ta[2][1])), ay1 = SDL_max(ta[0][1], SDL_max(ta[1][1], ta[2][1]));
+        double bx0 = SDL_min(tb[0][0], SDL_min(tb[1][0], tb[2][0])), bx1 = SDL_max(tb[0][0], SDL_max(tb[1][0], tb[2][0]));
+        double by0 = SDL_min(tb[0][1], SDL_min(tb[1][1], tb[2][1])), by1 = SDL_max(tb[0][1], SDL_max(tb[1][1], tb[2][1]));
+        if (ax1 <= bx0 || bx1 <= ax0 || ay1 <= by0 || by1 <= ay0) continue;
+        if (SemiTrianglesOverlap(ta, tb)) return true;
+    }
+    return false;
+}
+
+/* semi_run_end[i / 3] for every semi-transparent triangle i that starts a run: the index end of
+ * its run. Computed once per flush, shared by every render target. Polygon and sprite sampling
+ * differ by half a pixel at 1x, so a run keeps one kind. */
+static void SemiPlanRuns(void) {
+    int start = 0;
+    while (start < n_indices) {
+        if (vertex_buf[index_buf[start]].a == 0xFF) { start += 3; continue; }
+        int end = start + 3;
+        const unsigned kind = vertex_buf[index_buf[start]].t & TPAGE_POLYGON;
+        while (end < n_indices && (end - start) / 3 < SEMI_RUN_MAX &&
+               vertex_buf[index_buf[end]].a != 0xFF && (vertex_buf[index_buf[end]].t & TPAGE_POLYGON) == kind) {
+            bool hit = false;
+            for (int k = start; k < end && !hit; k += 3) hit = SemiTrianglePairOverlaps(k, end);
+            if (hit) break;
+            end += 3;
+        }
+        semi_run_end[start / 3] = end;
+        start = end;
+    }
+}
 void Draw_FlushBuffer(void) {
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
@@ -4177,6 +4387,7 @@ void Draw_FlushBuffer(void) {
      * the game's own picture for read-backs. */
     const int field_picture =
         ws_field && WidescreenDraw() ? WidescreenDrawPicture() : -1;
+    SemiPlanRuns();
 
     /* Native VRAM is independently rasterized: gameplay readback and texture
      * feedback must not depend on high-resolution sample positions. */
@@ -4211,8 +4422,7 @@ void Draw_FlushBuffer(void) {
                 while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF)
                     end += 3;
             } else {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81)
-                    end += 3;
+                end = semi_run_end[start / 3];
             }
             /* Three sampled textures, up to two draws (color and mask). Reserve
              * both heaps' worst-case sampler use before any destination copy.
