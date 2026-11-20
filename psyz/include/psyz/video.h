@@ -349,7 +349,7 @@ int Psyz_VideoVSync(int mode);
  * @param speed 1 (normal) to PSYZ_SPEED_MAX
  * @return 0 on success, -1 if invalid speed
  */
-#define PSYZ_SPEED_MAX 4
+#define PSYZ_SPEED_MAX 8
 int Psyz_VideoSetSpeed(unsigned speed);
 unsigned Psyz_VideoGetSpeed(void);
 

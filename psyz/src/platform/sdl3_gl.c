@@ -4,7 +4,11 @@
 #include <assert.h>
 /* The experimental atlas path currently targets SDL_GPU only. */
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *path) { (void)key; (void)path; return 0; }
+int Psyz_GpuLoadSpriteAtlasPixels(uint64_t key, const void *rgba, int width, int height, int pitch) { (void)key; (void)rgba; (void)width; (void)height; (void)pitch; return 0; }
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell) { (void)key; (void)cell; }
+void Psyz_GpuSelectSpriteAtlasTile(uint64_t key, unsigned int cell, unsigned int u0, unsigned int v0) { (void)key; (void)cell; (void)u0; (void)v0; }
+int Psyz_GpuSetPageHdWindows(const unsigned short *xys, int count) { (void)xys; (void)count; return 0; }
+int Psyz_GpuSetPageHd(unsigned int tpage, unsigned int clut_y0, unsigned int clut_y1, const void *rgba, const void *ref, int width, int height, int pitch) { (void)tpage; (void)clut_y0; (void)clut_y1; (void)rgba; (void)ref; (void)width; (void)height; (void)pitch; return 0; }
 int Psyz_GpuGetSpriteAtlasesEnabled(void) {return 0;}
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled) {(void)enabled;}
 void Psyz_GpuResetSpriteAtlases(void) {}

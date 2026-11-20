@@ -63,6 +63,12 @@ int Psyz_GpuSetHorizontalGrid(
  * Returns 1 when loaded, 0 when unavailable, -1 for malformed/over-budget data.
  * Keys identify immutable assets, not VRAM addresses. */
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
+/* The same from RGBA32 pixels in memory, laid out as a PNG/BMP atlas (width a
+ * multiple of 68, at most 16 cells; height a multiple of 136, material cells in
+ * the upper half, their native reference colours in the lower half). The pixels
+ * are copied; the atlas lasts until Psyz_GpuResetSpriteAtlases. Same results. */
+int Psyz_GpuLoadSpriteAtlasPixels(uint64_t key, const void *rgba, int width,
+                                  int height, int pitch);
 /* Retire queued reads and reuse the bounded atlas storage for a new room. */
 void Psyz_GpuResetSpriteAtlases(void);
 /* Presentation switch; native VRAM remains unchanged. */
@@ -88,6 +94,26 @@ int Psyz_GpuGetSpriteAtlasesEnabled(void);
  * when selecting inside an OT. Missing keys select ordinary rendering. */
 /* Cell bit 23 marks display-only widescreen extension material. */
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell);
+/* Like Psyz_GpuSelectSpriteAtlas, for the next textured polygon: the cell shows
+ * the 16x16 texels at (u0, v0) of the polygon's texture page, so a polygon cut
+ * from that sprite samples the matching part of the cell. Sprites ignore it. */
+void Psyz_GpuSelectSpriteAtlasTile(uint64_t key, unsigned int cell,
+                                   unsigned int u0, unsigned int v0);
+/* An HD picture for a whole texture page: textured polygons drawn from page
+ * `tpage` (GPU texpage bits; the low 5 select the page) with a CLUT whose VRAM
+ * row lies in [clut_y0, clut_y1] show `rgba` (1024x1024 or 2048x2048 RGBA,
+ * 4x4 or 8x8 pixels per texel of the page's 256x256 texels). `ref` (same size and pitch) holds each
+ * texel's native colour; like HD sprite tiles, a pixel shows the picture only
+ * where the drawn texel has that colour, else the native texel. Native texels
+ * keep transparency, STP and blending; display only, needs the HD sprite
+ * atlases enabled and an internal resolution above 1x. Lasts across
+ * Psyz_GpuResetSpriteAtlases; one page at a time; rgba NULL turns it off.
+ * Returns 1 when set, 0 when unavailable (no GPU backend, atlas storage
+ * full), -1 for a bad size. */
+/* Per-palette windows of the HD page picture: count entries of x, y, size (pixels). NULL: none. */
+int Psyz_GpuSetPageHdWindows(const unsigned short *xys, int count);
+int Psyz_GpuSetPageHd(unsigned int tpage, unsigned int clut_y0, unsigned int clut_y1,
+                      const void *rgba, const void *ref, int width, int height, int pitch);
 
 /**
  * @brief Keep a CPU copy of the VRAM (off by default)
