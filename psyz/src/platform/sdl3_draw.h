@@ -66,6 +66,9 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count);
 #define TRIANGLE 0x20
 
 static u_short cur_tpage = 0;
+#ifdef PSYZ_SOFTWARE_ROUTING
+static bool gpu_set_mask_bit = false; // E6h bit 0, applied per flushed batch
+#endif
 static Vertex vertex_buf[MAX_VERTEX_COUNT];
 static unsigned short index_buf[MAX_INDEX_COUNT];
 static Vertex* vertex_cur;
@@ -162,6 +165,7 @@ typedef enum {
     BLEND_SUB_OPAQUE,
     BLEND_MASK,
     BLEND_DIRECT,
+    BLEND_MASK_SET, // alpha only: max(dst, src), forces the mask bit on drawn pixels
     BLEND_COUNT,
 } BlendMode;
 
@@ -229,10 +233,21 @@ void Draw_SetMask(int bit0, int bit1) {
         software_rasterizer.mask(bit0, bit1);
         return;
     }
-#endif
+    /* E6h bit 0: every pixel written afterwards gets its mask bit (STP) set,
+     * whatever the texel or primitive says. Frame-feedback effects depend on
+     * it: they redraw the previous frame with only marked pixels blended. */
+    if (!!bit0 != gpu_set_mask_bit) {
+        Draw_FlushBuffer();
+        gpu_set_mask_bit = !!bit0;
+    }
+    if (bit1) {
+        NOT_IMPLEMENTED;
+    }
+#else
     if (bit0 || bit1) {
         NOT_IMPLEMENTED;
     }
+#endif
 }
 
 #endif

@@ -105,6 +105,7 @@ static bool dynamic_lighting = false;
 static bool effect_geometry_correction = false;
 static bool set_effect_geometry_correction = false;
 static SDL_GPUBuffer* vbuf = NULL;
+static SDL_GPUBuffer* vbuf_set_mask = NULL; // vbuf with every vertex opaque
 static SDL_GPUBuffer* ibuf = NULL;
 static SDL_GPUBuffer* clear_vbuf = NULL;
 static SDL_GPUTransferBuffer* vtx_transfer = NULL;
@@ -799,6 +800,21 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
             },
     };
     SDL_GPUColorTargetBlendState blend_state = blend[mode];
+    if (mode == BLEND_MASK_SET) {
+        /* The opaque colour pass writes alpha 1 on every covered pixel and
+         * vec4(0) on fully transparent texels; MAX keeps the latter's mask. */
+        blend_state = (SDL_GPUColorTargetBlendState){
+            .src_color_blendfactor = SDL_GPU_BLENDFACTOR_ZERO,
+            .dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
+            .color_blend_op = SDL_GPU_BLENDOP_ADD,
+            .src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
+            .dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
+            .alpha_blend_op = SDL_GPU_BLENDOP_MAX,
+            .color_write_mask = SDL_GPU_COLORCOMPONENT_A,
+            .enable_blend = true,
+            .enable_color_write_mask = true,
+        };
+    }
     if (mode == BLEND_MASK) {
         blend_state.color_write_mask = SDL_GPU_COLORCOMPONENT_A;
         blend_state.enable_color_write_mask = true;
@@ -920,6 +936,7 @@ static bool CreateGpuResources(void) {
         .size = MAX_VERTEX_COUNT * sizeof(Vertex),
     };
     vbuf = SDL_CreateGPUBuffer(device, &vbuf_info);
+    vbuf_set_mask = SDL_CreateGPUBuffer(device, &vbuf_info);
     const SDL_GPUBufferCreateInfo ibuf_info = {
         .usage = SDL_GPU_BUFFERUSAGE_INDEX,
         .size = MAX_INDEX_COUNT * sizeof(u16),
@@ -930,7 +947,7 @@ static bool CreateGpuResources(void) {
         .size = 4 * sizeof(Vertex),
     };
     clear_vbuf = SDL_CreateGPUBuffer(device, &clear_vbuf_info);
-    if (!vbuf || !ibuf || !clear_vbuf) {
+    if (!vbuf || !vbuf_set_mask || !ibuf || !clear_vbuf) {
         ERRORF("SDL_CreateGPUBuffer: %s", SDL_GetError());
         return false;
     }
@@ -938,7 +955,7 @@ static bool CreateGpuResources(void) {
     const SDL_GPUTransferBufferCreateInfo vtx_transfer_info = {
         .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
         .size =
-            MAX_VERTEX_COUNT * sizeof(Vertex) + MAX_INDEX_COUNT * sizeof(u16),
+            MAX_VERTEX_COUNT * sizeof(Vertex) * 2 + MAX_INDEX_COUNT * sizeof(u16),
     };
     vtx_transfer = SDL_CreateGPUTransferBuffer(device, &vtx_transfer_info);
     const SDL_GPUTransferBufferCreateInfo upload_info = {
@@ -1970,6 +1987,10 @@ static void QuitPlatform(void) {
             SDL_ReleaseGPUBuffer(device, vbuf);
             vbuf = NULL;
         }
+        if (vbuf_set_mask) {
+            SDL_ReleaseGPUBuffer(device, vbuf_set_mask);
+            vbuf_set_mask = NULL;
+        }
         if (ibuf) {
             SDL_ReleaseGPUBuffer(device, ibuf);
             ibuf = NULL;
@@ -2011,6 +2032,7 @@ static void QuitPlatform(void) {
 
 void ResetPlatform(void) {
     cur_tpage = 0;
+    gpu_set_mask_bit = false;
     internal_res = 1;
     geometry_correction = false;
     set_geometry_correction = false;
@@ -3329,8 +3351,17 @@ void Draw_FlushBuffer(void) {
     const Uint32 vtx_size = (Uint32)(sizeof(Vertex) * n_vertices);
     const Uint32 idx_size = (Uint32)(sizeof(*index_buf) * n_indices);
     const Uint32 idx_offset = MAX_VERTEX_COUNT * sizeof(Vertex);
+    const Uint32 set_mask_offset =
+        MAX_VERTEX_COUNT * sizeof(Vertex) + MAX_INDEX_COUNT * sizeof(u16);
     memcpy(map, vertex_buf, vtx_size);
     memcpy(map + idx_offset, index_buf, idx_size);
+    if (gpu_set_mask_bit) {
+        /* Same geometry, all opaque: the colour shader then reports alpha 1
+         * on each pixel a semitransparent primitive covers as well. */
+        Vertex* opaque = (Vertex*)(map + set_mask_offset);
+        memcpy(opaque, vertex_buf, vtx_size);
+        for (int i = 0; i < n_vertices; ++i) opaque[i].a = 0xFF;
+    }
     SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
 
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
@@ -3342,6 +3373,13 @@ void Draw_FlushBuffer(void) {
         .transfer_buffer = vtx_transfer, .offset = idx_offset};
     const SDL_GPUBufferRegion idx_dst = {.buffer = ibuf, .size = idx_size};
     SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, true);
+    if (gpu_set_mask_bit) {
+        const SDL_GPUTransferBufferLocation set_src = {
+            .transfer_buffer = vtx_transfer, .offset = set_mask_offset};
+        const SDL_GPUBufferRegion set_dst = {
+            .buffer = vbuf_set_mask, .size = vtx_size};
+        SDL_UploadToGPUBuffer(copy, &set_src, &set_dst, true);
+    }
     if (batch_has_texture && vram_dirty.w > 0 && vram_dirty.h > 0) {
         const SDL_GPUTextureLocation vram_src = {.texture = vram_render,
                                                  .x = (Uint32)vram_dirty.x,
@@ -3563,6 +3601,22 @@ void Draw_FlushBuffer(void) {
                 SDL_PushGPUFragmentUniformData(
                     cmd, 0, mask_pass, sizeof(mask_pass));
                 SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
+                SDL_DrawGPUIndexedPrimitives(
+                    pass, (Uint32)(end - start), 1, (Uint32)start, 0, 0);
+            }
+            /* E6h bit 0: force the mask bit on every pixel just drawn. The
+             * presentation-only midpoint target never feeds back. */
+            if (gpu_set_mask_bit && !midpoint) {
+                const u32 set_pass[4] = {
+                    0, target_scale,
+                    draw_grid_source_width == draw_grid_target_width,
+                    (target_index && model_filtering ? 1u : 0u) |
+                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                SDL_PushGPUFragmentUniformData(
+                    cmd, 0, set_pass, sizeof(set_pass));
+                const SDL_GPUBufferBinding set_vb = {.buffer = vbuf_set_mask};
+                SDL_BindGPUVertexBuffers(pass, 0, &set_vb, 1);
+                SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK_SET]);
                 SDL_DrawGPUIndexedPrimitives(
                     pass, (Uint32)(end - start), 1, (Uint32)start, 0, 0);
             }
