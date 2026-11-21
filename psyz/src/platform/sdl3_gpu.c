@@ -2249,13 +2249,13 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
 }
 
 static void UpdateScissor() {
-    int width = draw_area_end.x - draw_area_start.x + 1;
-    int height = draw_area_end.y - draw_area_start.y + 1;
-    if (width <= 0 || height <= 0) {
-        // Draw_SetAreaStart gets called before Draw_SetAreaEnd, it happens
-        // that either width or height are zero. Just ignore the call.
-        return;
-    }
+    /* GP0(E3h)/GP0(E4h) bounds are inclusive. An end before its start is an
+     * empty area: the PS1 GPU draws nothing until the next area command (the
+     * software rasterizer does the same). Keeping the previous scissor would
+     * draw content that the game deliberately clipped away, e.g. PE2 hides a
+     * menu panel with a zero-sized area that is inverted in display buffer 1. */
+    int width = SDL_max(0, draw_area_end.x - draw_area_start.x + 1);
+    int height = SDL_max(0, draw_area_end.y - draw_area_start.y + 1);
 
     if (!sdl3_window || !InitPlatform()) {
         return;
@@ -3307,6 +3307,11 @@ void Draw_FlushBuffer(void) {
         return;
     }
     if (n_vertices == 0) {
+        return;
+    }
+    if (scissor_rect.w <= 0 || scissor_rect.h <= 0) {
+        /* Primitives queued under an empty draw area are clipped entirely. */
+        Draw_ResetBuffer();
         return;
     }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();

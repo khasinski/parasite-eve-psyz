@@ -902,13 +902,11 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
 }
 
 static void UpdateScissor(void) {
-    int width = draw_area_end.x - draw_area_start.x + 1;
-    int height = draw_area_end.y - draw_area_start.y + 1;
-    if (width <= 0 || height <= 0) {
-        // Draw_SetAreaStart gets called before Draw_SetAreaEnd, it happens
-        // that either width or height are zero. Just ignore the call.
-        return;
-    }
+    /* Inclusive GP0(E3h)/GP0(E4h) bounds; an end before its start is an empty
+     * area that draws nothing on the PS1 GPU. A zero-sized GL scissor matches
+     * that instead of keeping the previous area (see sdl3_gpu.c). */
+    int width = SDL_max(0, draw_area_end.x - draw_area_start.x + 1);
+    int height = SDL_max(0, draw_area_end.y - draw_area_start.y + 1);
 
     if (!sdl3_window && !InitPlatform()) {
         return;
