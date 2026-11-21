@@ -124,6 +124,7 @@ static const char fragment_shader_body[] = {
     "flat in uvec4 texWindow;\n"
     "uniform sampler2D texVram;\n"
     "uniform bool fullColor;\n"
+    "uniform int maskPass;\n" // 0 colour, 1 texel STP to alpha, 2 forced mask
     "\n"
     "uvec2 resolveTexel() {\n"
     "    vec2 uv = rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;\n"
@@ -175,7 +176,15 @@ static const char fragment_shader_body[] = {
     "    }\n"
     // check for full transparency
     "    if (texColor == vec4(0, 0, 0, 0)) {\n"
+    "        if (maskPass != 0) discard;\n"
     "        FragColor = vec4(0);\n"
+    "        return;\n"
+    "    }\n"
+    // alpha-only pass: the PS1 mask bit is the texel's STP (0 untextured)
+    // or, with E6h bit 0 set, 1 on every pixel drawn
+    "    if (maskPass != 0) {\n"
+    "        bool stp = maskPass == 2 || (textureMode != 0u && texColor.a > 0.0);\n"
+    "        FragColor = vec4(0, 0, 0, stp ? 1.0 : 0.0);\n"
     "        return;\n"
     "    }\n"
     // check for setSemiTrans(p, 1)
@@ -234,6 +243,7 @@ static GLint uniform_resolution = 0;
 static GLint uniform_tex_vram = 0;
 static GLint uniform_draw_offset = 0;
 static GLint uniform_full_color = -1;
+static GLint uniform_mask_pass = -1;
 static GLuint vram_texture;
 static GLuint rgb24_texture, rgb24_fbo;
 static bool display_rgb24;
@@ -418,6 +428,7 @@ bool InitPlatform() {
     uniform_tex_vram = glGetUniformLocation(shader_program, "texVram");
     uniform_draw_offset = glGetUniformLocation(shader_program, "drawOffset");
     uniform_full_color = glGetUniformLocation(shader_program, "fullColor");
+    uniform_mask_pass = glGetUniformLocation(shader_program, "maskPass");
 
     glUniform1i(uniform_tex_vram, 0);
     glUniform2f(uniform_draw_offset, 0, 0);
@@ -719,6 +730,7 @@ static void QuitPlatform(void) {
 
 void ResetPlatform(void) {
     cur_tpage = 0;
+    gpu_set_mask_bit = false;
     if (shader_program) {
         glDeleteProgram(shader_program);
         shader_program = 0;
@@ -1524,6 +1536,10 @@ static void SetBlendMode(BlendMode mode) {
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         break;
+    case BLEND_MASK: // used with glColorMask(alpha only): plain overwrite
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ZERO);
+        break;
     default:
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -1534,6 +1550,19 @@ static void SetBlendMode(BlendMode mode) {
 static void DrawIndices(int start, int end) {
     glDrawElements(GL_TRIANGLES, end - start, GL_UNSIGNED_SHORT,
                    (const GLvoid*)((uintptr_t)start * sizeof(unsigned short)));
+}
+
+/* Blend factors use source alpha as an operation selector, so the colour
+ * passes leave a meaningless alpha behind. Redraw the same primitives into
+ * alpha only with the actual PS1 mask bit: the texel's STP, or 1 everywhere
+ * while GP0(E6h) bit 0 is set. Fully transparent texels keep their mask. */
+static void DrawMaskIndices(int start, int end) {
+    SetBlendMode(BLEND_MASK);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    glUniform1i(uniform_mask_pass, gpu_set_mask_bit ? 2 : 1);
+    DrawIndices(start, end);
+    glUniform1i(uniform_mask_pass, 0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 }
 
 void Draw_FlushBuffer(void) {
@@ -1587,11 +1616,13 @@ void Draw_FlushBuffer(void) {
                 SetBlendMode(BLEND_SUB_OPAQUE);
                 DrawIndices(start, group_end);
             }
+            DrawMaskIndices(start, group_end);
             start = group_end;
         }
         SetBlendMode(BLEND_ADD);
         if (start < end) {
             DrawIndices(start, end);
+            DrawMaskIndices(start, end);
             start = end;
         }
     }
