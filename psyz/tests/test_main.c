@@ -2,6 +2,16 @@
 
 #include "ztest.h"
 
+#ifdef __APPLE__
+// libapi.c only declares this hook weak; Mach-O does not resolve an undefined
+// weak reference from a static archive, so the test binary supplies a no-op.
+void Psyz_PadsOverride(int port, char* frame, int len) {
+    (void)port;
+    (void)frame;
+    (void)len;
+}
+#endif
+
 #ifdef __psx__
 #include <libapi.h>
 #include <libetc.h>

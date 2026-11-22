@@ -2279,7 +2279,7 @@ static void UpdateScissor() {
     int width = SDL_max(0, draw_area_end.x - draw_area_start.x + 1);
     int height = SDL_max(0, draw_area_end.y - draw_area_start.y + 1);
 
-    if (!sdl3_window || !InitPlatform()) {
+    if (!sdl3_window && !InitPlatform()) {
         return;
     }
     Draw_FlushBuffer();
@@ -3096,12 +3096,20 @@ void Draw_SetOffset(int x, int y) {
     draw_offset.y = y;
 }
 
-void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+void Draw_ClearImage(PS1_RECT* in, u_char r, u_char g, u_char b) {
     if (UseSoftwareBackend()) {
-        software_rasterizer.clear_image(rect, r, g, b);
+        software_rasterizer.clear_image(in, r, g, b);
         return;
     }
-    if (rect->w == 0 || rect->h == 0) {
+    /* Clip to VRAM as the software rasterizer does: the dirty mark and the
+     * blit to the scaled copy must not name texels outside the texture. */
+    int x0 = SDL_clamp(in->x, 0, VRAM_W), y0 = SDL_clamp(in->y, 0, VRAM_H);
+    int x1 = SDL_clamp(in->x + in->w, 0, VRAM_W);
+    int y1 = SDL_clamp(in->y + in->h, 0, VRAM_H);
+    PS1_RECT clipped = {
+        (short)x0, (short)y0, (short)(x1 - x0), (short)(y1 - y0)};
+    PS1_RECT* rect = &clipped;
+    if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
     if (!sdl3_window && !InitPlatform()) {

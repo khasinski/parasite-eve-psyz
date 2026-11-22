@@ -401,6 +401,7 @@ void Psyz_CdSetReadCB(PsyzCdReadCB cb) { disk_read_cb = cb; }
 #define CD_BUF_FRAMES                                                          \
     (SECTOR_SIZE * BUFFER_SECTORS / (N_CHANNELS * SAMPLE_SIZE))
 static FILE* track_file;
+static int read_raw_sector(int sector, u_char* out);
 static const TrackEntry* track_file_track;
 
 static void close_track_file(void) {
@@ -577,6 +578,17 @@ static int xa_decode_user_mono_4bit(const unsigned char* user) {
     return frame;
 }
 
+// Read the sector after the last XA one. Seek for every sector: movie video
+// reads share track_file, so its file position is not the XA stream's.
+static size_t xa_fetch_sector(u_char* sector) {
+    if (disk_read_cb) {
+        return (size_t)disk_read_cb(&(struct PsyzCdRead){
+            (unsigned int)(xa.cur_abs_sector + 1), SECTOR_SIZE, sector});
+    }
+    return read_raw_sector(xa.cur_abs_sector + 1, sector) == 0 ? SECTOR_SIZE
+                                                               : 0;
+}
+
 static int xa_read_and_decode_sector(void) {
     unsigned char sector[SECTOR_SIZE];
     int gap = 0;
@@ -593,11 +605,7 @@ static int xa_read_and_decode_sector(void) {
         goto silence;
     }
     while (!xa.stream_ended || silent_sectors-- > 0) {
-        const size_t n =
-            disk_read_cb ? (size_t)disk_read_cb(&(struct PsyzCdRead){
-                               (unsigned int)(xa.cur_abs_sector + 1),
-                               SECTOR_SIZE, sector})
-                         : fread(sector, 1, SECTOR_SIZE, track_file);
+        const size_t n = xa_fetch_sector(sector);
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
         }
@@ -1347,11 +1355,9 @@ int CdRead(int sectors, u_long* buf, int mode) {
     long sector = CdPosToInt(&CD_pos);
     Psyz_AudioLock();
     for (int i = 0; i < sectors; i++) {
-        if (fseek(track_file, (sector + i) * SECTOR_SIZE, SEEK_SET) != 0) {
-            break;
-        }
+        /* read_raw_sector maps the absolute sector into its track's file. */
         unsigned char sector_raw[SECTOR_SIZE];
-        if (fread(sector_raw, 1, SECTOR_SIZE, track_file) != SECTOR_SIZE) {
+        if (read_raw_sector((int)sector + i, sector_raw) != 0) {
             break;
         }
         int user_offset;

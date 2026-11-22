@@ -64,10 +64,14 @@ static void spu_reset(void) {
 }
 
 static void spu_reset_hot(void) {
-    u8 saved_ram[PSYZ_SPU_RAM_SIZE];
-    memcpy(saved_ram, spu.ram, PSYZ_SPU_RAM_SIZE);
-    spu_reset();
-    memcpy(spu.ram, saved_ram, PSYZ_SPU_RAM_SIZE);
+    /* Keep SPU RAM (the first member) and clear the rest in place; a 512 KiB
+     * copy on the stack would overflow small thread stacks. */
+    assert((void*)spu.ram == (void*)&spu);
+    _spu_RXX->rxx.spustat = 0;
+    for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
+        _spu_RXX->rxx.voice[v].volumex = 0;
+    }
+    memset((u8*)&spu + sizeof(spu.ram), 0, sizeof(spu) - sizeof(spu.ram));
 }
 
 void Psyz_SpuReset(int hot) {
