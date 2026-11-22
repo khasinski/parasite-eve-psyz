@@ -3292,17 +3292,25 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         SDL_CopyGPUTextureToTexture(
             copy, &bounce, &dst, (Uint32)copy_w, (Uint32)copy_h, 1, false);
     } else {
-        // Slow-path, simulating real hardware behaviour
+        // Slow-path, simulating real hardware behaviour: rows are copied in
+        // order, so a row reads what earlier rows wrote. Each row bounces
+        // through vram_sample: a copy within one texture whose regions
+        // overlap (a horizontal move) is undefined in Vulkan, D3D12 and Metal.
         // This behaviour is tested via move_image_overlap
         for (int row = 0; row < copy_h; row++) {
             const SDL_GPUTextureLocation src = {.texture = vram_render,
                                                 .x = (Uint32)src_x,
                                                 .y = (Uint32)(src_y + row)};
+            const SDL_GPUTextureLocation bounce = {.texture = vram_sample,
+                                                   .x = (Uint32)src_x,
+                                                   .y = (Uint32)(src_y + row)};
             const SDL_GPUTextureLocation dst = {.texture = vram_render,
                                                 .x = (Uint32)dst_x,
                                                 .y = (Uint32)(dst_y + row)};
             SDL_CopyGPUTextureToTexture(
-                copy, &src, &dst, (Uint32)copy_w, 1, 1, false);
+                copy, &src, &bounce, (Uint32)copy_w, 1, 1, false);
+            SDL_CopyGPUTextureToTexture(
+                copy, &bounce, &dst, (Uint32)copy_w, 1, 1, false);
         }
     }
     SDL_EndGPUCopyPass(copy);

@@ -142,14 +142,23 @@ void Psyz_AudioDestroy(void) {
     video_clock = false;
 }
 
+// Locks this thread took. The mutex is created lazily by Psyz_AudioInit on
+// the game thread while other threads (root-counter callbacks writing the
+// SPU) may already lock: a lock taken before the mutex existed did nothing, so
+// its unlock must not release the new mutex, which this thread never held.
+static _Thread_local int locks_held;
+
 void Psyz_AudioLock() {
-    if (mutex) {
-        SDL_LockMutex(mutex);
+    SDL_Mutex* m = mutex;
+    if (m) {
+        SDL_LockMutex(m);
+        locks_held++;
     }
 }
 
 void Psyz_AudioUnlock() {
-    if (mutex) {
+    if (locks_held > 0 && mutex) {
+        locks_held--;
         SDL_UnlockMutex(mutex);
     }
 }

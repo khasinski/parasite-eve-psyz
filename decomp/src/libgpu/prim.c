@@ -76,7 +76,12 @@ void SetDrawLoad(DR_LOAD* p, RECT* rect) {
     p->code[0] = 0xA0000000;
     p->code[1] = *(int*)&rect->x;
     p->code[2] = *(int*)&rect->w;
-    p->code[len - 1] = 0x01000000;
+#ifdef __psyz
+    // An oversized rectangle gives len 0. The PS1 then stored the flush over
+    // the tag word before code[0]; on the host that is the tag's len field.
+    if (len > 0)
+#endif
+        p->code[len - 1] = 0x01000000;
 }
 
 int MargePrim(void* p0, void* p1) {

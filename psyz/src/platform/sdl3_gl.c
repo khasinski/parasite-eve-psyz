@@ -1381,6 +1381,14 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     if (rect->w == 0 || rect->h == 0) {
         return;
     }
+    // As the SDL_GPU backend: a negative size would wrap the pixel count and
+    // GL leaves the pixels of a rectangle outside the texture undefined.
+    if (rect->x < 0 || rect->y < 0 || rect->w < 0 || rect->h < 0 ||
+        rect->x + rect->w > VRAM_W || rect->y + rect->h > VRAM_H) {
+        WARNF("rect (%d,%d %dx%d) is out of bound %dx%d, skipping upload",
+              rect->x, rect->y, rect->w, rect->h, VRAM_W, VRAM_H);
+        return;
+    }
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
@@ -1399,6 +1407,14 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
 }
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
     if (rect->w == 0 || rect->h == 0) {
+        return;
+    }
+    // As the SDL_GPU backend: a negative size would wrap the pixel count and
+    // GL leaves the pixels of a rectangle outside the texture undefined.
+    if (rect->x < 0 || rect->y < 0 || rect->w < 0 || rect->h < 0 ||
+        rect->x + rect->w > VRAM_W || rect->y + rect->h > VRAM_H) {
+        WARNF("rect (%d,%d %dx%d) is out of bound %dx%d, skipping download",
+              rect->x, rect->y, rect->w, rect->h, VRAM_W, VRAM_H);
         return;
     }
     if (!sdl3_window && !InitPlatform()) {

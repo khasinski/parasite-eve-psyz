@@ -337,6 +337,16 @@ static void GPU_Enqueue(u_long* packets) {
             INFOF("GPU queue full, calling exeque");
             Psyz_GpuExeque();
         }
+        // A tag length byte holds at most 255 words; a larger length is a
+        // corrupted tag and would overrun the queue even after the flush.
+        if (env->len > 0xFF || queue_len + env->len > LEN(queue_buf)) {
+            ERRORF("dropping packet of 0x%X words", (unsigned)env->len);
+            if (isendprim(env)) {
+                break;
+            }
+            env = (DR_ENV*)nextPrim(env);
+            continue;
+        }
         // a flush empties the queue; the packet that did not fit still goes in
         if (sizeof(u_long) == 8) {
             // Wow okay, this part is uuuugly...
