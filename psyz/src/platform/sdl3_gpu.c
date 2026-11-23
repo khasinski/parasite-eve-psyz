@@ -2682,6 +2682,15 @@ static void SetPolygonAttributes(Vertex* vertices) {
     }
 }
 
+/* Whether texture page `page` covers any pixel of the current drawing area. */
+static bool TexturePageOverlapsDrawArea(u16 page) {
+    static const int widths[4] = {64, 128, 256, 256};
+    const int x0 = (page & 0xF) * 64, y0 = (page & 0x10) ? 256 : 0;
+    const int x1 = x0 + widths[(page >> 7) & 3], y1 = y0 + 256;
+    return x0 < scissor_rect.x + scissor_rect.w && scissor_rect.x < x1 &&
+           y0 < scissor_rect.y + scissor_rect.h && scissor_rect.y < y1;
+}
+
 int Draw_PushPrim(u_long* packets, int max_len) {
     if (UseSoftwareBackend())
         return software_rasterizer.push_prim(packets, max_len);
@@ -2702,6 +2711,19 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool isShadeTex = !((code & 1) && isTextured && !isLine);
     u16 tpage = -1, clut = -1, pad2, pad3;
     Vertex* v;
+
+    /* Frame feedback (screen waves, captures): a textured primitive may
+     * sample the pixels that earlier primitives of this batch draw. Those
+     * reach vram_sample only when a batch is submitted, so submit them
+     * first; otherwise the effect redraws the frame without them. */
+    if (isTextured && !isLine && !atlas && n_vertices > 0) {
+        u16 page = cur_tpage;
+        if (isPoly) {
+            int word = (code & GOURAUD) ? 5 : 4; /* the second UV word carries the page */
+            if (word < max_len) page = (u16)(packets[word] >> 16);
+        }
+        if (TexturePageOverlapsDrawArea(page)) Draw_FlushBuffer();
+    }
 
     // A quad has two independent attribute planes, hence six vertices.
     // This also covers Gouraud's fifth-slot colour read-ahead.
