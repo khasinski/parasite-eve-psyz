@@ -880,6 +880,7 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 #endif
 }
 
+#if defined(__psyz) && !defined(__PSP__)
 /* The dark-to-bright edges of a captured frame along rows (vertical) or
  * columns, averaged over a band across them, each to the fraction of an
  * output pixel: the dark share of a window before it. */
@@ -941,6 +942,7 @@ static void WideEdgeSpread(int pan, float spread[2]) {
         }
     }
 }
+#endif
 
 /* The presenter's part of a room's sub-pixel shift moves the whole widescreen
  * picture alike: edges down the screen keep their distances whatever the
@@ -968,6 +970,7 @@ ZTEST(gpu, widescreen_subpixel_shift_moves_picture_uniformly) {
 #endif
 }
 
+#if defined(__psyz) && !defined(__PSP__)
 /* A dithered room drawn moved by its widescreen step (k/8 of a game pixel
  * down at 8x, all of it in the drawing) against the same room unmoved: the
  * mean difference of the shown pixels below the room's top edge, which
@@ -995,6 +998,7 @@ static float WideDitherDrift(unsigned step) {
     free(pixels);
     return diff/(64.0f*256.0f);
 }
+#endif
 
 /* The room's widescreen step moves its dither with it: the dither matrix
  * stays on the buffer, so a room moved by part of a game pixel took another
