@@ -1019,6 +1019,59 @@ ZTEST(gpu, widescreen_room_step_keeps_its_dither) {
 #endif
 }
 
+ZTEST(gpu, hd_page_polygon_matches_reference_without_changing_native_vram) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend = getenv("PSYZ_HEADLESS");
+    if (!backend || strcmp(backend, "gpu")) zskip("requires headless GPU");
+    DISPENV disp;
+    DRAWENV draw;
+    SetDefDispEnv(&disp, 0, 0, 320, 224);
+    disp.screen.h = 224;
+    PutDispEnv(&disp);
+    SetDefDrawEnv(&draw, 0, 0, 320, 224);
+    draw.dtd = 0;
+    PutDrawEnv(&draw);
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);
+    SDL_Surface *material = SDL_CreateSurface(1024, 1024, SDL_PIXELFORMAT_RGBA32);
+    SDL_Surface *reference = SDL_CreateSurface(1024, 1024, SDL_PIXELFORMAT_RGBA32);
+    zassert_ptr_ne(NULL, material);
+    zassert_ptr_ne(NULL, reference);
+    SDL_FillSurfaceRect(material, NULL, SDL_MapSurfaceRGB(material, 255, 0, 0));
+    SDL_FillSurfaceRect(reference, NULL, SDL_MapSurfaceRGB(reference, 0, 255, 0));
+    RECT source = {512, 0, 16, 16}, center = {24, 24, 2, 1};
+    u_short page = GetTPage(2, 0, 512, 0);
+    zassert_s32_eq(1, Psyz_GpuSetPageHd(page, 0, 0, material->pixels,
+                                        reference->pixels, 1024, 1024, material->pitch));
+    SDL_DestroySurface(reference);
+    SDL_DestroySurface(material);
+    POLY_FT4 polygon = {0};
+    SetPolyF4Img(&polygon, 16, 16, 16, 16, 0, 0, page, 0, 0);
+    setRGB0(&polygon, 128, 128, 128);
+    for (int matching = 0; matching <= 1; matching++) {
+        u16 pixels[256], native[2] = {0};
+        for (int i = 0; i < 256; i++) pixels[i] = matching ? 0x03e0 : 0x7c00;
+        LoadImage(&source, (u_long *)pixels);
+        DrawPrim(&polygon);
+        int w, h;
+        u8 *frame = Psyz_VideoAllocRenderedFrame(&w, &h);
+        zassert_ptr_ne(NULL, frame);
+        zassert_s32_eq(1, w > 48 && h > 48);
+        u8 *pixel = frame + (48 * w + 48) * 3;
+        zassert_s32_eq(1, pixel[matching ? 0 : 2] > 200);
+        zassert_s32_eq(1, pixel[matching ? 2 : 0] < 32);
+        free(frame);
+        StoreImage(&center, (u_long *)native);
+        DrawSync(0);
+        zassert_s32_eq(pixels[0], native[0] & 0x7fff);
+    }
+    Psyz_GpuSetPageHd(0, 0, 0, NULL, NULL, 0, 0, 0);
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");
