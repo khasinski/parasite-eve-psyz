@@ -999,6 +999,12 @@ PsyzSize Psyz_VideoGetDisplaySize(void) {
     return s;
 }
 
+/* The PSP queue carries native primitives without interpolation metadata. */
+void Psyz_GpuCopyInterpolationPacket(const void *from, const void *to) {
+    (void)from;
+    (void)to;
+}
+
 void Psyz_VideoSetDrawArea(PsyzRect rect) {
     draw_area_rect = rect;
     UpdateOutputMapping();
