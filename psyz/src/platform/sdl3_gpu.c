@@ -2836,6 +2836,7 @@ static void QuitPlatform(void) {
         DialogueFontDestroy();
         if (sprite_atlas_texture) SDL_ReleaseGPUTexture(device,sprite_atlas_texture);
         sprite_atlas_texture=NULL;sprite_atlas_cells=0;
+        page_hd.active=false;page_hd.reserved=false;page_hd_wins=0;
         sprite_atlas_count=0;sprite_atlas_bytes=0;next_sprite_atlas=NULL;
         if (sprite_atlas_sampler) SDL_ReleaseGPUSampler(device,sprite_atlas_sampler);
         sprite_atlas_sampler=NULL;
@@ -3880,7 +3881,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     if (w<page_hd_wins) { ox=page_hd_win[w][0]; oy=page_hd_win[w][1]; k=(float)page_hd_win[w][2]/256.0f; }
                     vertex_cur[i].hd_uv[0]=(left+ox+((float)(vertex_cur[i].u&255u)+0.5f)*k)/(float)HD_ATLAS_WIDTH;
                     vertex_cur[i].hd_uv[1]=(top+oy+((float)(vertex_cur[i].v&255u)+0.5f)*k)/(float)HD_ATLAS_HEIGHT;
-                    vertex_cur[i].hd_uv[2]=5.0f;   /* unconditional HD (as HD model replacements): no reference match */
+                    vertex_cur[i].hd_uv[2]=1.0f;
                 }
             }
             if (isTextured) DuckApply(vertex_cur,(unsigned)nVertices,tpage,clut);
