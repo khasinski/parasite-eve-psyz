@@ -533,7 +533,9 @@ static void WaitForNextFrame(void) {
         double frame_error = actual_frame_time - frame_time_us;
 
         // apply gentle correction (10% per frame)
-        drift_compensation = driver_pacing ? 0.0 :
+        /* A missed deadline is time spent doing work. Carrying that debt
+         * into the next present produces a burst of short VRR frames. */
+        drift_compensation = driver_pacing || elapsed_us >= frame_time_us ? 0.0 :
                              drift_compensation - frame_error * 0.1;
         if (drift_compensation > 5000.0) {
             drift_compensation = 5000.0;
