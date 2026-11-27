@@ -526,27 +526,6 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     glEnable(GL_SCISSOR_TEST);
 }
 
-static void SyncScaledVramToNative(void) {
-    if (!HasSeparateDrawTarget()) {
-        return;
-    }
-    int x0 = CLAMP(draw_area_start.x, 0, VRAM_W);
-    int y0 = CLAMP(draw_area_start.y, 0, VRAM_H);
-    int x1 = CLAMP(draw_area_end.x + 1, 0, VRAM_W);
-    int y1 = CLAMP(draw_area_end.y + 1, 0, VRAM_H);
-    if (x1 <= x0 || y1 <= y0) {
-        return;
-    }
-    glDisable(GL_SCISSOR_TEST);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, scaled_vram_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, vram_fbo);
-    glBlitFramebuffer(
-        x0 * internal_res, y0 * internal_res, x1 * internal_res,
-        y1 * internal_res, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, scaled_vram_fbo);
-    glEnable(GL_SCISSOR_TEST);
-}
-
 static bool CreateScaledVramFbo(int n) {
     if (scaled_vram_texture) {
         glDeleteTextures(1, &scaled_vram_texture);
@@ -1578,35 +1557,16 @@ static void DrawIndices(int start, int end) {
                    (const GLvoid*)((uintptr_t)start * sizeof(unsigned short)));
 }
 
-void Draw_FlushBuffer(void) {
-    if (n_vertices == 0) {
-        return;
-    }
-    if (VBO == -1) {
-        Draw_InitBuffer();
-    }
-
-    glUseProgram(shader_program);
-    glUniform1i(uniform_native_grid, internal_res == 1 && GetDrawGridXScale() == 1.0f);
-    glUniform1i(uniform_full_color, dither_mode == PSYZ_DITHER_OFF);
-    glBindVertexArray(VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferSubData(
-        GL_ARRAY_BUFFER, 0, (GLsizeiptr)(sizeof(Vertex) * (size_t)n_vertices),
-        vertex_buf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
-    glBufferSubData(
-        GL_ELEMENT_ARRAY_BUFFER, 0,
-        (GLsizeiptr)(sizeof(*index_buf) * (size_t)n_indices), index_buf);
-    glBindVertexArray(VAO);
+static void DrawBatchAtScale(int scale) {
+    glUniform1i(uniform_native_grid, scale == 1 && GetDrawGridXScale() == 1.0f);
     {
         const float grid_scale_x = GetDrawGridXScale();
-        const float render_scale = (float)internal_res;
+        const float render_scale = (float)scale;
         const GLint viewport_x = (GLint)lroundf(
             (float)draw_offset.x * render_scale * (1.0f - grid_scale_x));
         const GLsizei viewport_w =
             (GLsizei)lroundf((float)VRAM_W * render_scale * grid_scale_x);
-        glViewport(viewport_x, 0, viewport_w, VRAM_H * (GLsizei)internal_res);
+        glViewport(viewport_x, 0, viewport_w, VRAM_H * (GLsizei)scale);
     }
     int prim_size = 3;
     int start = 0;
@@ -1647,7 +1607,56 @@ void Draw_FlushBuffer(void) {
             start = end;
         }
     }
-    SyncScaledVramToNative();
+}
+
+void Draw_FlushBuffer(void) {
+    if (n_vertices == 0) {
+        return;
+    }
+    if (VBO == -1) {
+        Draw_InitBuffer();
+    }
+
+    glUseProgram(shader_program);
+    glUniform1i(uniform_full_color, dither_mode == PSYZ_DITHER_OFF);
+    glBindVertexArray(VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferSubData(
+        GL_ARRAY_BUFFER, 0, (GLsizeiptr)(sizeof(Vertex) * (size_t)n_vertices),
+        vertex_buf);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
+    glBufferSubData(
+        GL_ELEMENT_ARRAY_BUFFER, 0,
+        (GLsizeiptr)(sizeof(*index_buf) * (size_t)n_indices), index_buf);
+    glBindVertexArray(VAO);
+    if (HasSeparateDrawTarget()) {
+        DrawBatchAtScale(internal_res);
+    }
+    /* Native reads and texture feedback must use the original sampling grid. */
+    GLint clip[4];
+    glGetIntegerv(GL_SCISSOR_BOX, clip);
+    bool textured = false;
+    for (int i = 0; i < n_indices && !textured; i += 3)
+        textured = !is_untextured(&vertex_buf[index_buf[i]]);
+    if (textured) {
+        if (!EnsureScratchFbo()) {
+            BindDrawFbo();
+            Draw_ResetBuffer();
+            return;
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo);
+        glBindTexture(GL_TEXTURE_2D, scratch_texture);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, VRAM_W, VRAM_H);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo);
+    glScissor(clip[0] / internal_res, clip[1] / internal_res,
+              clip[2] / internal_res, clip[3] / internal_res);
+    DrawBatchAtScale(1);
+    glBindTexture(GL_TEXTURE_2D, vram_texture);
+    BindDrawFbo();
+    glScissor(clip[0], clip[1], clip[2], clip[3]);
     Draw_ResetBuffer();
 }
 
