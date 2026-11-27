@@ -9,6 +9,11 @@ layout(location = 5) in vec3 polygonRGB;
 layout(location = 6) in vec3 pgxpPos;
 layout(location = 7) in vec4 atlasBounds;
 layout(location = 8) in vec3 hdCoordinates;
+layout(location = 9) in uvec4 polygonGradientUV;
+layout(location = 10) in uvec4 polygonGradientRG;
+layout(location = 11) in uvec2 polygonGradientB;
+layout(location = 12) in ivec4 polygonCoverageAB;
+layout(location = 13) in ivec4 polygonCoverageC;
 
 // widescreen: {x squeeze, centre x before the draw-grid viewport,
 //              sub-pixel shift x, y (game pixels)}
@@ -32,19 +37,44 @@ layout(location = 13) flat out uint model;
 layout(location = 14) flat out vec4 uvBounds;
 
 layout(location = 15) out vec3 hdUV;
+layout(location = 16) flat out ivec4 nativeOriginUV;
+layout(location = 17) flat out ivec4 nativeOriginRGB;
+layout(location = 18) flat out uvec4 nativeGradientUV;
+layout(location = 19) flat out uvec4 nativeGradientRG;
+layout(location = 20) flat out uvec2 nativeGradientB;
+layout(location = 21) flat out ivec4 nativeCoverageAB;
+layout(location = 22) flat out ivec3 nativeCoverageC;
 
 void main() {
     hdUV=hdCoordinates;
     model = (tex.w & 0x1000u) != 0u ? 1u : 0u;
     uvBounds = atlasBounds;
     polygon = (tex.w & 0x2000u) != 0u ? 1u : 0u;
-    // drawOffset.z is a bitfield: bit0=ordinary PGXP, bit1=midpoint position.
+    // drawOffset.z: bit0=PGXP, bit1=midpoint, bit2=fractional horizontal grid.
     bool usePgxp = polygon != 0u && (uint(drawOffset.z)&1u)!=0u && pgxpPos.z > 0.0;
     bool midpoint = (uint(drawOffset.z)&2u)!=0u && pgxpPos.z>0.0;
     bool hiRes = drawOffset.w != 0.0;
+    vec2 offset = drawOffset.xy + widescreen.zw;
+    bool nativeGrid = polygon != 0u && uint(drawOffset.z) == 0u && !hiRes &&
+                      widescreen.x == 1.0 && all(equal(floor(offset), offset));
+    vec2 position = vec2(pos);
+    if (nativeGrid && polygonCoverageC.w > 0) {
+        // Hardware clipping can move an integer-owned edge off its sample
+        // (notably Vulkan at VRAM x=0). Cover conservatively, then apply the
+        // original integer edge rule in the fragment shader. The lower area
+        // bound also keeps large/thin triangles conservative without int64.
+        vec2 a = vec2(polygonCoverageAB.xy), b = vec2(polygonCoverageAB.zw);
+        vec2 c = vec2(polygonCoverageC.xy);
+        vec2 ab = abs(b-a), bc = abs(c-b), ca = abs(a-c);
+        float edge = max(ab.x+ab.y, max(bc.x+bc.y, ca.x+ca.y));
+        // Vulkan permits a 4-bit subpixel grid. One eighth of a pixel
+        // covers its quantization error; the integer mask removes overdraw.
+        float growth = 3.0 * edge / (8.0 * float(polygonCoverageC.w));
+        position += (position - (a+b+c)/3.0) * growth;
+    }
     float bias = (polygon != 0u && !hiRes) ? 0.5 : 0.0;
-    float vx = (usePgxp || midpoint) ? pgxpPos.x : (float(pos.x) + bias);
-    float vy = (usePgxp || midpoint) ? pgxpPos.y : (float(pos.y) + bias);
+    float vx = (usePgxp || midpoint) ? pgxpPos.x : (position.x + bias);
+    float vy = (usePgxp || midpoint) ? pgxpPos.y : (position.y + bias);
     float w = usePgxp ? pgxpPos.z : 1.0;
     float ax = vx + widescreen.z + drawOffset.x;
     // Squeezed before clipping, so drawing left of a buffer at VRAM x 0
@@ -72,6 +102,23 @@ void main() {
     rawUV = polygon != 0u
                 ? ((usePgxp || midpoint) ? vec2(tex.xy) : polyUV)
                 : vec2(tex.xy);
+    nativeOriginUV = ivec4(0);
+    nativeOriginRGB = ivec4(0);
+    nativeGradientUV = uvec4(0);
+    nativeGradientRG = uvec4(0);
+    nativeGradientB = uvec2(0);
+    nativeCoverageAB = ivec4(polygonCoverageAB.xy + ivec2(offset),
+                             polygonCoverageAB.zw + ivec2(offset));
+    nativeCoverageC = ivec3(polygonCoverageC.xy + ivec2(offset), polygonCoverageC.z);
+    if (polygon != 0u) {
+        // Integer planes avoid backend-dependent float interpolation at Q12
+        // boundaries. Keep enhanced geometry and fractional grids unchanged.
+        nativeOriginUV = ivec4(ivec2(pos) + ivec2(offset), ivec2(polygonUV * 4096.0));
+        nativeOriginRGB = ivec4(ivec3(polygonRGB * 4096.0), nativeGrid ? 1 : 0);
+        nativeGradientUV = polygonGradientUV;
+        nativeGradientRG = polygonGradientRG;
+        nativeGradientB = polygonGradientB;
+    }
     // Determine texture mode and pre-compute parameters
     subPixelMask = 0u;
     texelShift = 0u;

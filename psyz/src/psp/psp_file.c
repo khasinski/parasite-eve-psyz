@@ -109,12 +109,11 @@ static int open_dir(const char* basePath) {
 }
 
 static void populate_entry(struct DIRENTRY* dst, const FileEntry* src) {
-    // TODO: names longer than 20 characters are not supported
-    if (strlen(src->name) >= sizeof(dst->name) - 1) {
+    // A full PS1 directory name occupies all 20 bytes without a terminator.
+    if (strlen(src->name) > sizeof(dst->name)) {
         WARNF("dir name '%s' will be truncated", src->name);
     }
-    strncpy(dst->name, src->name, sizeof(dst->name) - 1);
-    dst->name[sizeof(dst->name) - 1] = '\0';
+    strncpy(dst->name, src->name, sizeof(dst->name));
     dst->attr = 0x10 | 0x40; // matches the desktop backend's attribute bits
     dst->size = src->size;
     dst->next = NULL;

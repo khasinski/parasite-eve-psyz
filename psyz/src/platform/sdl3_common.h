@@ -230,6 +230,9 @@ static double drift_compensation = 0.0;
 static PsyzVsyncMode vsync_mode = PSYZ_VSYNC_AUTO;
 static PsyzDitherMode dither_mode = PSYZ_DITHER_AUTO;
 static bool use_driver_vsync = false;
+static double driver_frame_time_us;
+static Uint64 last_driver_submit;
+static bool driver_submit_valid;
 static PsyzVideoStats gpu_stats = {0};
 
 // game speed (Psyz_VideoSetSpeed): the VSync mode is never changed for it
@@ -300,11 +303,8 @@ static double GetElapsedMicroseconds(Uint64 start, Uint64 end) {
 }
 
 static void ConfigureVSync(double target_fps) {
-    if (vsync_mode == PSYZ_VSYNC_ON) {
-        use_driver_vsync = PlatformBackend_SetDriverVsync(true);
-        INFOF("vsync forced ON (driver VSync)");
-        return;
-    }
+    driver_frame_time_us = 0.0;
+    driver_submit_valid = false;
     if (vsync_mode == PSYZ_VSYNC_OFF) {
         PlatformBackend_SetDriverVsync(false);
         use_driver_vsync = false;
@@ -318,11 +318,23 @@ static void ConfigureVSync(double target_fps) {
         return;
     }
 
-    SDL_DisplayID display_id = SDL_GetPrimaryDisplay();
+    /* The game may run on a secondary display with a different refresh rate.
+     * Window placement, not the desktop's primary display, governs pacing. */
+    SDL_DisplayID display_id = sdl3_window
+        ? SDL_GetDisplayForWindow(sdl3_window) : 0;
+    if (!display_id) display_id = SDL_GetPrimaryDisplay();
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
     double detected_framerate = 60.0;
     if (mode && mode->refresh_rate > 0.0f) {
         detected_framerate = mode->refresh_rate;
+    }
+
+    if (vsync_mode == PSYZ_VSYNC_ON) {
+        use_driver_vsync = PlatformBackend_SetDriverVsync(true);
+        if (use_driver_vsync)
+            driver_frame_time_us = 1000000.0 / detected_framerate;
+        INFOF("vsync forced ON (driver VSync)");
+        return;
     }
 
     const double target_time = 1.0 / target_fps;
@@ -332,6 +344,7 @@ static void ConfigureVSync(double target_fps) {
 
     if (can_use_driver_vsync && PlatformBackend_SetDriverVsync(true)) {
         use_driver_vsync = true;
+        driver_frame_time_us = 1000000.0 / detected_framerate;
         INFOF("detected %.2f Hz monitor, use driver VSync", detected_framerate);
     } else {
         PlatformBackend_SetDriverVsync(false);
@@ -452,6 +465,28 @@ static void Sdl3Common_Shutdown(void) {
     SDL_SetAtomicInt(&resume_audio_on_foreground, 0);
 }
 
+/* Limit actual window submissions, not just loop ends: variable CPU work
+ * after the previous wait must not refill an early-returning swapchain queue.
+ * This clock is independent of the original simulation and audio clocks. */
+static void PaceDriverPresent(void) {
+    if (!use_driver_vsync || game_speed != 1 ||
+        vsync_mode == PSYZ_VSYNC_LIMITLESS || driver_frame_time_us <= 0.0) {
+        driver_submit_valid = false;
+        return;
+    }
+    if (driver_submit_valid) {
+        double remaining = driver_frame_time_us - GetElapsedMicroseconds(
+            last_driver_submit, SDL_GetPerformanceCounter());
+        if (remaining > 1000.0)
+            SDL_DelayNS((Uint64)(remaining - 1000.0) * 1000);
+        while (GetElapsedMicroseconds(last_driver_submit,
+                   SDL_GetPerformanceCounter()) < driver_frame_time_us) {
+        }
+    }
+    last_driver_submit = SDL_GetPerformanceCounter();
+    driver_submit_valid = true;
+}
+
 static void WaitForNextFrame(void) {
     Uint64 current_time = SDL_GetPerformanceCounter();
     double elapsed_us = GetElapsedMicroseconds(last_frame_time, current_time);
@@ -461,17 +496,22 @@ static void WaitForNextFrame(void) {
     (void)elapsed_us;
     Psyz_WebWaitForNextFrame();
 #else
-    /* Above normal speed driver VSync no longer paces every frame (most are
-     * not shown), so the limiter does, at the faster rate. Also fall back to
-     * software pacing when no swapchain image was presented (e.g. minimized). */
-    const double frame_time_us = target_frame_time_us / game_speed;
-    if ((!use_driver_vsync || !frame_presented || game_speed > 1) &&
-        vsync_mode != PSYZ_VSYNC_LIMITLESS) {
+    /* Driver VSync can return early while filling its swapchain queue.
+     * Pace submissions to the window's refresh interval as well. This does
+     * not change the original simulation/audio clock. Missing presents and
+     * fast-forward retain the existing game-clock software limiter. */
+    const bool driver_pacing = use_driver_vsync && frame_presented &&
+                               game_speed == 1 && driver_frame_time_us > 0.0;
+    const double frame_time_us = driver_pacing ? driver_frame_time_us :
+                                 target_frame_time_us / game_speed;
+    const double correction = driver_pacing ? 0.0 : drift_compensation;
+    if (vsync_mode != PSYZ_VSYNC_LIMITLESS) {
         double time_to_wait_us =
-            frame_time_us - elapsed_us + drift_compensation;
+            frame_time_us - elapsed_us + correction;
 
         // only wait if we're ahead of schedule (not running slow)
-        if (time_to_wait_us > 100.0) { // more than 0.1ms to wait
+        /* Even a small early return can gradually refill the driver queue. */
+        if (time_to_wait_us > (driver_pacing ? 0.0 : 100.0)) {
             // High-precision mode: sleep + busy-wait
             if (time_to_wait_us > 1000.0) {
                 Uint64 sleep_us = (Uint64)(time_to_wait_us - 1000.0);
@@ -479,7 +519,7 @@ static void WaitForNextFrame(void) {
             }
 
             // busy-wait for precision
-            double target_elapsed = frame_time_us + drift_compensation;
+            double target_elapsed = frame_time_us + correction;
             while (GetElapsedMicroseconds(
                        last_frame_time, SDL_GetPerformanceCounter()) <
                    target_elapsed) {
@@ -493,7 +533,10 @@ static void WaitForNextFrame(void) {
         double frame_error = actual_frame_time - frame_time_us;
 
         // apply gentle correction (10% per frame)
-        drift_compensation -= frame_error * 0.1;
+        /* A missed deadline is time spent doing work. Carrying that debt
+         * into the next present produces a burst of short VRR frames. */
+        drift_compensation = driver_pacing || elapsed_us >= frame_time_us ? 0.0 :
+                             drift_compensation - frame_error * 0.1;
         if (drift_compensation > 5000.0) {
             drift_compensation = 5000.0;
         }
@@ -710,6 +753,21 @@ static void AddGamepad(SDL_JoystickID id) {
     gamepads[i].id = id;
     gamepads[i].dev = dev;
     gamepads[i].name = SDL_GetGamepadName(dev);
+#ifdef __ANDROID__
+    /* A screen controller is a fallback when hardware is absent. Keep real
+     * pads ahead of virtual ones even when plugged in after the game starts. */
+    if (!SDL_IsJoystickVirtual(id)) {
+        for (int first = 0; first < i; ++first) {
+            if (SDL_IsJoystickVirtual(gamepads[first].id)) {
+                struct Gamepad added = gamepads[i];
+                memmove(&gamepads[first + 1], &gamepads[first], (i - first) * sizeof(gamepads[0]));
+                gamepads[first] = added;
+                i = first;
+                break;
+            }
+        }
+    }
+#endif
     INFOF("connected %s", gamepads[i].name);
     UpdatePlatformTouchControls();
 }
@@ -1041,6 +1099,14 @@ static void PollEvents(void) {
 #else
             SetWindowSizeInPixels(wnd_size_in_pixels.w, wnd_size_in_pixels.h);
 #endif
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            if (sdl3_window && event.window.windowID == SDL_GetWindowID(sdl3_window))
+                SDL_SetAtomicInt(&timing_reset_requested, 1);
+            break;
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            if (sdl3_window && event.display.displayID == SDL_GetDisplayForWindow(sdl3_window))
+                SDL_SetAtomicInt(&timing_reset_requested, 1);
             break;
 #ifndef PLATFORM_IOS
         case SDL_EVENT_KEY_DOWN:

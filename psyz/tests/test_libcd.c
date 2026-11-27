@@ -35,6 +35,48 @@ static int bin_count;
 static void* allocs[MAX_ALLOCS];
 static int alloc_count;
 
+#ifdef PSYZ_TEST_CD_IO
+/* Compile the original module once with test-local stdio faults. The test
+ * CMake target excludes its archive copy; no fault hooks enter the SDK API. */
+static FILE* cue_fault_file;
+static int cue_fault_mode, cue_fault_lines, cue_fault_read_error, cue_fault_closes;
+static FILE* cue_fault_open(const char* path, const char* mode) {
+    FILE* file = fopen(path, mode);
+    if (cue_fault_mode && !strcmp(path, cue) && !strcmp(mode, "r"))
+        cue_fault_file = file;
+    return file;
+}
+static char* cue_fault_gets(char* text, int size, FILE* file) {
+    if (file == cue_fault_file && (cue_fault_mode & 1) && cue_fault_lines >= 3) {
+        cue_fault_read_error = 1;
+        errno = EIO;
+        return NULL;
+    }
+    char* result = fgets(text, size, file);
+    if (file == cue_fault_file && result) cue_fault_lines++;
+    return result;
+}
+static int cue_fault_error(FILE* file) {
+    return file == cue_fault_file && cue_fault_read_error ? 1 : ferror(file);
+}
+static int cue_fault_close(FILE* file) {
+    int fault = file == cue_fault_file;
+    if (fault) { cue_fault_closes++; cue_fault_file = NULL; }
+    int result = fclose(file);
+    if (fault && (cue_fault_mode & 2)) { errno = EIO; return EOF; }
+    return result;
+}
+#define fopen cue_fault_open
+#define fgets cue_fault_gets
+#define ferror cue_fault_error
+#define fclose cue_fault_close
+#include "../src/psyz/libcd.c"
+#undef fopen
+#undef fgets
+#undef ferror
+#undef fclose
+#endif
+
 static void make_blob(const char* path, long bytes) {
     FILE* f = fopen(path, "wb");
     if (f == NULL) {
@@ -260,6 +302,10 @@ ZTEST_SETUP(libcd) {
 }
 
 ZTEST_TEARDOWN(libcd) {
+#ifdef PSYZ_TEST_CD_IO
+    cue_fault_mode = 0;
+    cue_fault_file = NULL;
+#endif
     Psyz_CdSetReadCB(NULL);
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
@@ -576,6 +622,43 @@ ZTEST(libcd, data_read_returns_header_then_payload) {
     zexpect_s32_eq(0, CdGetSector(payload, sizeof(payload) / 4));
 
     CdControlB(CdlStop, NULL, NULL);
+}
+
+/* Replacing media must retire both a latched sector and the active reader.
+ * Mounting the same CUE is intentional: no changed pathname can hide stale
+ * controller state or make the old bytes coincidentally unobservable. */
+static void check_media_retires_data(int replacement) {
+    u_char payload[2048], untouched[2048];
+    load_cue_data(4);
+    start_read_at(0);
+    zassert_s32_eq(CdlDataReady, CdReady(1, NULL));
+    if (replacement == 0)
+        zassert_s32_eq(0, Psyz_CdSetDiskPath(cue));
+    else if (replacement == 1)
+        zassert_s32_eq(0, Psyz_CdSetDiskPath(NULL));
+    else
+        zassert_s32_eq(-1, Psyz_CdSetDiskPath("missing-retirement-disc.cue"));
+    memset(payload, 0xCC, sizeof(payload));
+    memset(untouched, 0xCC, sizeof(untouched));
+    zexpect_s32_eq(0, CdGetSector(payload, sizeof(payload) / 4));
+    zexpect_s32_eq(0, memcmp(untouched, payload, sizeof(payload)));
+    zexpect_s32_eq(CdlNoIntr, CdReady(1, NULL));
+    if (replacement == 0) {
+        /* A subsequent explicit read still works on the replacement. */
+        start_read_at(1);
+        zexpect_s32_eq(CdlDataReady, CdReady(1, NULL));
+    }
+    CdControlB(CdlStop, NULL, NULL);
+}
+
+ZTEST(libcd, media_replacement_retires_latched_sector) {
+    check_media_retires_data(0);
+}
+ZTEST(libcd, media_unmount_retires_latched_sector) {
+    check_media_retires_data(1);
+}
+ZTEST(libcd, media_failure_retires_latched_sector) {
+    check_media_retires_data(2);
 }
 
 ZTEST(libcd, data_read_advances_through_sectors) {
@@ -1198,3 +1281,109 @@ ZTEST(libcd_playback, xa_resampler_rounding) {
     zexpect_u32_eq(0xd17dd80au, (unsigned)hash);
     CdControlB(CdlStop, NULL, NULL);
 }
+
+/* Synchronous reads reopen the replacement track. They must not resurrect
+ * either the retired CDDA buffer or XA decoder history from the old media. */
+static void check_media_retires_audio(int is_xa) {
+    unsigned short* raw = test_calloc(8 * SECTOR_SIZE / 2, 2);
+    short out[256 * 2];
+    u_long data[2048 / 4];
+    for (int i = 0; i < 8; ++i) {
+        if (is_xa)
+            build_xa_sector((unsigned char*)raw + i * SECTOR_SIZE, i);
+        else
+            for (int j = 0; j < SECTOR_SIZE / 2; ++j)
+                raw[i * SECTOR_SIZE / 2 + j] = 0x6000;
+    }
+    mount_bin_cue_pair(raw, 8 * SECTOR_SIZE / 2,
+                       is_xa ? "MODE2/2352" : "AUDIO");
+    CdReset(1);
+    u_char mode = is_xa ? CdlModeRT | CdlModeSF : CdlModeDA;
+    u_char filter[2] = {1, 0};
+    CdlLOC loc;
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdControlB(CdlSetfilter, filter, NULL);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    CdControlB(is_xa ? CdlReadN : CdlPlay, NULL, NULL);
+    zassert_s32_eq(256, Psyz_CdPullSamples(out, 256));
+    zassert_s32_ne(0, out[128]);
+    zassert_s32_eq(0, Psyz_CdSetDiskPath(cue));
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    zassert_s32_ne(0, CdRead(1, data, 0));
+    zexpect_s32_eq(0, Psyz_CdPullSamples(out, 256));
+}
+
+ZTEST(libcd_playback, media_replacement_retires_cdda_buffer) {
+    check_media_retires_audio(0);
+}
+ZTEST(libcd_playback, media_replacement_retires_xa_decoder) {
+    check_media_retires_audio(1);
+}
+
+ZTEST(libcd_playback, xa_image_refill_ignores_movie_file_cursor) {
+    unsigned short* raw = test_calloc(8 * SECTOR_SIZE / 2, 2);
+    short out[4096 * 2];
+    u_long movie[2048 / 4];
+    for (int i = 0; i < 8; ++i)
+        build_xa_sector((unsigned char*)raw + i * SECTOR_SIZE, i);
+    mount_bin_cue_pair(raw, 8 * SECTOR_SIZE / 2, "MODE2/2352");
+    CdReset(1);
+    u_char mode = CdlModeRT | CdlModeSF, filter[2] = {1, 0};
+    CdlLOC loc;
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdControlB(CdlSetfilter, filter, NULL);
+    CdIntToPos(0, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    CdControlB(CdlReadN, NULL, NULL);
+    zassert_s32_eq(256, Psyz_CdPullSamples(out, 256));
+    /* Movie reads share track_file but must not move XA's logical cursor.
+     * Reading the final sector leaves the FILE at EOF, making a sequential
+     * audio refill fail even though seven XA sectors remain unconsumed. */
+    CdIntToPos(7, &loc);
+    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
+    zassert_s32_ne(0, CdRead(1, movie, 0));
+    zassert_s32_eq(4096, Psyz_CdPullSamples(out, 4096));
+    for (int i = 0; i < 4096 * 2; ++i)
+        zexpect_s16_eq(0x1000, out[i]);
+}
+
+#ifdef PSYZ_TEST_CD_IO
+static void check_cue_io_failure(int mode) {
+    u_char result[8];
+    load_cue_single(1, 8, true);
+    cue_fault_lines = cue_fault_read_error = cue_fault_closes = 0;
+    cue_fault_mode = mode;
+    zexpect_s32_eq(-1, Psyz_CdSetDiskPath(cue));
+    zexpect_s32_eq(1, cue_fault_closes);
+    zexpect_s32_eq(!!(mode & 1), cue_fault_read_error);
+    zexpect_s32_eq(CdlNoIntr, CdControlB(CdlGetTN, NULL, result));
+    zexpect_s32_ne(0, result[0] & CdlStatError);
+    cue_fault_mode = 0;
+    mount_cue();
+    zexpect_s32_eq(CdlDataReady, CdControlB(CdlGetTN, NULL, result));
+}
+ZTEST(libcd, binary_data_rejects_cue_before_reading_more_lines) {
+    load_cue_single(1, 8, true);
+    FILE* file = fopen(cue, "ab");
+    zassert_ptr_ne(NULL, file);
+    static const char tail[] = "\nREM prefix\0binary\nREM later line\n";
+    zassert_s32_eq(sizeof(tail) - 1, fwrite(tail, 1, sizeof(tail) - 1, file));
+    zassert_s32_eq(0, fclose(file));
+    cue_fault_lines = cue_fault_closes = 0;
+    cue_fault_mode = 4; /* Count reads and closes without injecting a fault. */
+    zexpect_s32_eq(-1, Psyz_CdSetDiskPath(cue));
+    zexpect_s32_eq(1, cue_fault_closes);
+    zexpect_s32_eq(5, cue_fault_lines);
+    cue_fault_mode = 0;
+    u_char result[8];
+    zexpect_s32_eq(CdlNoIntr, CdControlB(CdlGetTN, NULL, result));
+}
+ZTEST(libcd, cue_read_error_rejects_partial_track_table) {
+    check_cue_io_failure(1);
+}
+ZTEST(libcd, cue_close_error_rejects_track_table) {
+    check_cue_io_failure(2);
+    check_cue_io_failure(3);
+}
+#endif

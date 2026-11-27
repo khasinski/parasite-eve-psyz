@@ -1825,7 +1825,7 @@ typedef struct {
     float x, y, w;
 } PgxpSxyEntry;
 
-#define PGXP_ADDR_SETS 8192u
+#define PGXP_ADDR_SETS 65536u  /* PC-side skins: ~250k vertex/packet addresses a frame (was 8192) */
 #define PGXP_ADDR_WAYS 8u
 #define PGXP_SXY_SETS 4096u
 #define PGXP_SXY_WAYS 2u
@@ -3436,7 +3436,13 @@ void Psyz_GteStoreSxyTo(unsigned reg, void* dst) {
         PgxpSxyEntry entry = pgxp_fifo[fifo_idx];
         if (entry.gen == pgxp_frame_gen && entry.sxy == word) {
             PgxpStoreAddr(dst, entry);
+            return;
         }
+    }
+    if (pgxp_active) {
+        /* A plain/register write must not retain projection ownership from an
+         * older vertex at this address, even if packed integer XY is equal. */
+        Psyz_GteCopyPgxpSxy(NULL, dst, word);
     }
 }
 

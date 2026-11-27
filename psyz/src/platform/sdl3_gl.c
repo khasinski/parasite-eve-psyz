@@ -4,10 +4,15 @@
 #include <assert.h>
 /* The experimental atlas path currently targets SDL_GPU only. */
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *path) { (void)key; (void)path; return 0; }
+int Psyz_GpuLoadSpriteAtlasPixels(uint64_t key, const void *rgba, int width, int height, int pitch) { (void)key; (void)rgba; (void)width; (void)height; (void)pitch; return 0; }
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell) { (void)key; (void)cell; }
+void Psyz_GpuSelectSpriteAtlasTile(uint64_t key, unsigned int cell, unsigned int u0, unsigned int v0) { (void)key; (void)cell; (void)u0; (void)v0; }
+int Psyz_GpuSetPageHdWindows(const unsigned short *xys, int count) { (void)xys; (void)count; return 0; }
+int Psyz_GpuSetPageHd(unsigned int tpage, unsigned int clut_y0, unsigned int clut_y1, const void *rgba, const void *ref, int width, int height, int pitch) { (void)tpage; (void)clut_y0; (void)clut_y1; (void)rgba; (void)ref; (void)width; (void)height; (void)pitch; return 0; }
 int Psyz_GpuGetSpriteAtlasesEnabled(void) {return 0;}
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled) {(void)enabled;}
 void Psyz_GpuResetSpriteAtlases(void) {}
+int Psyz_VideoSetMovieFrame(int y,const char *path) {(void)y;(void)path;return 0;}
 int Psyz_VideoSetRgb24Backdrop(const char *p,const unsigned char *r,int w,int h,int t,int b) {(void)p;(void)r;(void)w;(void)h;(void)t;(void)b;return 0;}
 #include <math.h>
 #include <stdbool.h>
@@ -33,6 +38,8 @@ int Psyz_VideoSetRgb24Backdrop(const char *p,const unsigned char *r,int w,int h,
 #endif
 
 #include "sdl3_common.h"
+
+static bool hidden_gl_renderer;
 #include "sdl3_draw.h"
 
 // selected at runtime based on the active GL profile; the shader bodies are
@@ -50,6 +57,17 @@ static const char vertex_shader_body[] = {
     "layout(location = 1) in vec4 tex;\n"
     "layout(location = 2) in vec4 color;\n"
     "layout(location = 3) in vec4 twin;\n"
+    "layout(location = 4) in vec2 polygonUV;\n"
+    "layout(location = 6) in vec3 polygonRGB;\n"
+    "layout(location = 7) in uvec4 gradientRG;\n"
+    "layout(location = 8) in uvec2 gradientB;\n"
+    "layout(location = 5) in uvec4 gradientUV;\n"
+    "uniform bool nativeGrid;\n"
+    "flat out uvec3 rgbOrigin;\n"
+    "flat out uvec3 rgbDx;\n"
+    "flat out uvec3 rgbDy;\n"
+    "flat out uvec4 uvGradient;\n"
+    "flat out ivec4 uvOrigin;\n"
     "uniform vec2 resolution;\n"
     "uniform vec2 drawOffset;\n"
     "out vec4 vertexColor;\n"
@@ -62,22 +80,31 @@ static const char vertex_shader_body[] = {
     "flat out uint texelShift;\n"   // Right shift for texel X
     "flat out uint indexShift;\n"   // Shift for index extraction
     "flat out uint indexMask;\n"    // Mask for color index
+    "flat out uint polygon;\n"
     "flat out uint dither;\n"       // 1 when this primitive dithers
     "flat out ivec2 pageBase;\n"    // texture page origin, in VRAM pixels
     "flat out uvec4 texWindow;\n"   // GP0(E2h) as {and.xy, or.zw}
     "\n"
     "void main() {\n"
-    "    float x = ((pos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
-    "    float y = ((pos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
+    "    polygon = uint(tex.w) & 0x2000u;\n"
+    "    float bias = polygon != 0u && nativeGrid ? 0.5 : 0.0;\n"
+    "    rgbOrigin = uvec3(ivec3(polygonRGB * 4096.0));\n"
+    "    rgbDx = uvec3(gradientRG.xz, gradientB.x);\n"
+    "    rgbDy = uvec3(gradientRG.yw, gradientB.y);\n"
+    "    uvGradient = gradientUV;\n"
+    "    uvOrigin = ivec4(ivec2(pos + drawOffset), ivec2(polygonUV * 4096.0));\n"
+    "    float x = ((bias + pos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
+    "    float y = ((bias + pos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
     "    gl_Position = vec4(x, y, 0.0, 1.0);\n"
     // gouraud colors
     "    vertexColor = color;\n"
+    "    if (polygon != 0u) vertexColor.rgb = polygonRGB / 255.0;\n"
     // select the right texture coords based on the tpage
     "    clut = uint(tex.z);\n"
     "    uint texWord = uint(tex.w);\n"
     "    tpage = texWord & 0x1FFu;\n"
     "    dither = (texWord & 0x4000u) != 0u ? 1u : 0u;\n"
-    "    rawUV = tex.xy;\n"
+    "    rawUV = polygon != 0u ? polygonUV - (nativeGrid ? 0.0 : 0.5) : tex.xy;\n"
     // Determine texture mode and pre-compute parameters
     "    subPixelMask = 0u;\n"
     "    texelShift = 0u;\n"
@@ -123,10 +150,27 @@ static const char fragment_shader_body[] = {
     "flat in ivec2 pageBase;\n"
     "flat in uvec4 texWindow;\n"
     "uniform sampler2D texVram;\n"
+    "flat in uvec3 rgbOrigin;\n"
+    "flat in uvec3 rgbDx;\n"
+    "flat in uvec3 rgbDy;\n"
+    "flat in uvec4 uvGradient;\n"
+    "flat in ivec4 uvOrigin;\n"
+    "flat in uint polygon;\n"
+    "uniform bool nativeGrid;\n"
+    "uniform sampler2D background;\n"
+    "uniform ivec2 backgroundOrigin;\n"
     "uniform bool fullColor;\n"
     "\n"
     "uvec2 resolveTexel() {\n"
     "    vec2 uv = rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;\n"
+    "    if (polygon != 0u) {\n"
+    "        uv = rawUV;\n"
+    "        if (nativeGrid) {\n"
+    "            uvec2 d = uvec2(ivec2(gl_FragCoord.xy) - uvOrigin.xy);\n"
+    "            uvec2 q = uvec2(uvOrigin.zw) + uvGradient.xz * d.x + uvGradient.yw * d.y;\n"
+    "            uv = vec2(ivec2(q) >> 12);\n"
+    "        }\n"
+    "    }\n"
     "    uvec2 texel = uvec2(clamp(floor(uv), vec2(0.0), vec2(255.0)));\n"
     "    return (texel & texWindow.xy) | texWindow.zw;\n"
     "}\n"
@@ -175,21 +219,27 @@ static const char fragment_shader_body[] = {
     "    }\n"
     // check for full transparency
     "    if (texColor == vec4(0, 0, 0, 0)) {\n"
-    "        FragColor = vec4(0);\n"
-    "        return;\n"
+    "        discard;\n"
     "    }\n"
     // check for setSemiTrans(p, 1)
     "    bool isSemiTrans = vertexColor.a < 0.75;"
     // when a color has the 0x8000 bit left then it has the semitrans flag on
     "    bool colorSemiTrans = texColor.a > 0.0;"
     // PS1-accurate texture-color modulation: (tex5 * col8) >> 7
+    "    vec3 color8 = vertexColor.rgb * (textureMode == 0u ? 255.0 : 127.5);\n"
+    "    float bias = polygon == 0u ? 0.5 : 0.0;\n"
+    "    if (polygon != 0u && nativeGrid) {\n"
+    "        uvec2 delta = uvec2(ivec2(gl_FragCoord.xy) - uvOrigin.xy);\n"
+    "        color8 = vec3(ivec3(rgbOrigin + rgbDx * delta.x + rgbDy * delta.y)) / 4096.0;\n"
+    "        bias = 1.0 / 8192.0;\n"
+    "    }\n"
     "    vec3 modColor;\n"
     "    if (textureMode == 0u) {\n"
     // untextured: PS1 uses color directly, no modulation
-    "        modColor = texColor.rgb * vertexColor.rgb;\n"
+    "        modColor = (color8 + (polygon != 0u ? bias : 0.0)) / 255.0;\n"
     "    } else {\n"
     "        vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);\n"
-    "        vec3 col8 = min(floor(vertexColor.rgb * 127.5 + 0.5), "
+    "        vec3 col8 = min(floor(color8 + bias), "
     "vec3(255.0));\n"
     "        vec3 prod8 = min(tex5 * col8 / 16.0, vec3(255.0));\n"
     "        modColor = dither != 0u ? prod8 / 255.0\n"
@@ -198,21 +248,25 @@ static const char fragment_shader_body[] = {
     "    if (fullColor && textureMode != 0u) modColor = texColor.rgb * "
     "vertexColor.rgb;\n"
     "    modColor = applyDither(modColor);\n"
-    // pre-multiplied alpha output for GL_ONE, GL_ONE_MINUS_SRC_ALPHA blending
-    "    if (colorSemiTrans && isSemiTrans) {\n"
-    "        uint abr = (tpage & 0x60u) >> 5u;\n"
-    "        if (abr == 0u) {\n"
-    "            FragColor = vec4(modColor * 0.5, 0.5);\n" // 50% blend
-    "        } else if (abr == 1u) {\n"
-    "            FragColor = vec4(modColor, 0.0);\n" // additive
-    "        } else if (abr == 2u) {\n"
-    "            FragColor = vec4(modColor, 0.0);\n"        // subtractive
-    "        } else {\n"                                    // abr == 3u
-    "            FragColor = vec4(modColor * 0.25, 0.0);\n" // B + F/4
+    "    if (isSemiTrans && colorSemiTrans) {\n"
+    "        vec3 dst = texelFetch(background, ivec2(gl_FragCoord.xy) - backgroundOrigin, 0).rgb;\n"
+    "        uint mode = (tpage >> 5u) & 3u;\n"
+    "        if (fullColor) {\n"
+    "            if (mode == 0u) modColor = (dst + modColor) * 0.5;\n"
+    "            else if (mode == 1u) modColor = dst + modColor;\n"
+    "            else if (mode == 2u) modColor = dst - modColor;\n"
+    "            else modColor = dst + modColor * 0.25;\n"
+    "        } else {\n"
+    "            ivec3 b = ivec3(floor(dst * 31.0 + 0.5));\n"
+    "            ivec3 f = ivec3(floor(modColor * 31.0 + 0.5));\n"
+    "            if (mode == 0u) f = (b + f) >> 1;\n"
+    "            else if (mode == 1u) f = b + f;\n"
+    "            else if (mode == 2u) f = b - f;\n"
+    "            else f = b + (f >> 2);\n"
+    "            modColor = vec3(clamp(f, ivec3(0), ivec3(31))) / 31.0;\n"
     "        }\n"
-    "    } else {\n"
-    "        FragColor = vec4(modColor, 1.0);\n" // full opacity
     "    }\n"
+    "    FragColor = vec4(modColor, textureMode == 0u ? 0.0 : texColor.a);\n"
     "}\n"};
 
 typedef struct {
@@ -233,12 +287,15 @@ static GLuint shader_program = 0;
 static GLint uniform_resolution = 0;
 static GLint uniform_tex_vram = 0;
 static GLint uniform_draw_offset = 0;
-static GLint uniform_full_color = -1;
+static GLint uniform_full_color = -1, uniform_native_grid = -1;
 static GLuint vram_texture;
 static GLuint rgb24_texture, rgb24_fbo;
 static bool display_rgb24;
 static bool display_double_height;
 static GLuint vram_fbo = 0;
+static GLuint blend_texture;
+static int blend_width, blend_height;
+static GLint uniform_background_origin;
 static GLuint scratch_texture = 0;
 static GLuint scratch_fbo = 0;
 static GLuint scaled_vram_texture = 0;
@@ -338,6 +395,8 @@ bool InitPlatform() {
     }
     // avoid re-initializing it continuously on failures
     is_platform_initialized = true;
+    const char* headless = SDL_getenv("PSYZ_HEADLESS");
+    hidden_gl_renderer = headless && strcmp(headless, "gpu") == 0;
 
 #if defined(__EMSCRIPTEN__)
     // avoid yielding twice per frame
@@ -416,6 +475,9 @@ bool InitPlatform() {
     uniform_resolution = glGetUniformLocation(shader_program, "resolution");
     uniform_tex_vram = glGetUniformLocation(shader_program, "texVram");
     uniform_draw_offset = glGetUniformLocation(shader_program, "drawOffset");
+    glUniform1i(glGetUniformLocation(shader_program, "background"), 1);
+    uniform_background_origin = glGetUniformLocation(shader_program, "backgroundOrigin");
+    uniform_native_grid = glGetUniformLocation(shader_program, "nativeGrid");
     uniform_full_color = glGetUniformLocation(shader_program, "fullColor");
 
     glUniform1i(uniform_tex_vram, 0);
@@ -456,6 +518,8 @@ bool InitPlatform() {
     glViewport(0, 0, VRAM_W, VRAM_H);
 
     cur_tpage = 0;
+    if (hidden_gl_renderer)
+        vsync_mode = PSYZ_VSYNC_LIMITLESS;
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
@@ -491,27 +555,6 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     glBlitFramebuffer(x, y, x + w, y + h, x * internal_res, y * internal_res,
                       (x + w) * internal_res, (y + h) * internal_res,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, scaled_vram_fbo);
-    glEnable(GL_SCISSOR_TEST);
-}
-
-static void SyncScaledVramToNative(void) {
-    if (!HasSeparateDrawTarget()) {
-        return;
-    }
-    int x0 = CLAMP(draw_area_start.x, 0, VRAM_W);
-    int y0 = CLAMP(draw_area_start.y, 0, VRAM_H);
-    int x1 = CLAMP(draw_area_end.x + 1, 0, VRAM_W);
-    int y1 = CLAMP(draw_area_end.y + 1, 0, VRAM_H);
-    if (x1 <= x0 || y1 <= y0) {
-        return;
-    }
-    glDisable(GL_SCISSOR_TEST);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, scaled_vram_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, vram_fbo);
-    glBlitFramebuffer(
-        x0 * internal_res, y0 * internal_res, x1 * internal_res,
-        y1 * internal_res, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     glBindFramebuffer(GL_FRAMEBUFFER, scaled_vram_fbo);
     glEnable(GL_SCISSOR_TEST);
 }
@@ -726,6 +769,11 @@ void ResetPlatform(void) {
         glDeleteFramebuffers(1, &vram_fbo);
         vram_fbo = 0;
     }
+    if (blend_texture) {
+        glDeleteTextures(1, &blend_texture);
+        blend_texture = 0;
+        blend_width = blend_height = 0;
+    }
     if (scratch_texture) {
         glDeleteTextures(1, &scratch_texture);
         scratch_texture = 0;
@@ -932,7 +980,8 @@ static void ApplyDisplayPendingChanges() {
         BindDrawFbo();
     }
     if (!is_window_visible) {
-        SDL_ShowWindow(sdl3_window);
+        if (!hidden_gl_renderer)
+            SDL_ShowWindow(sdl3_window);
         is_window_visible = true;
 #ifdef __APPLE__
         SDL_Event event;
@@ -1043,6 +1092,18 @@ static void Draw_InitBuffer() {
     glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(Vertex),
                           (void*)offsetof(Vertex, twin));
     glEnableVertexAttribArray(3);
+    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, polygon_uv));
+    glEnableVertexAttribArray(4);
+    glVertexAttribIPointer(5, 4, GL_UNSIGNED_INT, sizeof(Vertex), (void*)offsetof(Vertex, polygon_gradient));
+    glEnableVertexAttribArray(5);
+    glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, polygon_rgb));
+    glEnableVertexAttribArray(6);
+    glVertexAttribIPointer(7, 4, GL_UNSIGNED_INT, sizeof(Vertex),
+                           (void*)(offsetof(Vertex, polygon_gradient) + 4 * sizeof(unsigned)));
+    glEnableVertexAttribArray(7);
+    glVertexAttribIPointer(8, 2, GL_UNSIGNED_INT, sizeof(Vertex),
+                           (void*)(offsetof(Vertex, polygon_gradient) + 8 * sizeof(unsigned)));
+    glEnableVertexAttribArray(8);
     glBindVertexArray(0);
 }
 
@@ -1059,8 +1120,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     Vertex* v;
 
     // to ensure we always have space, we pretend we want to allocate a quad
-    // Gouraud read-ahead can write a colour into a fifth vertex slot.
-    Draw_EnsureBufferWillNotOverflow(5, 6);
+    // A quad needs separate interpolation gradients for its two triangles.
+    Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
@@ -1118,7 +1179,16 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     VRGBA(vertex_cur[3]) = VRGBA(vertex_cur[0]);
             }
 
-            SET_TC_ALL(vertex_cur, tpage, clut);
+            if (nVertices == 4) {
+                Vertex second[3] = {vertex_cur[1], vertex_cur[3], vertex_cur[2]};
+                memcpy(vertex_cur + 3, second, sizeof(second));
+                for (int i = 3; i < 6; ++i) index_cur[i] = n_vertices + i;
+                nVertices = 6;
+                SetPolygonAttributes(vertex_cur + 3);
+            }
+            SetPolygonAttributes(vertex_cur);
+            for (int i = 0; i < nVertices; ++i)
+                SET_TC(&vertex_cur[i], tpage | TPAGE_POLYGON, clut);
             Draw_EnqueueBuffer(nVertices, nIndices);
         } else {
             // shouldn't happen on a normal PSX application
@@ -1346,7 +1416,10 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
-    glClearColor((float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, 0.0f);
+    Draw_FlushBuffer();
+    /* PS1 clears truncate each input channel to five bits before storage. */
+    glClearColor((float)(r >> 3) / 31.0f, (float)(g >> 3) / 31.0f,
+                 (float)(b >> 3) / 31.0f, 0.0f);
     glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo);
     glScissor(rect->x, rect->y, rect->w, rect->h);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1366,6 +1439,7 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
+    Draw_FlushBuffer();
     size_t count = (size_t)rect->w * rect->h;
     u8* buf = GetVramConvertBuffer(count * 4);
     if (!buf) {
@@ -1502,32 +1576,76 @@ void Draw_ResetBuffer(void) {
     index_cur = index_buf;
 }
 
-// the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
-static void SetBlendMode(BlendMode mode) {
-    static BlendMode cur_mode = BLEND_ADD;
-    if (mode == cur_mode) {
-        return;
-    }
-    cur_mode = mode;
-    switch (mode) {
-    case BLEND_SUB:
-        glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
-        glBlendFuncSeparate(GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
-        break;
-    case BLEND_SUB_OPAQUE:
-        glBlendEquation(GL_FUNC_ADD);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        break;
-    default:
-        glBlendEquation(GL_FUNC_ADD);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        break;
-    }
-}
-
 static void DrawIndices(int start, int end) {
     glDrawElements(GL_TRIANGLES, end - start, GL_UNSIGNED_SHORT,
                    (const GLvoid*)((uintptr_t)start * sizeof(unsigned short)));
+}
+
+/* Copy the triangle's destination before blending. A later overlapping triangle
+ * must see this draw's result, including five-bit saturation and rounding. */
+static void DrawBlendedTriangle(int start, int scale, const GLint clip[4]) {
+    int left = clip[0] + clip[2], right = clip[0];
+    int bottom = clip[1] + clip[3], top = clip[1];
+    float grid = GetDrawGridXScale();
+    for (int i = 0; i < 3; ++i) {
+        const Vertex *v = &vertex_buf[index_buf[start + i]];
+        float x = (draw_offset.x + v->x * grid) * scale;
+        float y = (draw_offset.y + v->y) * scale;
+        left = SDL_min(left, (int)floorf(x) - 2);
+        right = SDL_max(right, (int)ceilf(x) + 2);
+        bottom = SDL_min(bottom, (int)floorf(y) - 2);
+        top = SDL_max(top, (int)ceilf(y) + 2);
+    }
+    left = SDL_max(left, SDL_max(0, clip[0]));
+    bottom = SDL_max(bottom, SDL_max(0, clip[1]));
+    right = SDL_min(right, SDL_min(VRAM_W * scale, clip[0] + clip[2]));
+    top = SDL_min(top, SDL_min(VRAM_H * scale, clip[1] + clip[3]));
+    int width = right - left, height = top - bottom;
+    if (width <= 0 || height <= 0) return;
+    glActiveTexture(GL_TEXTURE1);
+    if (!blend_texture) glGenTextures(1, &blend_texture);
+    glBindTexture(GL_TEXTURE_2D, blend_texture);
+    if (width > blend_width || height > blend_height) {
+        blend_width = SDL_max(blend_width, width);
+        blend_height = SDL_max(blend_height, height);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, blend_width, blend_height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, left, bottom, width, height);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform2i(uniform_background_origin, left, bottom);
+    DrawIndices(start, start + 3);
+}
+
+static void DrawBatchAtScale(int scale) {
+    glUniform1i(uniform_native_grid, scale == 1 && GetDrawGridXScale() == 1.0f);
+    {
+        const float grid_scale_x = GetDrawGridXScale();
+        const float render_scale = (float)scale;
+        const GLint viewport_x = (GLint)lroundf(
+            (float)draw_offset.x * render_scale * (1.0f - grid_scale_x));
+        const GLsizei viewport_w =
+            (GLsizei)lroundf((float)VRAM_W * render_scale * grid_scale_x);
+        glViewport(viewport_x, 0, viewport_w, VRAM_H * (GLsizei)scale);
+    }
+    GLint clip[4];
+    glGetIntegerv(GL_SCISSOR_BOX, clip);
+    glDisable(GL_BLEND);
+    for (int start = 0; start < n_indices;) {
+        bool semi = vertex_buf[index_buf[start]].a != 0xFF;
+        if (semi) {
+            DrawBlendedTriangle(start, scale, clip);
+            start += 3;
+        } else {
+            int end = start + 3;
+            while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF) end += 3;
+            DrawIndices(start, end);
+            start = end;
+        }
+    }
+    glEnable(GL_BLEND);
 }
 
 void Draw_FlushBuffer(void) {
@@ -1550,46 +1668,34 @@ void Draw_FlushBuffer(void) {
         GL_ELEMENT_ARRAY_BUFFER, 0,
         (GLsizeiptr)(sizeof(*index_buf) * (size_t)n_indices), index_buf);
     glBindVertexArray(VAO);
-    {
-        const float grid_scale_x = GetDrawGridXScale();
-        const float render_scale = (float)internal_res;
-        const GLint viewport_x = (GLint)lroundf(
-            (float)draw_offset.x * render_scale * (1.0f - grid_scale_x));
-        const GLsizei viewport_w =
-            (GLsizei)lroundf((float)VRAM_W * render_scale * grid_scale_x);
-        glViewport(viewport_x, 0, viewport_w, VRAM_H * (GLsizei)internal_res);
+    if (HasSeparateDrawTarget()) {
+        DrawBatchAtScale(internal_res);
     }
-    int prim_size = 3;
-    int start = 0;
-    while (start < n_indices) {
-        Vertex* v = &vertex_buf[index_buf[start]];
-        bool need_subtract = is_subtract_abr(v);
-        int end = start + prim_size;
-        while (end < n_indices) {
-            v = &vertex_buf[index_buf[end]];
-            bool next_subtract = is_subtract_abr(v);
-            if (next_subtract != need_subtract) {
-                break;
-            }
-            end += prim_size;
+    /* Native reads and texture feedback must use the original sampling grid. */
+    GLint clip[4];
+    glGetIntegerv(GL_SCISSOR_BOX, clip);
+    bool textured = false;
+    for (int i = 0; i < n_indices && !textured; i += 3)
+        textured = !is_untextured(&vertex_buf[index_buf[i]]);
+    if (textured) {
+        if (!EnsureScratchFbo()) {
+            BindDrawFbo();
+            Draw_ResetBuffer();
+            return;
         }
-        while (need_subtract && start < end) {
-            int group_end = SubtractGroupEnd(start, end);
-            SetBlendMode(BLEND_SUB);
-            DrawIndices(start, group_end);
-            if (!is_untextured(&vertex_buf[index_buf[start]])) {
-                SetBlendMode(BLEND_SUB_OPAQUE);
-                DrawIndices(start, group_end);
-            }
-            start = group_end;
-        }
-        SetBlendMode(BLEND_ADD);
-        if (start < end) {
-            DrawIndices(start, end);
-            start = end;
-        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo);
+        glBindTexture(GL_TEXTURE_2D, scratch_texture);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, VRAM_W, VRAM_H);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
-    SyncScaledVramToNative();
+    glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo);
+    glScissor(clip[0] / internal_res, clip[1] / internal_res,
+              clip[2] / internal_res, clip[3] / internal_res);
+    DrawBatchAtScale(1);
+    glBindTexture(GL_TEXTURE_2D, vram_texture);
+    BindDrawFbo();
+    glScissor(clip[0], clip[1], clip[2], clip[3]);
     Draw_ResetBuffer();
 }
 

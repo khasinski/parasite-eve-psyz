@@ -16,11 +16,81 @@ layout(location = 12) flat in uint polygon;
 layout(location = 13) flat in uint model;
 layout(location = 14) flat in vec4 uvBounds;
 layout(location = 15) in vec3 hdUV;
+layout(location = 16) flat in ivec4 nativeOriginUV;
+layout(location = 17) flat in ivec4 nativeOriginRGB;
+layout(location = 18) flat in uvec4 nativeGradientUV;
+layout(location = 19) flat in uvec4 nativeGradientRG;
+layout(location = 20) flat in uvec2 nativeGradientB;
+layout(location = 21) flat in ivec4 nativeCoverageAB;
+layout(location = 22) flat in ivec3 nativeCoverageC;
 
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 layout(set = 2, binding = 1) uniform sampler2D texBlend;
 layout(set = 2, binding = 2) uniform sampler2D texHD;
 layout(set = 3, binding = 0) uniform PassMode { uvec4 passMode; };
+
+// Presentation-only margins can use different tile grids for the same RGB
+// surface. Quantize the interpolation phase before integer filtering so atlas
+// placement cannot change a half-way color rounding decision.
+vec4 sampleMarginMaterial() {
+    ivec2 size = textureSize(texHD, 0);
+    // Margin UVs are cell-local. Their integer atlas origin travels flat in
+    // uvBounds.xy, avoiding precision loss from interpolating large UVs.
+    ivec2 fixedUV = ivec2(floor((hdUV.xy - 0.5) * 256.0 + 0.5));
+    ivec2 base = (fixedUV >> 8) + ivec2(uvBounds.xy);
+    uvec2 f = uvec2(fixedUV & 255);
+    uvec4 a = uvec4(floor(texelFetch(texHD, clamp(base, ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 b = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(1,0), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 c = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(0,1), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 d = uvec4(floor(texelFetch(texHD, clamp(base+ivec2(1,1), ivec2(0), size-1), 0)*255.0+0.5));
+    uvec4 color = (a*(256u-f.x)*(256u-f.y) + b*f.x*(256u-f.y) +
+                  c*(256u-f.x)*f.y + d*f.x*f.y + 32768u) >> 16;
+    return vec4(color)/255.0;
+}
+
+bool nativeAffineAttributes() {
+    return polygon != 0u && passMode.y == 1u && passMode.z != 0u && nativeOriginRGB.w != 0;
+}
+
+uvec2 signedProduct(int x, int y) {
+    // Two-word multiplication uses ordinary 32-bit operations on every
+    // backend, including HLSL targets without imulExtended/shaderInt64.
+    uint a = x < 0 ? 0u-uint(x) : uint(x);
+    uint b = y < 0 ? 0u-uint(y) : uint(y);
+    uint p0 = (a&65535u)*(b&65535u);
+    uint p1 = (a&65535u)*(b>>16u), p2 = (a>>16u)*(b&65535u);
+    uint lo = p0+(p1<<16u);
+    uint hi = (a>>16u)*(b>>16u)+(p1>>16u)+uint(lo<p0);
+    uint next = lo+(p2<<16u);
+    hi += (p2>>16u)+uint(next<lo);
+    lo = next;
+    if ((x<0)!=(y<0)) { lo=0u-lo; hi=~hi+uint(lo==0u); }
+    return uvec2(lo,hi);
+}
+
+bool outsideNativeEdge(ivec2 a, ivec2 b, ivec2 p) {
+    uvec2 x = signedProduct(p.x-a.x, b.y-a.y);
+    uvec2 y = signedProduct(p.y-a.y, b.x-a.x);
+    uint low = x.x-y.x, high = x.y-y.y-uint(x.x<y.x);
+    bool positive = int(high)>0 || (high==0u && low!=0u);
+    bool zero = high==0u && low==0u;
+    bool topLeft = b.y<a.y || (b.y==a.y && b.x>a.x);
+    return positive || (zero && !topLeft);
+}
+
+uint nativeQ12(int origin, uvec2 gradient, ivec2 delta) {
+    // Modular integer arithmetic retains the low Q12 word, including negative
+    // slopes, without relying on floating-point plane setup or fused rounding.
+    return uint(origin) + gradient.x * uint(delta.x) + gradient.y * uint(delta.y);
+}
+
+vec3 nativeColorValue() {
+    ivec2 delta = ivec2(gl_FragCoord.xy) - nativeOriginUV.xy;
+    uvec3 fixedColor = uvec3(nativeQ12(nativeOriginRGB.x, nativeGradientRG.xy, delta),
+                            nativeQ12(nativeOriginRGB.y, nativeGradientRG.zw, delta),
+                            nativeQ12(nativeOriginRGB.z, nativeGradientB, delta));
+    return vec3(ivec3(fixedColor)) / 4096.0;
+}
 
 float attributeRoundingBias() {
     // Native 1:1 polygon attributes occupy a 1/4096 lattice. Half an LSB
@@ -35,6 +105,12 @@ uvec2 resolveTexel() {
     vec2 uv = polygon != 0u ? rawUV + attributeRoundingBias() :
         rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;
     ivec2 position = ivec2(floor(uv));
+    if (nativeAffineAttributes()) {
+        ivec2 delta = ivec2(gl_FragCoord.xy) - nativeOriginUV.xy;
+        uvec2 fixedUV = uvec2(nativeQ12(nativeOriginUV.z, nativeGradientUV.xy, delta),
+                             nativeQ12(nativeOriginUV.w, nativeGradientUV.zw, delta));
+        position = ivec2(fixedUV) >> 12;
+    }
     // A sprite reads only its own texels: a squeezed sprite's edge can cut
     // a pixel whose left side lies outside it.
     if (polygon == 0u) position = clamp(position, ivec2(uvBounds.xy), ivec2(uvBounds.zw));
@@ -61,8 +137,10 @@ vec3 applyDither(vec3 c) {
     // Explicit Off is a display enhancement; Auto retains PS1 RGB555.
     if ((passMode.w & 2u) != 0u) return clamp(c, 0.0, 1.0);
     if (dither == 0u) return clamp(floor(c * 255.0 / 8.0), 0.0, 31.0) / 31.0;
-    int dx = int(gl_FragCoord.x) & 3;
-    int dy = int(gl_FragCoord.y) & 3;
+    // passMode.w bits 8-11: the matrix's origin (x, y), where widescreen
+    // moved the room by part of a game pixel, so the room keeps its dither.
+    int dx = (int(gl_FragCoord.x) - int((passMode.w >> 8u) & 3u)) & 3;
+    int dy = (int(gl_FragCoord.y) - int((passMode.w >> 10u) & 3u)) & 3;
     float off = ditherMatrix[dy][dx];
     vec3 c8 = c * 255.0 + off;
     vec3 c5 = clamp(floor(c8 / 8.0), 0.0, 31.0);
@@ -82,6 +160,13 @@ vec4 fetchModelTexel(ivec2 position) {
 }
 
 void main() {
+    if (nativeAffineAttributes()) {
+        ivec2 a = nativeCoverageAB.xy, b = nativeCoverageAB.zw;
+        ivec2 c = nativeCoverageC.xy, p = ivec2(gl_FragCoord.xy);
+        if (nativeCoverageC.z < 0) { ivec2 swap = b; b = c; c = swap; }
+        if (nativeCoverageC.z == 0 || outsideNativeEdge(a,b,p) ||
+            outsideNativeEdge(b,c,p) || outsideNativeEdge(c,a,p)) discard;
+    }
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
     // Explicit queued dialogue glyph: new alpha is presentation-only.
@@ -96,7 +181,7 @@ void main() {
     if (hdUV.z>1.5 && hdUV.z<3.5) {
         if (hdUV.z>2.5 || passMode.y<=1u) discard;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
-        vec4 material=texture(texHD,hdUV.xy);
+        vec4 material=sampleMarginMaterial();
         if (material.a<0.5) discard;
         FragColor=vec4(clamp(material.rgb*tint,0.0,1.0),passMode.x==1u?0.0:1.0);
         return;
@@ -120,6 +205,47 @@ void main() {
             a.a==b.a && a.a==c.a && a.a==d.a)
             texColor=mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
     }
+    // An unmarked alpha-authored room atlas may refine an opaque cutout in
+    // the scaled presentation, inside the native silhouette. Reference RGB
+    // cannot distinguish transparent zero from opaque black (0x8000). Never
+    // let a matching black reference resurrect a transparent palette texel:
+    // doing so can expose rectangular foreground packet bounds. Native VRAM,
+    // mask writes and all PS1 semi-transparent primitives stay unchanged.
+    // Opaque draws use ONE / ONE_MINUS_SRC_ALPHA, so output premultiplied RGB.
+    // Mode7 is an explicit, static-only authored silhouette paired with a
+    // coherent underlay. Its alpha can cross the native staircase. Mode6
+    // and all unmarked packs retain the strict native-transparent guard.
+    bool staticHdCoverage=hdUV.z>6.5 && hdUV.z<7.5;
+    bool staticPaletteMatches=true;
+    if (passMode.y>1u && passMode.x==0u && hdUV.z>5.5 && hdUV.z<7.5 &&
+        textureMode!=0u && (staticHdCoverage || texColor!=vec4(0)) && vertexColor.a>=0.75) {
+        ivec2 size=textureSize(texHD,0);
+        ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
+        vec3 basis=texelFetch(texHD,reference,0).rgb;
+        if (all(equal(floor(basis*31.0+0.5),floor(texColor.rgb*31.0+0.5)))) {
+            if (staticHdCoverage && all(equal(floor(basis*31.0+0.5),vec3(0)))) {
+                // Transparent black matches an unchanged hole as well as a
+                // cleared palette. Require a live colored reference texel.
+                int witness=int(floor(texelFetch(texHD,reference,0).a*255.0+0.5));
+                ivec2 at=ivec2(witness%16,witness/16);
+                vec2 pixel=hdUV.xy*vec2(size);
+                ivec2 cell=ivec2(floor(pixel/68.0))*68;
+                vec2 local=(pixel-vec2(cell)-vec2(2))/4.0;
+                vec4 nativeWitness=fetchModelTexel(ivec2(round(rawUV-local))+at);
+                vec3 originalWitness=texelFetch(texHD,cell+ivec2(4)+at*4+ivec2(0,size.y/2),0).rgb;
+                vec3 original5=floor(originalWitness*31.0+0.5);
+                staticPaletteMatches=nativeWitness!=vec4(0) && any(notEqual(original5,vec3(0))) &&
+                    all(equal(original5,floor(nativeWitness.rgb*31.0+0.5)));
+            }
+            if (staticPaletteMatches) {
+                vec4 material=texture(texHD,hdUV.xy);
+                if (material.a<=0.0) discard;
+                vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
+                FragColor=vec4(clamp(material.rgb*tint,0.0,1.0)*material.a,material.a);
+                return;
+            }
+        }
+    }
     // check for full transparency
     if (texColor == vec4(0, 0, 0, 0)) {
         if (passMode.x != 0u) discard;
@@ -138,10 +264,12 @@ void main() {
     vec3 modColor;
     if (textureMode == 0u) {
         // untextured: PS1 uses color directly, no modulation
-        modColor = texColor.rgb * (vertexColor.rgb + attributeRoundingBias() / 255.0);
+        vec3 color = nativeAffineAttributes() ? nativeColorValue() / 255.0 : vertexColor.rgb;
+        modColor = texColor.rgb * (color + attributeRoundingBias() / 255.0);
     } else {
         vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);
-        vec3 col8 = min(floor(vertexColor.rgb * 127.5 +
+        vec3 color8 = nativeAffineAttributes() ? nativeColorValue() : vertexColor.rgb * 127.5;
+        vec3 col8 = min(floor(color8 +
                              (polygon != 0u ? attributeRoundingBias() : 0.5)), vec3(255.0));
         vec3 prod8 = min(tex5 * col8 / 16.0, vec3(255.0));
         modColor = dither != 0u ? prod8 / 255.0
@@ -153,7 +281,8 @@ void main() {
     bool enhancedPixel=false;
     // Presentation only. The original texel still owns coverage, STP and
     // palette changes. Unmatched reference colours fall back pixel by pixel.
-    if (passMode.y>1u && hdUV.z>0.5 && hdUV.z<1.5 && textureMode!=0u) {
+    if (passMode.y>1u && ((hdUV.z>0.5 && hdUV.z<1.5) ||
+                         (hdUV.z>5.5 && hdUV.z<7.5)) && textureMode!=0u && staticPaletteMatches) {
         ivec2 size=textureSize(texHD,0);
         ivec2 reference=ivec2(hdUV.xy*vec2(size))+ivec2(0,size.y/2);
         vec3 basis=texelFetch(texHD,reference,0).rgb;
@@ -164,9 +293,15 @@ void main() {
             enhancedPixel=true;
         }
     }
+    // Matched opaque room texels keep full native coverage. Room layers are
+    // complementary cutouts: the transparent hole under a foreground is
+    // exactly the foreground's opaque mask, with nothing drawn beneath it.
+    // Fading coverage inside either silhouette therefore blends both layers
+    // towards that empty hole and leaves a dark staircase along every shared
+    // edge (issue #208). Reviewed mattes and underlays refine edges instead.
     // Exact source-page/CLUT matching owns identity; native texel still owns
     // transparent cutouts, STP, mask writes and blend classification.
-    if (passMode.y>1u && hdUV.z>4.5 && polygon!=0u && textureMode!=0u) {
+    if (passMode.y>1u && hdUV.z>4.5 && hdUV.z<5.5 && polygon!=0u && textureMode!=0u) {
         vec3 enhanced=texture(texHD,hdUV.xy).rgb;
         vec3 tint=min(floor(vertexColor.rgb*127.5+0.5),vec3(255.0))/128.0;
         modColor=clamp(enhanced*tint,0.0,1.0);enhancedPixel=true;

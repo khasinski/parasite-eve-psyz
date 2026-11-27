@@ -26,6 +26,12 @@ void Psyz_SetTitle(const char* str);
 int Psyz_VideoSetRgb24Backdrop(const char *filename, const unsigned char *reference,
                              int width, int height, int top, int bottom);
 
+/* Display-only replacement for either of a movie's two native display pages.
+ * A NULL path restores that page. A negative page Y clears both pages.
+ * Returns 1 for a loaded frame, 0 for native presentation. */
+#define PSYZ_HAS_MOVIE_FRAME_REPLACEMENT 1
+int Psyz_VideoSetMovieFrame(int page_y, const char *filename);
+
 typedef enum {
     /**
      * Auto-detect use of driver VSync (default)
@@ -349,7 +355,7 @@ int Psyz_VideoVSync(int mode);
  * @param speed 1 (normal) to PSYZ_SPEED_MAX
  * @return 0 on success, -1 if invalid speed
  */
-#define PSYZ_SPEED_MAX 4
+#define PSYZ_SPEED_MAX 8
 int Psyz_VideoSetSpeed(unsigned speed);
 unsigned Psyz_VideoGetSpeed(void);
 

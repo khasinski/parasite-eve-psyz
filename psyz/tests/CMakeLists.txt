@@ -17,8 +17,30 @@ set(PSYZ_TEST_SOURCES
 )
 
 add_executable(${PROJECT_NAME} ${PSYZ_TEST_SOURCES})
+# Fixture setup and teardown use assert even in release test binaries.
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /UNDEBUG)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -UNDEBUG)
+endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_link_libraries(${PROJECT_NAME} PRIVATE ztest psyz)
+# The D3D12 tests keep native, scaled and interpolation textures resident at 8x.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
+    elseif(MINGW)
+        target_link_options(${PROJECT_NAME} PRIVATE -Wl,--large-address-aware)
+    endif()
+endif()
+if(NOT PSP)
+    # test_libcd.c compiles the original module with local stdio fault wrappers.
+    # Do not also archive it: COFF linkers can load both copies of the symbols.
+    get_target_property(psyz_test_sources psyz SOURCES)
+    list(REMOVE_ITEM psyz_test_sources src/psyz/libcd.c)
+    set_property(TARGET psyz PROPERTY SOURCES "${psyz_test_sources}")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PSYZ_TEST_CD_IO=1 _FILE_OFFSET_BITS=64)
+endif()
 if(NOT PSP AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
     target_compile_definitions(${PROJECT_NAME} PRIVATE PSYZ_TEST_SDL_GPU=1)
 endif()

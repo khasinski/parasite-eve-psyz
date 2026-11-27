@@ -85,6 +85,8 @@ static struct {
 static int disp_origin_count;
 
 // ===== display defaults, same as a real PS1 =====
+static bool display_rgb24, display_double_height;
+static int display_x, display_y;
 static int game_w = 256;         // GP1 PS1 register for display mode
 static int game_h = 240;         // GP1 PS1 register for display mode
 static int set_disp_horiz = 256; // Display range for aspect ratio
@@ -891,6 +893,35 @@ static int FbOffset(int idx) {
     return offsets[idx];
 }
 
+// A packed scanline starts at a VRAM word address and wraps within its row.
+static void ReadPackedRow(int y, u16* row) {
+    int words = (3 * game_w + 1) / 2;
+    int first = PSX_VRAM_W - display_x;
+    int vram_y = (display_y + y) & (PSX_VRAM_H - 1);
+    if (first > words)
+        first = words;
+    VramLineRead(display_x, vram_y, row, first);
+    if (first < words)
+        VramLineRead(0, vram_y, row + first, words - first);
+}
+
+static void PresentPackedFrame(void) {
+    u16 row[PSX_VRAM_W];
+    u16* fb = (u16*)UNCACHED(edram_base + FbOffset(cur_draw_fb));
+    memset(fb, 0, FB_STRIDE * PSP_SCREEN_H * sizeof(*fb));
+    if (target_w <= 0)
+        return;
+    for (int y = out_y; y < out_y + out_h && y < pres_y + game_h; ++y) {
+        ReadPackedRow(y - pres_y, row);
+        for (int x = out_x; x < out_x + out_w && x < pres_x + target_w; ++x) {
+            int sx = (x - pres_x) * game_w / target_w;
+            const u8* rgb = (const u8*)row + sx * 3;
+            fb[y * FB_STRIDE + x] = (rgb[0] >> 3) | ((rgb[1] >> 3) << 5) |
+                                    ((rgb[2] >> 3) << 10);
+        }
+    }
+}
+
 // point the display at show_fb, which has the frame ready to show on screen
 static void ShowPendingFrame(void) {
     if (!pending_show) {
@@ -927,12 +958,16 @@ int Psyz_VideoVSync(int mode) {
 
         FlushPendingClear();
         FlushBatch();
-        if (use_surface) {
+        if (use_surface && !display_rgb24) {
             PresentSurface();
         }
         sceGuFinish();
         prev_frame_list_id = ge_list_executed[0];
         prev_frame_pending = true;
+        if (display_rgb24) {
+            WaitPrevFrameGpu();
+            PresentPackedFrame();
+        }
         show_fb = cur_draw_fb;
         pending_show = true;
         dlist_idx ^= 1;
@@ -999,6 +1034,12 @@ PsyzSize Psyz_VideoGetDisplaySize(void) {
     return s;
 }
 
+/* The PSP queue carries native primitives without interpolation metadata. */
+void Psyz_GpuCopyInterpolationPacket(const void *from, const void *to) {
+    (void)from;
+    (void)to;
+}
+
 void Psyz_VideoSetDrawArea(PsyzRect rect) {
     draw_area_rect = rect;
     UpdateOutputMapping();
@@ -1016,6 +1057,17 @@ int Psyz_VideoStats(PsyzVideoStats* stats) {
     return 0;
 }
 
+static void Expand555Row(u8* out, const u16* row, int width) {
+    for (int i = 0; i < width; ++i) {
+        u16 color = row[i];
+        for (int channel = 0; channel < 3; ++channel) {
+            u8 value = color & 31;
+            *out++ = (value << 3) | (value >> 2);
+            color >>= 5;
+        }
+    }
+}
+
 static unsigned char* AllocRgb888Region(
     int offset, int bufw, int x, int y, int w, int h) {
     const u16* fb = (const u16*)(0x40000000 | (uintptr_t)(edram_base + offset));
@@ -1023,27 +1075,12 @@ static unsigned char* AllocRgb888Region(
     if (!out) {
         return NULL;
     }
-    unsigned char* p = out;
-    for (int j = 0; j < h; j++) {
-        const u16* row = &fb[(y + j) * bufw + x];
-        for (int i = 0; i < w; i++) {
-            u16 c = row[i];
-            u8 r5 = c & 0x1F;
-            u8 g5 = (c >> 5) & 0x1F;
-            u8 b5 = (c >> 10) & 0x1F;
-            *p++ = (u8)((r5 << 3) | (r5 >> 2));
-            *p++ = (u8)((g5 << 3) | (g5 >> 2));
-            *p++ = (u8)((b5 << 3) | (b5 >> 2));
-        }
-    }
+    for (int j = 0; j < h; ++j)
+        Expand555Row(out + j * w * 3, fb + (y + j) * bufw + x, w);
     return out;
 }
 
-unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
-    if (!is_init && !InitPlatform()) {
-        return NULL;
-    }
-    WaitPrevFrameGpu();
+static unsigned char* CapturePresentedFrame(int* w, int* h) {
     int fb_idx = show_fb >= 0 ? show_fb : cur_draw_fb;
     unsigned char* out = AllocRgb888Region(
         FbOffset(fb_idx), FB_STRIDE, out_x, out_y, out_w, out_h);
@@ -1059,6 +1096,26 @@ unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
     return out;
 }
 
+unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
+    if (!is_init && !InitPlatform()) {
+        return NULL;
+    }
+    WaitPrevFrameGpu();
+    if (display_rgb24) {
+        u8* pixels = malloc((size_t)game_w * game_h * 3);
+        if (!pixels)
+            return NULL;
+        for (int y = 0; y < game_h; ++y)
+            ReadPackedRow(y, (u16*)(pixels + y * game_w * 3));
+        if (w)
+            *w = game_w;
+        if (h)
+            *h = game_h;
+        return pixels;
+    }
+    return CapturePresentedFrame(w, h);
+}
+
 unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     if (w)
         *w = 0;
@@ -1066,30 +1123,31 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         *h = 0;
     if (!w || !h)
         return NULL;
-    unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
+    if (!is_init && !InitPlatform())
+        return NULL;
+    WaitPrevFrameGpu();
+    unsigned char* pixels = CapturePresentedFrame(w, h);
     if (!pixels)
         *w = *h = 0;
     return pixels;
 }
 
 unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
-    // TODO feasibility of returning the edram pointer directly?
-    if (!is_init && !InitPlatform()) {
+    if (!is_init && !InitPlatform())
         return NULL;
-    }
-    WaitPrevFrameGpu();
-    int dump_w = FB_STRIDE;
-    int dump_h = (int)sceGeEdramGetSize() / (dump_w * 2);
-    unsigned char* out = AllocRgb888Region(0, dump_w, 0, 0, dump_w, dump_h);
-    if (!out) {
+    u8* out = malloc(PSX_VRAM_W * PSX_VRAM_H * 3);
+    if (!out)
         return NULL;
+    GeSyncCaughtUp();
+    u16 row[PSX_VRAM_W];
+    for (int y = 0; y < PSX_VRAM_H; ++y) {
+        VramLineRead(0, y, row, PSX_VRAM_W);
+        Expand555Row(out + y * PSX_VRAM_W * 3, row, PSX_VRAM_W);
     }
-    if (w) {
-        *w = dump_w;
-    }
-    if (h) {
-        *h = dump_h;
-    }
+    if (w)
+        *w = PSX_VRAM_W;
+    if (h)
+        *h = PSX_VRAM_H;
     return out;
 }
 
@@ -1120,6 +1178,8 @@ void Draw_DisplayEnable(unsigned int on) { display_enabled = on != 0; }
 static void TryLockFbOrigin(void);
 
 void Draw_DisplayArea(unsigned int x, unsigned int y) {
+    display_x = x & (PSX_VRAM_W - 1);
+    display_y = y & (PSX_VRAM_H - 1);
     // remember the framebuffer locations (typically two, alternating)
     for (int i = 0; i < disp_origin_count; i++) {
         if (disp_origins[i].x == (int)x && disp_origins[i].y == (int)y) {
@@ -1152,7 +1212,10 @@ void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
 }
 
 void Draw_DisplayVerticalRange(unsigned int start, int unsigned end) {
+    if (end <= start || end - start > PSX_VRAM_H)
+        return;
     set_disp_vert = (int)(end - start);
+    game_h = set_disp_vert * (display_double_height ? 2 : 1);
     UpdateOutputMapping();
     UpdateScissor();
 }
@@ -1161,9 +1224,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     if (mode->reversed) {
         WARNF("reverse mode not supported");
     }
-    if (mode->rgb24) {
-        LOG_ONCE("24-bit display mode not supported");
-    }
+    display_rgb24 = mode->rgb24;
+    display_double_height = mode->vertical_resolution;
     is_pal = mode->pal;
     if (mode->horizontal_resolution_368) {
         game_w = 368;
@@ -1183,7 +1245,7 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
             break;
         }
     }
-    game_h = mode->vertical_resolution ? 480 : 240;
+    game_h = set_disp_vert * (display_double_height ? 2 : 1);
     UpdateOutputMapping();
     UpdateScissor();
 }

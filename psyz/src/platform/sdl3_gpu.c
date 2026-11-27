@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <psyz.h>
 #include <psyz/overlay.h>
 #include <psyz/overlay_sdl3_gpu.h>
@@ -196,8 +197,8 @@ static bool SubmitCmdAndWait(void);
 static bool InterpEnsureTarget(void);
 /* Presentation-only geometry history. Packet pairs belong to the original
  * double buffers; UI packets are deliberately never registered. */
-#define INTERP_PAIRS 16384u
-#define INTERP_MAP 65536u
+#define INTERP_PAIRS 262144u   /* big PC-side models (skins) register one pair per face */
+#define INTERP_MAP 1048576u
 typedef struct { const void *address; unsigned pair, serial; } InterpAddress;
 typedef struct {
     const void *a,*b;
@@ -223,6 +224,7 @@ static unsigned interpolated_scale;
 static Vertex interpolated_vertices[MAX_VERTEX_COUNT];
 static unsigned long long interpolated_present_count;
 static bool present_commit_pending,present_commit_mid;
+static bool driver_present_pending;
 static Uint64 present_window_start;
 static unsigned present_window_frames,present_window_mid;
 static float actual_present_fps;
@@ -375,8 +377,15 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     if(!e||!e->serial)return;
     InterpPair *p=&interp_pairs[e->pair];if(p->serial!=e->serial)return;
     uint64_t signature=14695981039346656037ULL;
-    for(unsigned i=0;i<count;++i){const unsigned char *s=(const void *)&v[i].u;
-        for(unsigned j=0;j<8;++j)signature=(signature^s[j])*1099511628211ULL;}
+    for(unsigned i=0;i<count;++i){
+        /* Textureless primitives do not write UV/CLUT fields. Those slots
+         * retain the previous batch's texture data, which is not identity:
+         * hashing it drops their midpoint while textured neighbours move. */
+        const unsigned char *s=(const void *)&v[i].u;
+        unsigned bytes=8;
+        if(v[i].t&TPAGE_NOTEXTURE){s=(const void *)&v[i].t;bytes=sizeof(v[i].t);}
+        for(unsigned j=0;j<bytes;++j)signature=(signature^s[j])*1099511628211ULL;
+    }
     bool valid=p->frame&&p->frame+1==interp_frame&&p->count==count&&p->signature==signature;
     float position[6][3];
     for(unsigned i=0;i<count;++i){bool projected=(geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0;
@@ -394,6 +403,13 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     if(valid||camera_fallback)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
         out->pgxp_pos[0]=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0]+interp_camera_half_x;
         out->pgxp_pos[1]=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1]+interp_camera_half_y;
+        /* A half-native-pixel camera step lands between render pixels at
+         * odd scales. Align all tiles to the same target pixel so raster
+         * interpolation cannot alternate UV rounding across their rows. */
+        if (p->background && internal_res > 1 && (internal_res & 1)) {
+            out->pgxp_pos[0] = SDL_floorf(out->pgxp_pos[0] * internal_res + 0.5f) / internal_res;
+            out->pgxp_pos[1] = SDL_floorf(out->pgxp_pos[1] * internal_res + 0.5f) / internal_res;
+        }
         out->pgxp_pos[2]=valid?2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]):position[i][2];}
     memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
 }
@@ -402,19 +418,33 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
 typedef struct SpriteAtlas {
     uint64_t key;
     unsigned columns, rows, first_cell;
+    bool authored_coverage,static_hd_coverage,selective_hd_coverage;
 } SpriteAtlas;
 static SpriteAtlas sprite_atlases[512];
 static unsigned sprite_atlas_count;
 static size_t sprite_atlas_bytes;
 static SpriteAtlas *next_sprite_atlas;
+static int next_sprite_tile_u=-1,next_sprite_tile_v; /* polygon tile origin, -1: sprites only */
+/* Psyz_GpuSetPageHd: one texture page shown from a 1024x1024 HD picture kept in a reserved
+ * 16x16-cell corner of the shared atlas (material rows PAGE_HD_ROW0.., columns PAGE_HD_COL0..). */
+#define PAGE_HD_ROW0 29u   /* 31x31 cells: room for a 2048x2048 picture (was 44: 16x16, 1024) */
+#define PAGE_HD_COL0 209u
+static struct { bool active, reserved; unsigned tpage, clut_y0, clut_y1, size; } page_hd;
+/* Optional windows: palette k of the page (16 per CLUT row from clut_y0) shows the square
+ * x,y,size of the picture, so 8-bit UVs address it at size/256 pixels per step. */
+static unsigned short page_hd_win[64][3];
+static unsigned page_hd_wins;
 static SDL_GPUTexture *sprite_atlas_texture;
 static unsigned sprite_atlas_cells;
 #define HD_ATLAS_COLUMNS 240u
 #define HD_ATLAS_ROWS 60u
 #define HD_ATLAS_WIDTH (HD_ATLAS_COLUMNS*68u)
 #define HD_ATLAS_HEIGHT (HD_ATLAS_ROWS*136u)
+/* Bit0: authored alpha; bit1: explicitly selected static coverage. */
+static u8 sprite_atlas_cell_alpha[HD_ATLAS_COLUMNS*HD_ATLAS_ROWS];
 static unsigned next_sprite_cell;
-static bool next_sprite_extension;
+/* 1: HD underlay in any aspect; 2: widescreen-only side art. */
+static unsigned next_sprite_extension;
 static bool sprite_atlases_enabled=true;
 static SDL_GPUSampler *sprite_atlas_sampler;
 typedef struct{SDL_GPUTexture *texture,*quarantine_texture;SDL_GPUSampler *sampler;SDL_GPUTransferBuffer *quarantine_transfer;int enabled,valid;} NativeFontGpu;
@@ -442,6 +472,7 @@ static bool widescreen;
 /* Rendered-frame capture uses the same final widescreen crop and scaling as
  * presentation, into an offscreen texture even when the window is hidden. */
 static SDL_GPUTexture* ws_capture;
+static SDL_GPUTexture* ws_black;
 static Uint32 ws_capture_width, ws_capture_height;
 static bool ws_capture_active;
 static struct {
@@ -579,6 +610,22 @@ static void WidescreenFieldStep(int picture, float n, float* qx, float* qy) {
     *qy = SDL_roundf(ws_picture[picture].ey * n) / n;
 }
 
+/* The dither matrix's origin, as passMode.w bits 8-11 of the triangle passes:
+ * the room's step (WidescreenFieldStep) in buffer pixels across and down,
+ * mod 4. The matrix is anchored to the buffer, so a room moved by part of a
+ * game pixel took another dither each frame, and dithered parts of one model
+ * (a chest's lid and body) shifted against each other by a pixel at 8x while
+ * a camera panned. With the matrix moved along, the step moves the room's
+ * picture as a whole. Drawing not moved (and all without widescreen) keeps
+ * the matrix where it was. */
+static u32 WidescreenDitherOrigin(float step_x, float step_y, unsigned scale) {
+    if (!widescreen)
+        return 0;
+    const int x = (int)SDL_lroundf(step_x * (float)scale);
+    const int y = (int)SDL_lroundf(step_y * (float)scale);
+    return ((u32)(x & 3) | ((u32)(y & 3) << 2)) << 8;
+}
+
 /* The squeeze's fixed point. It moves 3 pixels against each pixel of view
  * shift, so the buffer holds the shifted view around its own centre: game x
  * centre + shift lands on the buffer's centre. */
@@ -656,6 +703,10 @@ static bool SubmitCmd(void) {
     if (pending_cmd) {
         SDL_GPUCommandBuffer *cmd = pending_cmd;
         pending_cmd = NULL; /* consumed by SDL on both results */
+        if (driver_present_pending) {
+            driver_present_pending=false;
+            PaceDriverPresent();
+        }
         if (!SDL_SubmitGPUCommandBuffer(cmd)) {
             quarantined_cmd = cmd; /* evidence only; never dereference */
             present_commit_pending=false;return GpuFail("SDL_SubmitGPUCommandBuffer", true);
@@ -704,6 +755,7 @@ void Psyz_GpuResetSpriteAtlases(void) {
     sprite_atlas_bytes=0;
     next_sprite_atlas=NULL;
     next_sprite_cell=0;
+    next_sprite_tile_u=-1;
 }
 
 /* The lossy material and lossless native-reference plane are deliberately
@@ -725,6 +777,98 @@ static SDL_Surface *LoadHdImage(const char *filename) {
 }
 
 #include "cpu-material-adapter.h"
+
+/* Reference alpha is unused by RGB555 matching. For a reviewed matte,
+ * store a nearby colored reference texel there so black RGB cannot by itself
+ * authorize a fringe after the original palette disappears. */
+static void SpriteCoverageWitnesses(u8 *reference) {
+    u16 nearest[256],queue[256];unsigned head=0,tail=0;
+    for(unsigned i=0;i<256;++i){
+        const u8 *pixel=reference+((size_t)(4+(i/16)*4)*68+4+(i%16)*4)*4;
+        nearest[i]=0xffff;
+        if(pixel[0]>=5 || pixel[1]>=5 || pixel[2]>=5){nearest[i]=(u16)i;queue[tail++]=(u16)i;}
+    }
+    while(head<tail){
+        int i=queue[head++],next[4]={i-16,i+16,i%16?i-1:-1,i%16<15?i+1:-1};
+        for(unsigned n=0;n<4;++n)if(next[n]>=0 && next[n]<256 && nearest[next[n]]==0xffff){
+            nearest[next[n]]=nearest[i];queue[tail++]=(u16)next[n];
+        }
+    }
+    for(int y=0;y<68;++y)for(int x=0;x<68;++x){
+        unsigned i=(unsigned)(SDL_clamp((y-2)/4,0,15)*16+SDL_clamp((x-2)/4,0,15));
+        reference[((size_t)y*68+x)*4+3]=nearest[i]==0xffff?0:(u8)nearest[i];
+    }
+}
+
+static int UploadSpriteAtlas(uint64_t key, SDL_Surface *source, const char *name);
+
+/* The shared atlas texture and its sampler, made on first use. */
+static SDL_GPUTexture *EnsureSpriteAtlasTexture(void) {
+    SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=HD_ATLAS_WIDTH,.height=HD_ATLAS_HEIGHT,.layer_count_or_depth=1,.num_levels=1};
+    if (!sprite_atlas_texture) sprite_atlas_texture=SDL_CreateGPUTexture(device,&info);
+    if (!sprite_atlas_sampler) {
+        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
+        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
+    }
+    return sprite_atlas_texture && sprite_atlas_sampler ? sprite_atlas_texture : NULL;
+}
+
+int Psyz_GpuSetPageHd(unsigned tpage, unsigned clut_y0, unsigned clut_y1,
+                      const void *rgba, const void *ref, int width, int height, int pitch) {
+    if (!rgba) { page_hd.active=false; return 1; }
+    if (UseSoftwareBackend() || gpu_failed || !device) return 0;
+    if (!ref || (width!=1024 && width!=2048) || height!=width || pitch<width*4) return -1;
+    const int last=width-1;
+    /* the corner must be free of ordinary atlas cells */
+    if (!page_hd.reserved && sprite_atlas_cells>HD_ATLAS_COLUMNS*PAGE_HD_ROW0) return 0;
+    SDL_GPUTexture *texture=EnsureSpriteAtlasTexture();
+    if (!texture) return 0;
+    Draw_FlushBuffer();                              /* draws queued so far keep the old picture */
+    const unsigned side=31u*68u;                     /* 2108: the picture at +2,+2 with edge gutters */
+    /* picture in the material half, native colours at the same place in the reference half */
+    SDL_GPUTransferBufferCreateInfo upload_info={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=2u*side*side*4u};
+    SDL_GPUTransferBuffer *upload=SDL_CreateGPUTransferBuffer(device,&upload_info);
+    u8 *mapped=upload ? (u8 *)SDL_MapGPUTransferBuffer(device,upload,false) : NULL;
+    if (!mapped) { if (upload) SDL_ReleaseGPUTransferBuffer(device,upload); return 0; }
+    for (unsigned plane=0;plane<2;++plane) for (unsigned y=0;y<side;++y) {
+        int sy=(int)y-2; sy=sy<0?0:sy>last?last:sy;
+        const u8 *src=(const u8 *)(plane?ref:rgba)+(size_t)sy*(size_t)pitch;
+        u8 *dst=mapped+((size_t)plane*side+y)*side*4u;
+        for (unsigned x=0;x<side;++x) {
+            int sx=(int)x-2; sx=sx<0?0:sx>last?last:sx;
+            memcpy(dst+x*4u,src+(size_t)sx*4u,3); dst[x*4u+3]=255;
+        }
+    }
+    SDL_UnmapGPUTransferBuffer(device,upload);
+    SDL_GPUCommandBuffer *cmd=AcquireCmd();
+    SDL_GPUCopyPass *copy=cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
+    if (!copy) { SDL_ReleaseGPUTransferBuffer(device,upload); return 0; }
+    for (unsigned plane=0;plane<2;++plane) {
+        SDL_GPUTextureTransferInfo from={.transfer_buffer=upload,.offset=plane*side*side*4u,.pixels_per_row=side,.rows_per_layer=side};
+        SDL_GPUTextureRegion to={.texture=texture,.x=PAGE_HD_COL0*68u,.y=PAGE_HD_ROW0*68u+plane*HD_ATLAS_HEIGHT/2u,.w=side,.h=side,.d=1};
+        SDL_UploadToGPUTexture(copy,&from,&to,false);
+    }
+    SDL_EndGPUCopyPass(copy);
+    SDL_ReleaseGPUTransferBuffer(device,upload);
+    page_hd.reserved=true; page_hd.active=true;
+    page_hd.tpage=tpage&31u; page_hd.clut_y0=clut_y0; page_hd.clut_y1=clut_y1; page_hd.size=(unsigned)width;
+    INFOF("HD page %u (VRAM %u,%u) for CLUT rows %u-%u",page_hd.tpage,(page_hd.tpage&15u)*64u,
+          ((page_hd.tpage>>4)&1u)*256u,clut_y0,clut_y1);
+    return 1;
+}
+
+int Psyz_GpuSetPageHdWindows(const unsigned short *xys, int count) {
+    if (!xys || count <= 0) { page_hd_wins = 0; return 1; }
+    if (count > 64) count = 64;
+    Draw_FlushBuffer();
+    memcpy(page_hd_win, xys, (size_t)count * 3u * sizeof(unsigned short));
+    page_hd_wins = (unsigned)count;
+    INFOF("HD page windows: %d", count);
+    return 1;
+}
 
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     if (UseSoftwareBackend()) return CpuMaterialLoad(key,filename);
@@ -750,24 +894,35 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
         SDL_DestroySurface(reference);SDL_DestroySurface(source);source=combined;
     }
     if (!source) return 0;
+    return UploadSpriteAtlas(key,source,filename);
+}
+
+/* Like Psyz_GpuLoadSpriteAtlas, from RGBA32 pixels in memory laid out as a
+ * PNG/BMP atlas: material cells in the upper half, references in the lower. */
+int Psyz_GpuLoadSpriteAtlasPixels(uint64_t key, const void *rgba, int width, int height, int pitch) {
+    if (UseSoftwareBackend() || gpu_failed || !key || !rgba || !device) return 0;
+    for (unsigned i=0;i<sprite_atlas_count;++i)
+        if (sprite_atlases[i].key==key) return 1;
+    if (width<=0 || width>16*68 || height<=0 || height>16384 || pitch<width*4) return -1;
+    SDL_Surface *view=SDL_CreateSurfaceFrom(width,height,SDL_PIXELFORMAT_RGBA32,(void *)rgba,pitch);
+    if (!view) return -1;
+    return UploadSpriteAtlas(key,view,"(memory)");
+}
+
+/* Uploads one two-plane atlas into the shared cells; takes source. */
+static int UploadSpriteAtlas(uint64_t key, SDL_Surface *source, const char *name) {
     int w=source->w,h=source->h;
     size_t bytes=(size_t)w*(size_t)h*4;
+    /* the reserved page corner starts at material row PAGE_HD_ROW0: cells stop above it once used */
+    unsigned capacity=HD_ATLAS_COLUMNS*(page_hd.reserved?PAGE_HD_ROW0:HD_ATLAS_ROWS);
     if (w<=0 || h<=0 || w%68 || h%136 || w>16*68 || h>16384 ||
-        sprite_atlas_count>=512 || (unsigned)(w/68)*(unsigned)(h/136)>HD_ATLAS_COLUMNS*HD_ATLAS_ROWS-sprite_atlas_cells) {
-        SDL_DestroySurface(source); WARNF("Invalid or over-budget HD sprite atlas: %s",filename); return -1;
+        sprite_atlas_count>=512 || sprite_atlas_cells>capacity ||
+        (unsigned)(w/68)*(unsigned)(h/136)>capacity-sprite_atlas_cells) {
+        SDL_DestroySurface(source); WARNF("Invalid or over-budget HD sprite atlas: %s",name); return -1;
     }
     SDL_Surface *rgba=SDL_ConvertSurface(source,SDL_PIXELFORMAT_RGBA32);
     SDL_DestroySurface(source); if (!rgba) return -1;
-    SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=HD_ATLAS_WIDTH,.height=HD_ATLAS_HEIGHT,.layer_count_or_depth=1,.num_levels=1};
-    if (!sprite_atlas_texture) sprite_atlas_texture=SDL_CreateGPUTexture(device,&info);
-    if (!sprite_atlas_sampler) {
-        SDL_GPUSamplerCreateInfo sampler={.min_filter=SDL_GPU_FILTER_LINEAR,.mag_filter=SDL_GPU_FILTER_LINEAR,
-            .mipmap_mode=SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,.address_mode_u=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-            .address_mode_v=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE};
-        sprite_atlas_sampler=SDL_CreateGPUSampler(device,&sampler);
-    }
-    SDL_GPUTexture *texture=sprite_atlas_texture;
+    SDL_GPUTexture *texture=EnsureSpriteAtlasTexture();
     SDL_GPUTransferBufferCreateInfo upload_info={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=(Uint32)bytes};
     SDL_GPUTransferBuffer *upload=(texture && sprite_atlas_sampler) ? SDL_CreateGPUTransferBuffer(device,&upload_info) : NULL;
     void *mapped=upload ? SDL_MapGPUTransferBuffer(device,upload,false) : NULL;
@@ -777,6 +932,34 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
         SDL_DestroySurface(rgba); return -1;
     }
     unsigned columns=(unsigned)w/68,rows=(unsigned)h/136,cells=columns*rows;
+    bool authored_coverage=false;
+    /* Explicit opt-in for a reviewed STATIC foreground mask and its coherent
+     * backdrop. Unmarked/invalid metadata retains strict native coverage. */
+    bool static_hd_coverage=false;
+    bool selective_hd_coverage=false;
+    u8 selected_cells[(HD_ATLAS_COLUMNS*HD_ATLAS_ROWS+7)/8]={0};
+    const char *extension=SDL_strrchr(name,'.');
+    if(extension){
+        char marker[4096];size_t prefix=(size_t)(extension-name);
+        if(prefix+sizeof("-matte.bin")<=sizeof(marker)){
+            memcpy(marker,name,prefix);memcpy(marker+prefix,"-matte.bin",sizeof("-matte.bin"));
+            SDL_IOStream *file=SDL_IOFromFile(marker,"rb");
+            if(file){
+                char magic[4],extra;size_t size=SDL_ReadIO(file,magic,sizeof(magic));
+                if(size==4 && !memcmp(magic,"PEM1",4))
+                    static_hd_coverage=SDL_ReadIO(file,&extra,1)==0 && SDL_GetIOStatus(file)==SDL_IO_STATUS_EOF;
+                else if(size==4 && !memcmp(magic,"PEM2",4)){
+                    size_t bytes=(cells+7)/8;
+                    if(SDL_ReadIO(file,selected_cells,bytes)==bytes && SDL_ReadIO(file,&extra,1)==0 && SDL_GetIOStatus(file)==SDL_IO_STATUS_EOF){
+                        unsigned any=0;for(size_t i=0;i<bytes;++i)any|=selected_cells[i];
+                        unsigned valid_last=cells%8 ? (1u<<(cells%8))-1u : 255u;
+                        selective_hd_coverage=any && !(selected_cells[bytes-1]&~valid_last);
+                    }
+                }
+                SDL_CloseIO(file);
+            }
+        }
+    }
     /* This SDL revision's Metal uploader uses destination width for row
      * pitch. Pack every cell contiguously instead of relying on row strides. */
     for (unsigned cell=0;cell<cells;++cell) for (unsigned reference=0;reference<2;++reference) {
@@ -786,9 +969,15 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
             memcpy(target+(size_t)row*68*4,(u8 *)rgba->pixels+(size_t)(sy+row)*rgba->pitch+sx*4,68*4);
         if (reference==0) {
             u8 solid[68][68];
+            bool cell_authored_coverage=false;
             for (unsigned row=0;row<68;++row) {
                 u8 *line=target+(size_t)row*68*4;
-                for (unsigned col=0;col<68;++col) solid[row][col]=line[col*4+3]>=128;
+                for (unsigned col=0;col<68;++col) {
+                    /* Fractional coverage still owns valid straight RGB.
+                     * Extrude only fully transparent material texels. */
+                    solid[row][col]=line[col*4+3]!=0;
+                    cell_authored_coverage |= line[col*4+3]!=255;
+                }
                 for (unsigned col=1;col<68;++col) {
                     if (!solid[row][col] && solid[row][col-1]) {
                         memcpy(line+col*4,line+(col-1)*4,3);
@@ -816,8 +1005,15 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
                     }
                 }
             }
+            sprite_atlas_cell_alpha[sprite_atlas_cells+cell]=cell_authored_coverage |
+                ((selective_hd_coverage && (selected_cells[cell/8]&(1u<<(cell%8))))?2:0);
+            authored_coverage |= cell_authored_coverage;
+        } else if(static_hd_coverage || (selective_hd_coverage && (selected_cells[cell/8]&(1u<<(cell%8))))) {
+            SpriteCoverageWitnesses(target);
         }
     }
+    static_hd_coverage &= authored_coverage;
+    selective_hd_coverage &= authored_coverage;
     SDL_UnmapGPUTransferBuffer(device,upload);SDL_DestroySurface(rgba);
     SDL_GPUCommandBuffer *cmd=AcquireCmd();
     if (!cmd) { SDL_ReleaseGPUTransferBuffer(device,upload);return -1; }
@@ -833,7 +1029,7 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     }
     SDL_EndGPUCopyPass(copy);
     SDL_ReleaseGPUTransferBuffer(device,upload);
-    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells};
+    sprite_atlases[sprite_atlas_count++]=(SpriteAtlas){key,columns,rows,sprite_atlas_cells,authored_coverage,static_hd_coverage,selective_hd_coverage};
     sprite_atlas_cells+=cells;
     sprite_atlas_bytes+=bytes;
     INFOF("HD sprite atlas %016llx: %dx%d (%zu MiB cached)",(unsigned long long)key,w,h,sprite_atlas_bytes/(1024*1024));
@@ -844,15 +1040,22 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
 
 void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned cell) {
     next_sprite_atlas=NULL;
-    next_sprite_extension=(cell&0x800000u)!=0;
+    next_sprite_tile_u=-1;
+    next_sprite_extension=(cell>>22)&3u;
     if (UseSoftwareBackend()) { CpuMaterialSelect(key,cell); return; }
-    cell&=0x7fffffu;
+    cell&=0x3fffffu;
     for (unsigned i=0;i<sprite_atlas_count;++i) {
         SpriteAtlas *atlas=&sprite_atlases[i];
         if (atlas->key==key && cell<atlas->columns*atlas->rows) {
             next_sprite_atlas=atlas;next_sprite_cell=cell;return;
         }
     }
+}
+
+void Psyz_GpuSelectSpriteAtlasTile(uint64_t key, unsigned cell, unsigned u0, unsigned v0) {
+    if (UseSoftwareBackend()) { next_sprite_atlas=NULL;next_sprite_tile_u=-1;return; }
+    Psyz_GpuSelectSpriteAtlas(key,cell&0x7fffffu);
+    if (next_sprite_atlas) { next_sprite_tile_u=(int)(u0&255u);next_sprite_tile_v=(int)(v0&255u); }
 }
 
 
@@ -889,7 +1092,7 @@ static void SubmitFrame(void) {
         return;
     }
     if (swapchain_ok && frame_presented) {
-        SubmitCmd();
+        if (!SubmitCmd()) frame_presented = false;
         return;
     }
     SDL_GPUFence** fence = &frame_fences[frame_fence_idx];
@@ -901,6 +1104,10 @@ static void SubmitFrame(void) {
     }
     SDL_GPUCommandBuffer *cmd = pending_cmd;
     pending_cmd = NULL;
+    if (driver_present_pending) {
+        driver_present_pending=false;
+        PaceDriverPresent();
+    }
     *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!*fence) { quarantined_cmd = cmd; GpuFail("frame submit/fence", true); return; }
     RecordPresentedCommit();
@@ -922,6 +1129,10 @@ static bool SubmitCmdAndWait(void) {
     }
     SDL_GPUCommandBuffer *cmd = pending_cmd;
     pending_cmd = NULL;
+    if (driver_present_pending) {
+        driver_present_pending=false;
+        PaceDriverPresent();
+    }
     SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence) { quarantined_cmd = cmd; return GpuFail("submit/fence", true); }
     if (!SDL_WaitForGPUFences(device, true, &fence, 1)) {
@@ -1003,6 +1214,11 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
          .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
          .offset = offsetof(Vertex, uv_bounds)},
         {.location=8,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,.offset=offsetof(Vertex,hd_uv)},
+        {.location=9,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT4,.offset=offsetof(Vertex,polygon_gradient)},
+        {.location=10,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT4,.offset=offsetof(Vertex,polygon_gradient)+4*sizeof(unsigned int)},
+        {.location=11,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_UINT2,.offset=offsetof(Vertex,polygon_gradient)+8*sizeof(unsigned int)},
+        {.location=12,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_SHORT4,.offset=offsetof(Vertex,polygon_coverage)},
+        {.location=13,.buffer_slot=0,.format=SDL_GPU_VERTEXELEMENTFORMAT_SHORT4,.offset=offsetof(Vertex,polygon_coverage)+4*sizeof(short)},
     };
     // the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
     static const SDL_GPUColorTargetBlendState blend[BLEND_COUNT] = {
@@ -1728,10 +1944,20 @@ static u8 *title_reference;
 static int title_width, title_height;
 static char title_path[4096];
 static uint64_t title_hash;
-static unsigned title_generation, title_uploaded;
-static SDL_GPUTexture *title_texture;
-static SDL_GPUTransferBuffer *title_transfer;
-static unsigned title_texture_width, title_texture_height;
+typedef struct {
+    SDL_GPUTexture *texture;
+    SDL_GPUTransferBuffer *transfer;
+    unsigned width, height, generation;
+} DisplayImage;
+
+static DisplayImage title_gpu;
+static unsigned title_generation;
+
+static void ReleaseDisplayImage(DisplayImage *image) {
+    if (image->texture) SDL_ReleaseGPUTexture(device, image->texture);
+    if (image->transfer) SDL_ReleaseGPUTransferBuffer(device, image->transfer);
+    *image = (DisplayImage){0};
+}
 static bool title_present_active;
 
 /* CPU title enhancement is explicitly opt-in and never grants GPU atlas support. */
@@ -1817,36 +2043,93 @@ static SDL_Surface *BuildTitleDisplay(const u8 *rgb) {
     title_hash=hash;++title_generation;return title_output;
 }
 
-static SDL_GPUTexture *UploadTitleDisplay(SDL_Surface *surface) {
-    if (!title_texture || !title_transfer || title_texture_width!=(unsigned)surface->w || title_texture_height!=(unsigned)surface->h) {
-        if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
-        if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
-        title_texture=NULL;title_transfer=NULL;title_uploaded=0;
-        SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=surface->w,.height=surface->h,.layer_count_or_depth=1,.num_levels=1};
-        title_texture=SDL_CreateGPUTexture(device,&info);
-        SDL_GPUTransferBufferCreateInfo transfer={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=surface->w*surface->h*4};
-        title_transfer=title_texture?SDL_CreateGPUTransferBuffer(device,&transfer):NULL;
-        if (!title_texture || !title_transfer) {
-            if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
-            if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
-            title_texture=NULL;title_transfer=NULL;
-            title_texture_width=title_texture_height=0;
+static SDL_GPUTexture *UploadDisplayImage(DisplayImage *image, SDL_Surface *surface,
+                                          unsigned generation) {
+    unsigned width = surface->w, height = surface->h;
+    if (!image->texture || image->width != width || image->height != height) {
+        ReleaseDisplayImage(image);
+        SDL_GPUTextureCreateInfo info = {
+            .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = width, .height = height,
+            .layer_count_or_depth = 1, .num_levels = 1
+        };
+        SDL_GPUTransferBufferCreateInfo transfer = {
+            .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = width * height * 4
+        };
+        image->texture = SDL_CreateGPUTexture(device, &info);
+        image->transfer = SDL_CreateGPUTransferBuffer(device, &transfer);
+        if (!image->texture || !image->transfer) {
+            ReleaseDisplayImage(image);
             return NULL;
         }
-        title_texture_width=surface->w;title_texture_height=surface->h;
+        image->width = width;
+        image->height = height;
+    } else if (image->generation == generation) {
+        return image->texture;
     }
-    if (!title_texture || !title_transfer) return NULL;
-    if (title_uploaded==title_generation) return title_texture;
-    u8 *mapped=SDL_MapGPUTransferBuffer(device,title_transfer,true);if (!mapped) return NULL;
-    for (int y=0;y<surface->h;++y) memcpy(mapped+(size_t)y*surface->w*4,(u8 *)surface->pixels+(size_t)y*surface->pitch,(size_t)surface->w*4);
-    SDL_UnmapGPUTransferBuffer(device,title_transfer);
-    SDL_GPUCommandBuffer *cmd=AcquireCmd();if (!cmd) return NULL;
-    SDL_GPUCopyPass *copy=SDL_BeginGPUCopyPass(cmd);if (!copy) return NULL;
-    SDL_GPUTextureTransferInfo src={.transfer_buffer=title_transfer,.pixels_per_row=surface->w,.rows_per_layer=surface->h};
-    SDL_GPUTextureRegion dst={.texture=title_texture,.w=surface->w,.h=surface->h,.d=1};
-    SDL_UploadToGPUTexture(copy,&src,&dst,false);SDL_EndGPUCopyPass(copy);title_uploaded=title_generation;
-    return title_texture;
+
+    u8 *mapped = SDL_MapGPUTransferBuffer(device, image->transfer, true);
+    if (!mapped) return NULL;
+    for (unsigned y = 0; y < height; ++y)
+        memcpy(mapped + (size_t)y * width * 4,
+               (u8 *)surface->pixels + (size_t)y * surface->pitch, width * 4);
+    SDL_UnmapGPUTransferBuffer(device, image->transfer);
+    SDL_GPUCommandBuffer *cmd = AcquireCmd();
+    if (!cmd) return NULL;
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    if (!copy) return NULL;
+    SDL_GPUTextureTransferInfo src = {
+        .transfer_buffer = image->transfer, .pixels_per_row = width, .rows_per_layer = height
+    };
+    SDL_GPUTextureRegion dst = {.texture = image->texture, .w = width, .h = height, .d = 1};
+    SDL_UploadToGPUTexture(copy, &src, &dst, false);
+    SDL_EndGPUCopyPass(copy);
+    image->generation = generation;
+    return image->texture;
+}
+
+typedef struct {
+    int y;
+    SDL_Surface *surface;
+    DisplayImage gpu;
+    unsigned generation;
+} MovieFrame;
+
+static MovieFrame movie_frames[2];
+
+static MovieFrame *FindMovieFrame(int y) {
+    for (unsigned i = 0; i < 2; ++i)
+        if (movie_frames[i].surface && movie_frames[i].y == y) return &movie_frames[i];
+    return NULL;
+}
+
+int Psyz_VideoSetMovieFrame(int page_y, const char *filename) {
+    if (page_y < 0) {
+        for (unsigned i = 0; i < 2; ++i) {
+            SDL_DestroySurface(movie_frames[i].surface);
+            ReleaseDisplayImage(&movie_frames[i].gpu);
+            movie_frames[i] = (MovieFrame){0};
+        }
+        return 0;
+    }
+    MovieFrame *frame = FindMovieFrame(page_y);
+    if (!frame) {
+        if (!filename) return 0;
+        for (unsigned i = 0; i < 2; ++i)
+            if (!movie_frames[i].surface) { frame = &movie_frames[i]; break; }
+    }
+    if (!frame) return 0;
+    SDL_DestroySurface(frame->surface);
+    frame->surface = NULL;
+    if (!filename || UseSoftwareBackend()) return 0;
+    SDL_Surface *source = LoadHdImage(filename);
+    if (!source) return 0;
+    if (source->w > 0 && source->w <= 4096 && source->h > 0 && source->h <= 4096)
+        frame->surface = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(source);
+    frame->y = page_y;
+    ++frame->generation;
+    return frame->surface != NULL;
 }
 
 static SDL_GPUTexture* PrepareRgb24Display(void) {
@@ -1857,7 +2140,7 @@ static SDL_GPUTexture* PrepareRgb24Display(void) {
         return NULL;
     SDL_Surface *enhanced=BuildTitleDisplay(rgb);
     if (enhanced) {
-        SDL_GPUTexture *texture=UploadTitleDisplay(enhanced);
+        SDL_GPUTexture *texture=UploadDisplayImage(&title_gpu, enhanced, title_generation);
         if (texture) {free(rgb);title_present_active=true;return texture;}
     }
     if (!rgb24_display) {
@@ -2042,6 +2325,49 @@ static SDL_GPUBlitRegion PrescaleWidescreen(
             SDL_clamp((Uint32)SDL_lroundf((y1 - y0) * (float)ky), 1u, ph - py)};
 }
 
+/* Clip room ends after scaling the complete view. Cropping the source and
+ * independently rounding a smaller destination changes the sample grid of
+ * the original picture whenever optional side artwork changes its bounds. */
+static void MaskWidescreenEnds(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
+                               SDL_Rect dst, float left, float right) {
+    if (left <= 0.0f && right >= 1.0f) return;
+    if (!ws_black) {
+        const SDL_GPUTextureCreateInfo info = {
+            .type=SDL_GPU_TEXTURETYPE_2D, .format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER|SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+            .width=1, .height=1, .layer_count_or_depth=1, .num_levels=1};
+        ws_black=SDL_CreateGPUTexture(device,&info);
+        if (!ws_black) return;
+        SDL_GPUColorTargetInfo clear={.texture=ws_black,.load_op=SDL_GPU_LOADOP_CLEAR,
+            .store_op=SDL_GPU_STOREOP_STORE,.clear_color={0,0,0,1}};
+        SDL_GPURenderPass *pass=SDL_BeginGPURenderPass(cmd,&clear,1,NULL);
+        SDL_EndGPURenderPass(pass);
+    }
+    const int ends[2]={SDL_clamp((int)SDL_lroundf(left*dst.w),0,dst.w),
+                       SDL_clamp((int)SDL_lroundf(right*dst.w),0,dst.w)};
+    for (int side=0;side<2;++side) {
+        int start=side?ends[1]:0, width=side?dst.w-ends[1]:ends[0];
+        if (width<=0) continue;
+        const SDL_GPUBlitInfo mask={
+            .source={.texture=ws_black,.w=1,.h=1},
+            .destination={.texture=target,.x=(Uint32)(dst.x+start),.y=(Uint32)dst.y,
+                          .w=(Uint32)width,.h=(Uint32)dst.h},
+            .load_op=SDL_GPU_LOADOP_LOAD,.filter=SDL_GPU_FILTER_NEAREST};
+        SDL_BlitGPUTexture(cmd,&mask);
+    }
+}
+
+/* A shift of the widescreen view's source, in buffer pixels, as whole
+ * pixels of the output it is shown on (per_pixel of them a buffer pixel),
+ * picked out by the nearest whole pixels of its k times prescale. */
+static float WidescreenRestOnOutput(float shift, float per_pixel, Uint32 k) {
+    if (!(per_pixel > 0.0f))
+        return shift;
+    k = SDL_max(k, 1u);
+    const float output = SDL_roundf(shift * per_pixel);
+    return SDL_roundf(output / per_pixel * (float)k) / (float)k;
+}
+
 #ifdef PE_PS5
 /* Unsqueezed CPU equivalent of WidescreenFieldStep. Quantize at the actual
  * destination grid; retain the fractional remainder for presentation. */
@@ -2126,7 +2452,7 @@ static bool RefreshWindowSwapchain(void) {
 }
 
 static void PlatformBackend_Present(void) {
-    frame_presented=false;present_commit_pending=false;
+    frame_presented=false;present_commit_pending=false;driver_present_pending=false;
     if(host_clock_pause_depth||SDL_GetAtomicInt(&app_in_background)){present_window_start=0;present_window_frames=present_window_mid=0;actual_present_fps=0;Psyz_GpuResetInterpolation();}
     if (gpu_failed) return;
     if (UseSoftwareBackend()) {
@@ -2242,15 +2568,23 @@ static void PlatformBackend_Present(void) {
         !RefreshWindowSwapchain()) {
         can_present = false;
     }
-    if(ws_capture_active)interp_present_mid=false;
-    else {
+    /* A widescreen readback redraws the already selected display image.
+     * Preserve its midpoint without advancing presentation phase or counts. */
+    if(!ws_capture_active) {
         interp_present_mid=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
             interpolated_scale==internal_res&&interp_next_y>=0&&interp_next_y<=VRAM_H-display_size.y&&
             !display_rgb24&&
 #ifdef PE_PS5_GPU_NATIVE
             !native_movie_active&&
 #endif
-            !debug_show_vram&&game_speed==1&&interp_phase++==1;
+            !debug_show_vram&&game_speed==1;
+        if(interp_present_mid){
+            /* Keep the midpoint on extra display refreshes (e.g. 60 Hz
+             * presentation against the original 59.94 Hz game clock).
+             * Returning to the old display buffer would reverse motion. */
+            interp_present_mid=interp_phase!=0;
+            interp_phase=1;
+        }
         if(interp_present_mid)++interpolated_present_count;
     }
 
@@ -2259,10 +2593,16 @@ static void PlatformBackend_Present(void) {
        native_movie_active||
 #endif
        game_speed!=1)Psyz_GpuResetInterpolation();
-    SDL_GPUTexture* rgb24 =
-        disp_on && display_rgb24 && !debug_show_vram && (ws_capture_active || can_present)
-            ? PrepareRgb24Display()
-            : NULL;
+    MovieFrame *movie = disp_on && !debug_show_vram ? FindMovieFrame(display_area.y) : NULL;
+    SDL_GPUTexture *rgb24 = NULL;
+    bool replacing_movie = false;
+    if (disp_on && !debug_show_vram && (ws_capture_active || can_present)) {
+        if (movie) {
+            rgb24 = UploadDisplayImage(&movie->gpu, movie->surface, movie->generation);
+            replacing_movie = rgb24 != NULL;
+        }
+        if (!rgb24 && display_rgb24) rgb24 = PrepareRgb24Display();
+    }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         finish_time = SDL_GetPerformanceCounter();
@@ -2286,7 +2626,7 @@ static void PlatformBackend_Present(void) {
 #endif
         }
         if (swapchain) {
-            if (!ws_capture_active){frame_presented=true;present_commit_pending=!host_clock_pause_depth;present_commit_mid=interp_present_mid;}
+            if (!ws_capture_active){driver_present_pending=true;frame_presented=true;present_commit_pending=!host_clock_pause_depth;present_commit_mid=interp_present_mid;}
             if (!disp_on) {
                 const SDL_GPUColorTargetInfo blank_target = {
                     .texture = swapchain,
@@ -2311,11 +2651,12 @@ static void PlatformBackend_Present(void) {
                 };
                 if (rgb24)
                     src = (SDL_GPUBlitRegion){.texture = rgb24,
-                                              .w = title_present_active ? title_texture_width : display_size.x,
-                                              .h = title_present_active ? title_texture_height : display_size.y};
+                                              .w = replacing_movie ? movie->gpu.width : title_present_active ? title_gpu.width : display_size.x,
+                                              .h = replacing_movie ? movie->gpu.height : title_present_active ? title_gpu.height : display_size.y};
                 float game_aspect =
                     GetCurrentGameAspectRatio(display_size.x, display_size.y);
-                if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
+                if (replacing_movie) game_aspect = 4.0f / 3.0f;
+                else if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
 #ifdef PE_PS5_GPU_NATIVE
                 if(native_movie_active)game_aspect=4.0f/3.0f; /* Original PS1 video display aspect, independent of scene-wide mode. */
 #endif
@@ -2333,6 +2674,7 @@ static void PlatformBackend_Present(void) {
                 WndSize win = {(int)sc_w, (int)sc_h};
                 SDL_Rect dst = FitGameToWindow(game_aspect, win);
                 bool ws_view = false;
+                float ws_clip_left=0.0f,ws_clip_right=1.0f;
 #ifdef PE_PS5_GPU_NATIVE
                 bool fsr_wide_crop=false;
                 SDL_GPUBlitRegion fsr_wide_source={0};
@@ -2389,11 +2731,13 @@ static void PlatformBackend_Present(void) {
                     const float shown_l = SDL_max(view_l, left);
                     const float shown_r =
                         SDL_max(shown_l, SDL_min(view_r, right));
+                    ws_clip_left=SDL_clamp((shown_l-view_l)/(2.0f*half),0.0f,1.0f);
+                    ws_clip_right=SDL_clamp((shown_r-view_l)/(2.0f*half),0.0f,1.0f);
                     /* game x -> fraction of the squeezed buffer */
                     const float f0 =
-                        (pivot + (shown_l - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (view_l - rest_x - pivot) * WS_SQUEEZE) / w;
                     const float f1 =
-                        (pivot + (shown_r - rest_x - pivot) * WS_SQUEEZE) / w;
+                        (pivot + (view_r - rest_x - pivot) * WS_SQUEEZE) / w;
                     dst = FitGameToWindow(16.0f / 9.0f, win);
                     /* whole prescale factors from the view's size, so they
                      * hold while a picture end moves through the view */
@@ -2404,23 +2748,21 @@ static void PlatformBackend_Present(void) {
                     const Uint32 ky =
                         src.h > 2 ? ((Uint32)dst.h + src.h - 3) / (src.h - 2)
                                   : 1;
-                    const int dx0 =
-                        dst.x + (int)SDL_lroundf((shown_l - view_l) /
-                                                 (2.0f * half) * (float)dst.w);
-                    const int dx1 =
-                        dst.x + (int)SDL_lroundf((shown_r - view_l) /
-                                                 (2.0f * half) * (float)dst.w);
                     float sx0 = f0 * (float)src.w, sx1 = f1 * (float)src.w;
-                    if (sx1 > sx0 && dx1 > dx0) {
-                        dst.x = dx0;
-                        dst.w = dx1 - dx0;
-                    } else {
-                        sx0 = 0.0f;
-                        sx1 = (float)src.w;
-                    }
                     /* a buffer pixel off the top and bottom leaves room to
                      * show the room up to half a pixel up or down */
-                    const float sy = rest_y * (float)n;
+                    float sy = rest_y * (float)n;
+                    /* The view is sharp: a shift by part of an output row
+                     * shows as a whole row in some bands of the screen and
+                     * as none or a blend in others, so things a few bands
+                     * apart shook against each other while a camera panned
+                     * (a chest's lid on its body). Shown by whole output
+                     * rows, the picture moves as one. Across, the 4/3
+                     * stretch moves edges unevenly for whole-pixel pans as
+                     * much, so the rest keeps its finer steps there. */
+                    if (src.h > 2)
+                        sy = WidescreenRestOnOutput(
+                            sy, (float)dst.h / (float)(src.h - 2), ky);
                     ws_view = true;
 #ifdef PE_PS5_GPU_NATIVE
                     fsr_wide_crop=fsr1_requested;
@@ -2485,6 +2827,7 @@ static void PlatformBackend_Present(void) {
                                       : SDL_GPU_FILTER_NEAREST,
                 };
                 SDL_BlitGPUTexture(cmd, &blit);
+                if (ws_view) MaskWidescreenEnds(cmd,swapchain,dst,ws_clip_left,ws_clip_right);
 #ifdef PE_PS5_GPU_NATIVE
                 EndCommittedPresentation(&committed_scope);
 #endif
@@ -2574,12 +2917,15 @@ static void QuitPlatform(void) {
         DialogueFontDestroy();
         if (sprite_atlas_texture) SDL_ReleaseGPUTexture(device,sprite_atlas_texture);
         sprite_atlas_texture=NULL;sprite_atlas_cells=0;
+        page_hd.active=false;page_hd.reserved=false;page_hd_wins=0;
         sprite_atlas_count=0;sprite_atlas_bytes=0;next_sprite_atlas=NULL;
         if (sprite_atlas_sampler) SDL_ReleaseGPUSampler(device,sprite_atlas_sampler);
         sprite_atlas_sampler=NULL;
         if (ws_capture)
             SDL_ReleaseGPUTexture(device, ws_capture);
         ws_capture = NULL;
+        if (ws_black) SDL_ReleaseGPUTexture(device,ws_black);
+        ws_black=NULL;
         ws_capture_width = ws_capture_height = 0;
         ws_capture_active = false;
         for (int i = 0; i < BLEND_COUNT; i++) {
@@ -2593,10 +2939,9 @@ static void QuitPlatform(void) {
             pipe_clear = NULL;
         }
         Psyz_VideoSetRgb24Backdrop(NULL,NULL,0,0,0,0);
-        if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
-        if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
-        title_texture=NULL;title_transfer=NULL;title_uploaded=title_generation=0;
-        title_texture_width=title_texture_height=0;
+        Psyz_VideoSetMovieFrame(-1, NULL);
+        ReleaseDisplayImage(&title_gpu);
+        title_generation = 0;
         ReleaseTransientDisplayTextures();
         Psyz_GpuResetInterpolation();
         if (rgb24_display) {
@@ -2791,7 +3136,8 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     Draw_FlushBuffer();
     if (!UseSoftwareBackend())
         ApplyPendingInternalRes();
-    if (!UseSoftwareBackend() && display_rgb24 && title_image) {
+    MovieFrame *movie = disp_on && !debug_show_vram ? FindMovieFrame(display_area.y) : NULL;
+    if (!movie && !UseSoftwareBackend() && display_rgb24 && title_image) {
         u8 *native=Sdl3Common_ReadRgb24(display_area.x,display_area.y,display_size.x,display_size.y);
         SDL_Surface *enhanced=native?BuildTitleDisplay(native):NULL;free(native);
         if (enhanced) {
@@ -2801,14 +3147,14 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
             *w=enhanced->w;*h=enhanced->h;return pixels;
         }
     }
-    if (UseSoftwareBackend() || display_rgb24 ||
-        (!scaled_vram_render && !widescreen && !interp_present_mid)) {
+    if (!movie && (UseSoftwareBackend() || display_rgb24 ||
+        (!scaled_vram_render && !widescreen && !interp_present_mid))) {
         unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
         if (!pixels)
             *w = *h = 0;
         return pixels;
     }
-    if ((!scaled_vram_render && !widescreen && !interp_present_mid) || display_area.x < 0 ||
+    if ((!movie && !scaled_vram_render && !widescreen && !interp_present_mid) || display_area.x < 0 ||
         display_area.y < 0 || display_size.x <= 0 || display_size.y <= 0 ||
         display_area.x > VRAM_W - display_size.x ||
         display_area.y > VRAM_H - display_size.y)
@@ -2817,8 +3163,14 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     unsigned width = (unsigned)display_size.x * output_scale;
     unsigned height = (unsigned)display_size.y * output_scale;
     bool capture_widescreen = widescreen && !debug_show_vram;
-    if (capture_widescreen) {
-        width = (height * 16u + 4u) / 9u;
+    if (capture_widescreen || movie) {
+        if (movie) {
+            height = movie->surface->h;
+            width = (height * (widescreen ? 16u : 4u) + (widescreen ? 4u : 1u)) /
+                    (widescreen ? 9u : 3u);
+        } else {
+            width = (height * 16u + 4u) / 9u;
+        }
         if (!ws_capture || ws_capture_width != width ||
             ws_capture_height != height) {
             if (ws_capture)
@@ -2867,7 +3219,7 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         .y = (Uint32)(interp_present_mid?interp_next_y:display_area.y) * internal_res,
         .w = (Uint32)display_size.x * internal_res,
         .h = (Uint32)display_size.y * internal_res};
-    if (capture_widescreen)
+    if (capture_widescreen || movie)
         visible =
             (SDL_GPUBlitRegion){.texture = ws_capture, .w = width, .h = height};
     else if (antialiasing) {
@@ -3319,11 +3671,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     }
     display_double_height = mode->vertical_resolution;
     display_size.y = set_disp_vert * (display_double_height ? 2 : 1);
-    if (UseSoftwareBackend()) {
-        UpdateTargetFramerate(mode->pal ? VSYNC_PAL : VSYNC_NTSC);
-        return;
-    }
-    ApplyDisplayPendingChanges();
+    if (!UseSoftwareBackend())
+        ApplyDisplayPendingChanges();
 
     double new_target_fps = mode->pal ? VSYNC_PAL : VSYNC_NTSC;
     if (new_target_fps != target_frame_rate) {
@@ -3335,49 +3684,6 @@ int Draw_ExequeSync() { return 0; }
 
 // optimization to avoid sampling the VRAM on an untextured batch draw
 static bool batch_has_texture = false;
-/* Retain the PS1's signed 12-fractional-bit attribute gradients while the
- * GPU rasterizes the geometry, including at higher internal resolutions. */
-static void SetPolygonAttributes(Vertex* vertices) {
-    Vertex* a = &vertices[0];
-    Vertex* b = &vertices[1];
-    Vertex* c = &vertices[2];
-    Vertex* anchor =
-        b->x <= a->x ? (c->x <= b->x ? c : b) : (c->x < a->x ? c : a);
-    int64_t area = (int64_t)(b->x - a->x) * (c->y - a->y) -
-                   (int64_t)(b->y - a->y) * (c->x - a->x);
-    for (int i = 0; i < 3; ++i) {
-        vertices[i].uv_bounds[0] = SDL_min(a->u, SDL_min(b->u, c->u));
-        vertices[i].uv_bounds[1] = SDL_min(a->v, SDL_min(b->v, c->v));
-        vertices[i].uv_bounds[2] = SDL_max(a->u, SDL_max(b->u, c->u));
-        vertices[i].uv_bounds[3] = SDL_max(a->v, SDL_max(b->v, c->v));
-    }
-    const int av[5] = {a->u, a->v, a->r, a->g, a->b};
-    const int bv[5] = {b->u, b->v, b->r, b->g, b->b};
-    const int cv[5] = {c->u, c->v, c->r, c->g, c->b};
-    const int origin[5] = {
-        anchor->u, anchor->v, anchor->r, anchor->g, anchor->b};
-    for (int attribute = 0; attribute < 5; ++attribute) {
-        int64_t dx = 0, dy = 0;
-        if (area) {
-            dx = ((int64_t)(bv[attribute] - av[attribute]) * (c->y - a->y) -
-                  (int64_t)(cv[attribute] - av[attribute]) * (b->y - a->y)) *
-                 4096 / area;
-            dy = ((int64_t)(cv[attribute] - av[attribute]) * (b->x - a->x) -
-                  (int64_t)(bv[attribute] - av[attribute]) * (c->x - a->x)) *
-                 4096 / area;
-        }
-        for (int vertex = 0; vertex < 3; ++vertex) {
-            float value = (float)(origin[attribute] * 4096 + 2048 +
-                                  (vertices[vertex].x - anchor->x) * dx +
-                                  (vertices[vertex].y - anchor->y) * dy) /
-                          4096.0f;
-            if (attribute < 2)
-                vertices[vertex].polygon_uv[attribute] = value;
-            else
-                vertices[vertex].polygon_rgb[attribute - 2] = value;
-        }
-    }
-}
 /* A future ownership-aware software consumer calls Take exactly once before
  * dispatch; these wrappers expose real data without enabling presentation. */
 int Psyz_CpuMaterialSample2x(unsigned px,unsigned py,uint16_t native,uint16_t out[4]) {
@@ -3388,6 +3694,12 @@ void Psyz_CpuMaterialEndPrimitive(void) { (void)CpuMaterialTake(); }
 int Draw_PushPrim(u_long* packets, int max_len) {
     int dialogue_glyph=dialogue_next_glyph,font_context=dialogue_next_context;unsigned font_crop=dialogue_next_crop,font_width=dialogue_next_width;dialogue_next_glyph=dialogue_next_context=-1;
     if (UseSoftwareBackend()) {
+        /* Underlays are scaled GPU presentation only. Never feed their
+         * placeholder PS1 texture into the native software framebuffer. */
+        if(next_sprite_extension==1){
+            next_sprite_extension=0;Psyz_CpuMaterialEndPrimitive();
+            return max_len>=3 && (((unsigned)packets[0]>>24)&~3u)==0x7cu ? 3 : 0;
+        }
 #ifdef PE_PS5
         CpuWideContext();
         if(next_sprite_extension && (max_len<3 || (((unsigned)packets[0]>>24)&~3u)!=0x7cu))SoftwareRasterizer_WideReject();
@@ -3414,10 +3726,13 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool isTile = (code & 0x40) && (code & 0x20);
     bool isTextured = (code & TEXTURED) != 0;
     bool isGouraud = (code & GOURAUD) != 0;
-    SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C) ? next_sprite_atlas : NULL;
+    SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C && next_sprite_tile_u<0) ? next_sprite_atlas : NULL;
+    SpriteAtlas *poly_atlas=(isPoly && isTextured && next_sprite_tile_u>=0) ? next_sprite_atlas : NULL;
+    int poly_tile_u=next_sprite_tile_u,poly_tile_v=next_sprite_tile_v;
     unsigned atlas_cell=next_sprite_cell;
-    bool atlas_extension=next_sprite_extension;
+    unsigned atlas_extension=next_sprite_extension;
     next_sprite_atlas=NULL;next_sprite_extension=false;
+    next_sprite_tile_u=-1;
     /* One shared atlas: selecting a replacement must not split PS1 batches. */
 
     bool isShadeTex = !((code & 1) && isTextured && !isLine);
@@ -3429,6 +3744,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
     for (int i=0;i<6;++i) {
+        memset(v[i].polygon_gradient, 0, sizeof(v[i].polygon_gradient));
+        memset(v[i].polygon_coverage, 0, sizeof(v[i].polygon_coverage));
         v[i].hd_uv[0]=v[i].hd_uv[1]=0;
         v[i].hd_uv[2]=(atlas_extension&&!atlas&&isTile&&isTextured&&(code&~3)==0x7c)?3:0;
         v[i].pgxp_pos[0] = 0.0f;
@@ -3571,6 +3888,33 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 }
             }
             #endif
+            /* A polygon cut from a 16x16 sprite: each corner samples the HD cell where
+             * its texel sits in the tile (texels past 255 wrap, as the u8 UVs do). */
+            if (poly_atlas && sprite_atlases_enabled) {
+                unsigned cell=atlas_cell+poly_atlas->first_cell;
+                float left=(float)((cell%HD_ATLAS_COLUMNS)*68+2),top=(float)((cell/HD_ATLAS_COLUMNS)*68+2);
+                for (int i=0;i<nVertices;++i) {
+                    int du=((int)vertex_cur[i].u-poly_tile_u)&255,dv=((int)vertex_cur[i].v-poly_tile_v)&255;
+                    if (du>16) du=0; if (dv>16) dv=0;
+                    vertex_cur[i].hd_uv[0]=(left+du*4.0f)/(float)HD_ATLAS_WIDTH;
+                    vertex_cur[i].hd_uv[1]=(top+dv*4.0f)/(float)HD_ATLAS_HEIGHT;
+                    vertex_cur[i].hd_uv[2]=1.0f;
+                }
+            } else if (page_hd.active && sprite_atlases_enabled && isTextured &&
+                       (tpage&31u)==page_hd.tpage && (unsigned)(clut>>6)>=page_hd.clut_y0 &&
+                       (unsigned)(clut>>6)<=page_hd.clut_y1) {
+                /* A polygon from the HD page: each corner samples the picture where its texel sits
+                 * (mode 1, as HD sprite tiles: the picture where the texel matches its reference). */
+                float left=(float)(PAGE_HD_COL0*68u+2u),top=(float)(PAGE_HD_ROW0*68u+2u);
+                for (int i=0;i<nVertices;++i) {
+                    float k=(float)page_hd.size/256.0f,ox=0.0f,oy=0.0f;
+                    unsigned w=(((unsigned)clut>>6)-page_hd.clut_y0)*16u+((unsigned)clut&15u);
+                    if (w<page_hd_wins) { ox=page_hd_win[w][0]; oy=page_hd_win[w][1]; k=(float)page_hd_win[w][2]/256.0f; }
+                    vertex_cur[i].hd_uv[0]=(left+ox+((float)(vertex_cur[i].u&255u)+0.5f)*k)/(float)HD_ATLAS_WIDTH;
+                    vertex_cur[i].hd_uv[1]=(top+oy+((float)(vertex_cur[i].v&255u)+0.5f)*k)/(float)HD_ATLAS_HEIGHT;
+                    vertex_cur[i].hd_uv[2]=1.0f;
+                }
+            }
             if (isTextured) DuckApply(vertex_cur,(unsigned)nVertices,tpage,clut);
             if(dialogue_glyph>=0&&font_context==1&&nVertices==4&&tpage==5&&clut==0x089c){
                 unsigned u=(dialogue_glyph%21)*12+font_crop,vv=(dialogue_glyph/21)*12;int valid=1;
@@ -3583,6 +3927,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             if (nVertices == 4) {
                 Vertex second[3] = {vertex_cur[1], vertex_cur[3],
                                     vertex_cur[2]};
+                if (code & SEMITRANSP) {
+                    second[0].a = 0x81;
+                }
                 memcpy(vertex_cur + 3, second, sizeof(second));
                 index_cur[3] = n_vertices + 3;
                 index_cur[4] = n_vertices + 4;
@@ -3685,7 +4032,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 q[3].r = cr[s];
                 q[3].g = cg[s];
                 q[3].b = cb[s];
-                q[3].a = ca[s];
+                q[3].a = (code & SEMITRANSP) ? 0x81 : ca[s];
                 q[1].r = cr[s + 1];
                 q[1].g = cg[s + 1];
                 q[1].b = cb[s + 1];
@@ -3708,9 +4055,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 index_cur[0] = base + 0;
                 index_cur[1] = base + 1;
                 index_cur[2] = base + 2;
-                index_cur[3] = base + 0;
-                index_cur[4] = base + 2;
-                index_cur[5] = base + 3;
+                index_cur[3] = base + 3;
+                index_cur[4] = base + 0;
+                index_cur[5] = base + 2;
                 Draw_EnqueueBuffer(4, 6);
             }
         }
@@ -3789,23 +4136,38 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         }
         VRGBA(vertex_cur[1]) = VRGBA(vertex_cur[2]) = VRGBA(vertex_cur[3]) =
             VRGBA(vertex_cur[0]);
+        if (code & SEMITRANSP) {
+            vertex_cur[3].a = 0x81;
+        }
         if (!isTextured) {
             WidenFullWidthFill(vertex_cur, 4);
         }
         index_cur[0] = n_vertices + 0;
         index_cur[1] = n_vertices + 1;
         index_cur[2] = n_vertices + 2;
-        index_cur[3] = n_vertices + 1;
-        index_cur[4] = n_vertices + 3;
-        index_cur[5] = n_vertices + 2;
+        index_cur[3] = n_vertices + 3;
+        index_cur[4] = n_vertices + 2;
+        index_cur[5] = n_vertices + 1;
         if (atlas) {
             float width=(float)HD_ATLAS_WIDTH,height=(float)HD_ATLAS_HEIGHT;
             atlas_cell+=atlas->first_cell;
             float left=(float)((atlas_cell%HD_ATLAS_COLUMNS)*68+2),top=(float)((atlas_cell/HD_ATLAS_COLUMNS)*68+2);
+            unsigned alpha=sprite_atlas_cell_alpha[atlas_cell];
+            unsigned coverage=(atlas->static_hd_coverage || (atlas->selective_hd_coverage && (alpha&2)))?7:(alpha&1)?6:1;
             for (int i=0;i<4;++i) {
                 vertex_cur[i].hd_uv[0]=(left+((i&1)?64.0f:0.0f))/width;
                 vertex_cur[i].hd_uv[1]=(top+((i&2)?64.0f:0.0f))/height;
-                vertex_cur[i].hd_uv[2]=atlas_extension?(widescreen&&sprite_atlases_enabled?2:3):(sprite_atlases_enabled?1:0);
+                if (atlas_extension) {
+                    // Presentation-only margins do not consume native UV
+                    // bounds. Keep their interpolated UVs local to the cell;
+                    // carry the exact integer atlas origin without interpolation.
+                    vertex_cur[i].hd_uv[0]=(i&1)?64.0f:0.0f;
+                    vertex_cur[i].hd_uv[1]=(i&2)?64.0f:0.0f;
+                    vertex_cur[i].uv_bounds[0]=left;
+                    vertex_cur[i].uv_bounds[1]=top;
+                }
+                vertex_cur[i].hd_uv[2]=atlas_extension?((widescreen||atlas_extension==1)&&sprite_atlases_enabled?2:3):
+                    (sprite_atlases_enabled?coverage:0);
             }
         }
         for (int i = 0; i < 4; ++i) {
@@ -3976,7 +4338,15 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     SDL_EndGPUCopyPass(copy);
     MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
     DuckUpload((SDL_Rect){rect->x,rect->y,rect->w,rect->h},(const unsigned short *)p);
-    SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    int max_x = SDL_max(640, SDL_max(display_area.x + display_size.x,
+                                     scissor_rect.x + scissor_rect.w));
+    int max_y = SDL_max(480, SDL_max(display_area.y + display_size.y,
+                                     scissor_rect.y + scissor_rect.h));
+    if (rect->x < max_x && rect->y < max_y) {
+        SyncNativeVramToScaled(
+            rect->x, rect->y, SDL_min(rect->w, max_x - rect->x),
+            SDL_min(rect->h, max_y - rect->y));
+    }
 }
 
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
@@ -3994,6 +4364,33 @@ void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
         return;
     }
     if (!device || !vram_render) {
+        return;
+    }
+    bool overlap_pending =
+        n_vertices > 0 && rect->x < scissor_rect.x + scissor_rect.w &&
+        scissor_rect.x < rect->x + rect->w &&
+        rect->y < scissor_rect.y + scissor_rect.h &&
+        scissor_rect.y < rect->y + rect->h;
+    if (overlap_pending) {
+        Draw_FlushBuffer();
+    }
+    bool all_known = true;
+    for (int y = 0; y < rect->h && all_known; ++y) {
+        size_t o = (size_t)(rect->y + y) * VRAM_W + rect->x;
+        for (int x = 0; x < rect->w; ++x) {
+            if (!duck_known[o + x]) {
+                all_known = false;
+                break;
+            }
+        }
+    }
+    if (all_known) {
+        u16* dst = (u16*)p;
+        for (int y = 0; y < rect->h; ++y) {
+            memcpy(dst + (size_t)y * rect->w,
+                   duck_words + (size_t)(rect->y + y) * VRAM_W + rect->x,
+                   (size_t)rect->w * sizeof(u16));
+        }
         return;
     }
     Draw_FlushBuffer(); // flush primitives before operating with the VRAM
@@ -4100,6 +4497,133 @@ void Draw_ResetBuffer(void) {
     vertex_cur = vertex_buf;
     index_cur = index_buf;
     batch_has_texture = false;
+}
+
+typedef struct {
+    int rx0, ry0, rx1, ry1;
+    float x[3], y[3];
+} SemiTri;
+
+static SemiTri ComputeSemiTri(
+    int tri_start, bool midpoint, unsigned target_index, unsigned target_scale,
+    float sub_x, float sub_y, float grid_scale_x, float target_centre,
+    float ws_squeeze) {
+    SemiTri t;
+    for (int k = 0; k < 3; ++k) {
+        const Vertex* v = midpoint
+                              ? &interpolated_vertices[index_buf[tri_start + k]]
+                              : &vertex_buf[index_buf[tri_start + k]];
+        float bias =
+            ((v->t & TPAGE_POLYGON) && target_scale == 1) ? 0.5f : 0.0f;
+        bool use_pgxp =
+            (midpoint ||
+             (target_index &&
+              (geometry_correction || effect_geometry_correction) &&
+              (v->t & TPAGE_POLYGON))) &&
+            v->pgxp_pos[2] > 0.0f;
+        float vx = (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
+        float vy = (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
+        float x = draw_offset.x + (vx + bias) * grid_scale_x;
+        x = (target_centre + (x - target_centre) * ws_squeeze) * target_scale;
+        float y = (draw_offset.y + vy + bias) * target_scale;
+        t.x[k] = x;
+        t.y[k] = y;
+    }
+    float min_x = SDL_min(t.x[0], SDL_min(t.x[1], t.x[2]));
+    float max_x = SDL_max(t.x[0], SDL_max(t.x[1], t.x[2]));
+    float min_y = SDL_min(t.y[0], SDL_min(t.y[1], t.y[2]));
+    float max_y = SDL_max(t.y[0], SDL_max(t.y[1], t.y[2]));
+    t.rx0 = (int)SDL_floorf(min_x);
+    t.ry0 = (int)SDL_floorf(min_y);
+    t.rx1 = (int)SDL_ceilf(max_x);
+    t.ry1 = (int)SDL_ceilf(max_y);
+    return t;
+}
+
+static bool SemiTrisDisjoint(const SemiTri* a, const SemiTri* b) {
+    if (a->rx1 <= b->rx0 || b->rx1 <= a->rx0 ||
+        a->ry1 <= b->ry0 || b->ry1 <= a->ry0) {
+        return true;
+    }
+    int shared_a[2], shared_b[2], n_shared = 0;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            if (a->x[i] == b->x[j] && a->y[i] == b->y[j]) {
+                if (n_shared < 2) {
+                    shared_a[n_shared] = i;
+                    shared_b[n_shared] = j;
+                }
+                n_shared++;
+                break;
+            }
+        }
+    }
+    if (n_shared == 2) {
+        int oa = 3 - shared_a[0] - shared_a[1];
+        int ob = 3 - shared_b[0] - shared_b[1];
+        float px = a->x[shared_a[0]], py = a->y[shared_a[0]];
+        float dx = a->x[shared_a[1]] - px, dy = a->y[shared_a[1]] - py;
+        float ca = dx * (a->y[oa] - py) - dy * (a->x[oa] - px);
+        float cb = dx * (b->y[ob] - py) - dy * (b->x[ob] - px);
+        if ((ca > 0.0f && cb < 0.0f) || (ca < 0.0f && cb > 0.0f)) {
+            return true;
+        }
+    }
+    const SemiTri* pairs[2][2] = {{a, b}, {b, a}};
+    for (int p = 0; p < 2; ++p) {
+        const SemiTri* t1 = pairs[p][0];
+        const SemiTri* t2 = pairs[p][1];
+        for (int i = 0; i < 3; ++i) {
+            int j = (i + 1) % 3;
+            int k = (i + 2) % 3;
+            float px = t1->x[i], py = t1->y[i];
+            float dx = t1->x[j] - px, dy = t1->y[j] - py;
+            float c_in = dx * (t1->y[k] - py) - dy * (t1->x[k] - px);
+            if (c_in == 0.0f)
+                continue;
+            if (c_in < 0.0f) {
+                dx = -dx;
+                dy = -dy;
+            }
+            float margin = -(SDL_fabsf(dx) + SDL_fabsf(dy));
+            if (dx * (t2->y[0] - py) - dy * (t2->x[0] - px) <= margin &&
+                dx * (t2->y[1] - py) - dy * (t2->x[1] - px) <= margin &&
+                dx * (t2->y[2] - py) - dy * (t2->x[2] - px) <= margin) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void MergeSemiCopyRect(
+    SDL_Rect* copy_rects, int* num_rects, SDL_Rect r, unsigned target_scale) {
+    bool merged = true;
+    int64_t pad_area = (int64_t)1024 * target_scale * target_scale;
+    while (merged) {
+        merged = false;
+        for (int i = 0; i < *num_rects; ++i) {
+            int ux0 = SDL_min(r.x, copy_rects[i].x);
+            int uy0 = SDL_min(r.y, copy_rects[i].y);
+            int ux1 = SDL_max(r.x + r.w, copy_rects[i].x + copy_rects[i].w);
+            int uy1 = SDL_max(r.y + r.h, copy_rects[i].y + copy_rects[i].h);
+            bool overlaps = r.x < copy_rects[i].x + copy_rects[i].w &&
+                            copy_rects[i].x < r.x + r.w &&
+                            r.y < copy_rects[i].y + copy_rects[i].h &&
+                            copy_rects[i].y < r.y + r.h;
+            int64_t union_area = (int64_t)(ux1 - ux0) * (uy1 - uy0);
+            int64_t sum_area = (int64_t)r.w * r.h +
+                               (int64_t)copy_rects[i].w * copy_rects[i].h +
+                               pad_area;
+            if (overlaps || union_area <= sum_area) {
+                r = (SDL_Rect){ux0, uy0, ux1 - ux0, uy1 - uy0};
+                copy_rects[i] = copy_rects[--(*num_rects)];
+                merged = true;
+                break;
+            }
+        }
+    }
+    copy_rects[(*num_rects)++] = r;
 }
 
 void Draw_FlushBuffer(void) {
@@ -4209,16 +4733,89 @@ void Draw_FlushBuffer(void) {
         if(midpoint&&field_picture>=0){sub_x=ws_mid_qx[field_picture];sub_y=ws_mid_qy[field_picture];}
         SDL_GPUTexture* destination_sample =
             target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
+        enum { MAX_SEMI_BATCH_TRIS = 256 };
+        SemiTri batch_tris[MAX_SEMI_BATCH_TRIS];
+        SDL_Rect copy_rects[MAX_SEMI_BATCH_TRIS];
+        const int clip_x0 = SDL_max(0, clip.x) * (int)target_scale;
+        const int clip_y0 = SDL_max(0, clip.y) * (int)target_scale;
+        const int clip_x1 = SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale;
+        const int clip_y1 = SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale;
+        const float grid_scale_x = GetDrawGridXScale();
+        const u32 dither_origin = WidescreenDitherOrigin(
+            sub_x * grid_scale_x * ws_squeeze, sub_y, target_scale);
         int start = 0;
         while (start < n_indices) {
             bool semi = vertex_buf[index_buf[start]].a != 0xFF;
             int end = start + 3;
+            int num_batch_tris = 0;
+            int num_copy_rects = 0;
             if (!semi) {
                 while (end < n_indices && vertex_buf[index_buf[end]].a == 0xFF)
                     end += 3;
             } else {
-                while (end < n_indices && vertex_buf[index_buf[end]].a == 0x81)
-                    end += 3;
+                int p_start = start;
+                while (p_start < n_indices &&
+                       vertex_buf[index_buf[p_start]].a != 0xFF) {
+                    int p_end = p_start + 3;
+                    while (p_end < n_indices &&
+                           vertex_buf[index_buf[p_end]].a == 0x81)
+                        p_end += 3;
+                    int prim_tris = (p_end - p_start) / 3;
+                    if (p_start > start &&
+                        (prim_tris > 2 ||
+                         num_batch_tris + prim_tris > MAX_SEMI_BATCH_TRIS)) {
+                        break;
+                    }
+                    SemiTri cand[2];
+                    int px0 = clip_x1, py0 = clip_y1, px1 = clip_x0,
+                        py1 = clip_y0;
+                    bool overlap = false;
+                    for (int t = 0; t < prim_tris; ++t) {
+                        SemiTri st = ComputeSemiTri(
+                            p_start + t * 3, midpoint, target_index,
+                            target_scale, sub_x, sub_y, grid_scale_x,
+                            target_centre, ws_squeeze);
+                        px0 = SDL_min(px0, st.rx0 - 1);
+                        py0 = SDL_min(py0, st.ry0 - 1);
+                        px1 = SDL_max(px1, st.rx1 + 1);
+                        py1 = SDL_max(py1, st.ry1 + 1);
+                        if (p_start > start && prim_tris <= 2) {
+                            for (int b = 0; b < num_batch_tris; ++b) {
+                                if (!SemiTrisDisjoint(&st, &batch_tris[b])) {
+                                    overlap = true;
+                                    break;
+                                }
+                            }
+                            if (overlap)
+                                break;
+                        }
+                        if (t < 2)
+                            cand[t] = st;
+                    }
+                    if (overlap)
+                        break;
+                    px0 = SDL_max(px0, clip_x0);
+                    py0 = SDL_max(py0, clip_y0);
+                    px1 = SDL_min(px1, clip_x1);
+                    py1 = SDL_min(py1, clip_y1);
+                    if (px1 > px0 && py1 > py0) {
+                        for (int t = 0; t < prim_tris && t < 2 &&
+                                        num_batch_tris < MAX_SEMI_BATCH_TRIS;
+                             ++t) {
+                            batch_tris[num_batch_tris++] = cand[t];
+                        }
+                        MergeSemiCopyRect(
+                            copy_rects, &num_copy_rects,
+                            (SDL_Rect){px0, py0, px1 - px0, py1 - py0},
+                            target_scale);
+                    }
+                    end = p_end;
+                    p_start = p_end;
+                }
+                if (num_copy_rects == 0) {
+                    start = end;
+                    continue;
+                }
             }
             /* Three sampled textures, up to two draws (color and mask). Reserve
              * both heaps' worst-case sampler use before any destination copy.
@@ -4229,54 +4826,18 @@ void Draw_FlushBuffer(void) {
                 return;
             }
             if (semi) {
-                int x0 = (clip.x + clip.w) * (int)target_scale;
-                int y0 = (clip.y + clip.h) * (int)target_scale;
-                int x1 = clip.x * (int)target_scale;
-                int y1 = clip.y * (int)target_scale;
-                for (int i = start; i < end; ++i) {
-                    const Vertex* v = midpoint ? &interpolated_vertices[index_buf[i]] : &vertex_buf[index_buf[i]];
-                    float bias = ((v->t & TPAGE_POLYGON) && target_scale == 1)
-                                     ? 0.5f
-                                     : 0.0f;
-                    bool use_pgxp =
-                        (midpoint ||
-                         (target_index &&
-                          (geometry_correction || effect_geometry_correction) &&
-                          (v->t & TPAGE_POLYGON))) &&
-                        v->pgxp_pos[2] > 0.0f;
-                    float vx =
-                        (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
-                    float vy =
-                        (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
-                    float x = draw_offset.x + (vx + bias) * GetDrawGridXScale();
-                    x = (target_centre + (x - target_centre) * ws_squeeze) *
-                        target_scale;
-                    float y = (draw_offset.y + vy + bias) * target_scale;
-                    x0 = SDL_min(x0, (int)SDL_floorf(x) - 1);
-                    x1 = SDL_max(x1, (int)SDL_ceilf(x) + 1);
-                    y0 = SDL_min(y0, (int)SDL_floorf(y) - 1);
-                    y1 = SDL_max(y1, (int)SDL_ceilf(y) + 1);
-                }
-                x0 = SDL_max(x0, SDL_max(0, clip.x) * (int)target_scale);
-                y0 = SDL_max(y0, SDL_max(0, clip.y) * (int)target_scale);
-                x1 = SDL_min(
-                    x1, SDL_min(VRAM_W, clip.x + clip.w) * (int)target_scale);
-                y1 = SDL_min(
-                    y1, SDL_min(VRAM_H, clip.y + clip.h) * (int)target_scale);
-                if (x1 <= x0 || y1 <= y0) {
-                    start = end;
-                    continue;
-                }
                 SDL_GPUCopyPass* blend_copy = SDL_BeginGPUCopyPass(cmd);
-                SDL_GPUTextureLocation from = {
-                    .texture = render_target,
-                    .x = (Uint32)x0,
-                    .y = (Uint32)y0};
-                SDL_GPUTextureLocation to = from;
-                to.texture = destination_sample;
-                SDL_CopyGPUTextureToTexture(
-                    blend_copy, &from, &to, (Uint32)(x1 - x0),
-                    (Uint32)(y1 - y0), 1, false);
+                for (int i = 0; i < num_copy_rects; ++i) {
+                    SDL_GPUTextureLocation from = {
+                        .texture = render_target,
+                        .x = (Uint32)copy_rects[i].x,
+                        .y = (Uint32)copy_rects[i].y};
+                    SDL_GPUTextureLocation to = from;
+                    to.texture = destination_sample;
+                    SDL_CopyGPUTextureToTexture(
+                        blend_copy, &from, &to, (Uint32)copy_rects[i].w,
+                        (Uint32)copy_rects[i].h, 1, false);
+                }
                 SDL_EndGPUCopyPass(blend_copy);
             }
             const SDL_GPUColorTargetInfo target = {
@@ -4325,7 +4886,8 @@ void Draw_FlushBuffer(void) {
                   (geometry_correction || effect_geometry_correction))
                      ? 1.0f
                      : 0.0f) +
-                    (midpoint ? 2.0f : 0.0f),
+                    (midpoint ? 2.0f : 0.0f) +
+                    (draw_grid_source_width != draw_grid_target_width ? 4.0f : 0.0f),
                 target_scale > 1 ? 1.0f : 0.0f,
                 ws_squeeze,
                 (target_centre - (float)draw_offset.x * (1.0f - grid_x)) / grid_x,
@@ -4338,7 +4900,8 @@ void Draw_FlushBuffer(void) {
                 draw_grid_source_width == draw_grid_target_width,
                 (target_index && model_filtering ? 1u : 0u) |
                     (target_index && sprite_filtering ? 4u : 0u) |
-                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                    (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+                    dither_origin};
             SDL_PushGPUFragmentUniformData(
                 cmd, 0, color_pass, sizeof(color_pass));
 
@@ -4355,7 +4918,8 @@ void Draw_FlushBuffer(void) {
                     draw_grid_source_width == draw_grid_target_width,
                     (target_index && model_filtering ? 1u : 0u) |
                     (target_index && sprite_filtering ? 4u : 0u) |
-                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u)};
+                        (dither_mode == PSYZ_DITHER_OFF ? 2u : 0u) |
+                    dither_origin};
                 SDL_PushGPUFragmentUniformData(
                     cmd, 0, mask_pass, sizeof(mask_pass));
                 SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
@@ -4424,7 +4988,12 @@ void Psyz_StateGpuEnd(void){if(pe_state_gpu_owned&&pe_state_gpu_thread==SDL_GetC
 /* Project-authored typed GPU environment. No device handles, raw structs or preference mutation. */
 static uint32_t StateGpuGet32(const unsigned char *p){return(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 static void StateGpuPut32(unsigned char *p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(v>>(i*8));}
-static uint64_t StateGpuAtlasIdentity(void){uint64_t h=1469598103934665603ull;for(unsigned i=0;i<sprite_atlas_count;i++){const SpriteAtlas *a=&sprite_atlases[i];uint64_t values[4]={a->key,a->columns,a->rows,a->first_cell};for(unsigned j=0;j<4;j++)for(unsigned k=0;k<8;k++){h^=(values[j]>>(k*8))&255;h*=1099511628211ull;}}return h;}
+static uint64_t StateGpuAtlasIdentity(void){uint64_t h=1469598103934665603ull;for(unsigned i=0;i<sprite_atlas_count;i++){const SpriteAtlas *a=&sprite_atlases[i];uint64_t values[4]={a->key,a->columns,a->rows,a->first_cell};for(unsigned j=0;j<4;j++)for(unsigned k=0;k<8;k++){h^=(values[j]>>(k*8))&255;h*=1099511628211ull;}
+    /* Preserve legacy identities; queued mode7 vertices require the same
+     * explicitly marked atlas when a typed GPU environment is restored. */
+    if(a->static_hd_coverage){h^=0x50454d3100000007ull;h*=1099511628211ull;}
+    if(a->selective_hd_coverage){h^=0x50454d3200000007ull;h*=1099511628211ull;
+        for(unsigned cell=0;cell<a->columns*a->rows;++cell){h^=(sprite_atlas_cell_alpha[a->first_cell+cell]&2)!=0;h*=1099511628211ull;}}}return h;}
 static uint32_t StateGpuPreferences(void){return (widescreen?1u:0u)|((unsigned)aspect_mode<<1)|(is_pal?16u:0u)|(antialiasing?32u:0u)|(model_filtering?64u:0u)|(geometry_correction?128u:0u)|(effect_geometry_correction?256u:0u)|(dynamic_lighting?512u:0u)|(sprite_atlases_enabled?1024u:0u)|(internal_res<<16);}
 uint32_t Psyz_StateGpuControlBlockers(void){uint32_t bits=0;
     if(host_clock_pause_depth)bits|=1u;if(SDL_GetAtomicInt(&quit_requested))bits|=2u;if(SDL_GetAtomicInt(&app_in_background))bits|=4u;

@@ -4,6 +4,7 @@
 #include <psyz/log.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -225,7 +226,17 @@ static int parse_cue_file(const char* cue_path) {
         0; // Absolute sector where current file starts
 
     g_track_count = 0;
-    while (fgets(full_line, sizeof(full_line), fp)) {
+    for (;;) {
+        /* fgets appends a NUL. A second NUL means the input contains binary data. */
+        memset(full_line, 0xff, sizeof(full_line));
+        errno = 0;
+        if (!fgets(full_line, sizeof(full_line), fp)) break;
+        size_t used = strlen(full_line) + 1;
+        if (memchr(full_line + used, 0, sizeof(full_line) - used)) {
+            ERRORF("Binary data in CUE file %s", cue_path);
+            fclose(fp);
+            return -1;
+        }
         char* line = str_trim(full_line);
         if (strncmp(line, "FILE", 4) == 0) {
             // Before switching to new file, calculate size of previous file
@@ -309,7 +320,19 @@ static int parse_cue_file(const char* cue_path) {
             WARNF("CUE line not recognized: %s", line);
         }
     }
-    fclose(fp);
+    /* A readable prefix is not a complete CUE. Always close the FILE, but
+     * propagate either IO failure so the mount owner clears partial tracks. */
+    int read_errno = errno;
+    int read_failed = ferror(fp);
+    int read_eof = feof(fp);
+    errno = 0;
+    int close_failed = fclose(fp);
+    int close_errno = errno;
+    if (read_failed || close_failed) {
+        ERRORF("Failed to finish reading CUE file %s: read_error=%d eof=%d read_errno=%d close_result=%d close_errno=%d",
+               cue_path, read_failed, read_eof, read_errno, close_failed, close_errno);
+        return -1;
+    }
 
     if (g_track_count == 0) {
         ERRORF("No valid tracks found in CUE file");
@@ -370,25 +393,34 @@ void Psyz_CdShellOpen(int is_open) {
 }
 
 static void close_track_file(void);
+static void retire_disc_media_locked(void);
 
 int Psyz_CdSetDiskPath(const char* diskPath) {
 #if PE_NATIVE_STATE_CPU_COMPONENTS
     extern void Psyz_StateCdChanged(void);Psyz_StateCdChanged();
 #endif
-    close_track_file();
+    /* Same owner/lock order as CDDA/XA pull: audio first, then file IO.
+     * No old decoder or queued sample may observe the replacement table. */
+    Psyz_AudioLock();
+    retire_disc_media_locked();
     is_disk_loaded = 0;
     g_track_count = 0;
     memset(g_tracks, 0, sizeof(g_tracks));
+    int result = 0;
     if (!diskPath) {
         DEBUGF("Disk path unset");
-        return 0;
+    } else if (parse_cue_file(diskPath) < 0) {
+        /* Parsing may have visited tracks before failing: do not expose a
+         * partial replacement, and never resurrect the retired old media. */
+        g_track_count = 0;
+        memset(g_tracks, 0, sizeof(g_tracks));
+        result = -1;
+    } else {
+        is_disk_loaded = 1;
+        DEBUGF("Disk path set: %s", diskPath);
     }
-    if (parse_cue_file(diskPath) < 0) {
-        return -1;
-    }
-    is_disk_loaded = 1;
-    DEBUGF("Disk path set: %s", diskPath);
-    return 0;
+    Psyz_AudioUnlock();
+    return result;
 }
 
 static PsyzCdReadCB disk_read_cb = NULL;
@@ -514,6 +546,10 @@ static int xa_sector_matches(unsigned char file, unsigned char channel) {
 
 static int s4(int n) { return (n & 0x8) ? (n - 0x10) : n; }
 
+/* XA and movie data have independent logical cursors but share the image
+ * handle. Video ready callbacks seek that handle between audio refills. */
+static int read_raw_sector(int sector, u_char* out);
+
 static const int xa_pos[4] = {0, 60, 115, 98};
 static const int xa_neg[4] = {0, 0, -52, -55};
 // Decode 28 samples for one (block, nibble) pair into `dst` (stride=2 stereo
@@ -593,11 +629,11 @@ static int xa_read_and_decode_sector(void) {
         goto silence;
     }
     while (!xa.stream_ended || silent_sectors-- > 0) {
-        const size_t n =
-            disk_read_cb ? (size_t)disk_read_cb(&(struct PsyzCdRead){
-                               (unsigned int)(xa.cur_abs_sector + 1),
-                               SECTOR_SIZE, sector})
-                         : fread(sector, 1, SECTOR_SIZE, track_file);
+        const int next_sector = xa.cur_abs_sector + 1;
+        const size_t n = disk_read_cb
+            ? (size_t)disk_read_cb(&(struct PsyzCdRead){
+                  (unsigned int)next_sector, SECTOR_SIZE, sector})
+            : (read_raw_sector(next_sector, sector) == 0 ? SECTOR_SIZE : 0);
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
         }
@@ -839,6 +875,23 @@ static int read_raw_sector(int sector, u_char* out) {
 }
 
 static int need_cdda_rewind = 1;
+/* Called only while holding Psyz_AudioLock, before any track FILE/table change.
+ * This is media retirement, not pause/resume or an audio-clock adjustment. */
+static void retire_disc_media_locked(void) {
+    is_playing = 0;
+    xa.active = 0;
+    xa_reset_stream();
+    xa.cur_abs_sector = -1;
+    Psyz_SpuFlushCdSamples();
+    data_read_active = 0;
+    data_sector_valid = 0;
+    data_getsector_count = 0;
+    close_track_file();
+    cd_buf_pos = cd_buf_count = 0;
+    need_cdda_rewind = 1;
+    CD_status &= ~(CdlStatPlay | CdlStatSeek | CdlStatRead);
+}
+
 // play on CDDA mode only (not XA)
 static void psyz_play() {
     if (!(CD_mode & CdlModeDA)) {
