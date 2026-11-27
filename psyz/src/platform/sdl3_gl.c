@@ -202,8 +202,7 @@ static const char fragment_shader_body[] = {
     "    }\n"
     // check for full transparency
     "    if (texColor == vec4(0, 0, 0, 0)) {\n"
-    "        FragColor = vec4(0);\n"
-    "        return;\n"
+    "        discard;\n"
     "    }\n"
     // check for setSemiTrans(p, 1)
     "    bool isSemiTrans = vertexColor.a < 0.75;"
@@ -225,6 +224,10 @@ static const char fragment_shader_body[] = {
     "    if (fullColor && textureMode != 0u) modColor = texColor.rgb * "
     "vertexColor.rgb;\n"
     "    modColor = applyDither(modColor);\n"
+    "    if (!isSemiTrans) {\n"
+    "        FragColor = vec4(modColor, textureMode == 0u ? 0.0 : texColor.a);\n"
+    "        return;\n"
+    "    }\n"
     // pre-multiplied alpha output for GL_ONE, GL_ONE_MINUS_SRC_ALPHA blending
     "    if (colorSemiTrans && isSemiTrans) {\n"
     "        uint abr = (tpage & 0x60u) >> 5u;\n"
@@ -1607,15 +1610,24 @@ void Draw_FlushBuffer(void) {
     int start = 0;
     while (start < n_indices) {
         Vertex* v = &vertex_buf[index_buf[start]];
+        bool opaque = v->a == 0xFF;
         bool need_subtract = is_subtract_abr(v);
         int end = start + prim_size;
         while (end < n_indices) {
             v = &vertex_buf[index_buf[end]];
             bool next_subtract = is_subtract_abr(v);
-            if (next_subtract != need_subtract) {
+            if (next_subtract != need_subtract || (v->a == 0xFF) != opaque) {
                 break;
             }
             end += prim_size;
+        }
+        if (opaque) {
+            /* Native bit 15 is the texture mask. Opaque geometry writes it directly. */
+            glDisable(GL_BLEND);
+            DrawIndices(start, end);
+            glEnable(GL_BLEND);
+            start = end;
+            continue;
         }
         while (need_subtract && start < end) {
             int group_end = SubtractGroupEnd(start, end);
