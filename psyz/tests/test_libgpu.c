@@ -2057,6 +2057,20 @@ ZTEST(gpu, rgb24_display_reads_packed_vram_bytes) {
             for (int x = 0; x < width * 3; ++x)
                 zassert_u8_eq((u8)(image[y * words + x / 2] >> ((x & 1) * 8)),
                               pixels[y * width * 3 + x]);
+#ifdef __PSP__
+        if (width == 320) {
+            int rendered_w, rendered_h;
+            u8* rendered = Psyz_VideoAllocRenderedFrame(&rendered_w, &rendered_h);
+            zassert_ptr_ne(NULL, rendered);
+            zassert_s32_eq(320, rendered_w);
+            zassert_s32_eq(240, rendered_h);
+            for (int i = 0; i < rendered_w * rendered_h * 3; ++i) {
+                u8 channel = pixels[i] >> 3;
+                zassert_u8_eq((channel << 3) | (channel >> 2), rendered[i]);
+            }
+            free(rendered);
+        }
+#endif
         free(pixels);
         free(image);
     }
