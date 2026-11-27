@@ -3687,59 +3687,6 @@ int Draw_ExequeSync() { return 0; }
 
 // optimization to avoid sampling the VRAM on an untextured batch draw
 static bool batch_has_texture = false;
-/* Retain the PS1's signed 12-fractional-bit attribute gradients while the
- * GPU rasterizes the geometry, including at higher internal resolutions. */
-static void SetPolygonAttributes(Vertex* vertices) {
-    Vertex* a = &vertices[0];
-    Vertex* b = &vertices[1];
-    Vertex* c = &vertices[2];
-    Vertex* anchor =
-        b->x <= a->x ? (c->x <= b->x ? c : b) : (c->x < a->x ? c : a);
-    int64_t area = (int64_t)(b->x - a->x) * (c->y - a->y) -
-                   (int64_t)(b->y - a->y) * (c->x - a->x);
-    int64_t magnitude = area < 0 ? -area : area;
-    for (int i = 0; i < 3; ++i) {
-        const short coverage[8] = {
-            a->x, a->y, b->x, b->y, c->x, c->y,
-            (short)((area > 0) - (area < 0)),
-            (short)(magnitude > 32767 ? 32767 : magnitude)};
-        memcpy(vertices[i].polygon_coverage, coverage, sizeof(coverage));
-    }
-    for (int i = 0; i < 3; ++i) {
-        vertices[i].uv_bounds[0] = SDL_min(a->u, SDL_min(b->u, c->u));
-        vertices[i].uv_bounds[1] = SDL_min(a->v, SDL_min(b->v, c->v));
-        vertices[i].uv_bounds[2] = SDL_max(a->u, SDL_max(b->u, c->u));
-        vertices[i].uv_bounds[3] = SDL_max(a->v, SDL_max(b->v, c->v));
-    }
-    const int av[5] = {a->u, a->v, a->r, a->g, a->b};
-    const int bv[5] = {b->u, b->v, b->r, b->g, b->b};
-    const int cv[5] = {c->u, c->v, c->r, c->g, c->b};
-    const int origin[5] = {
-        anchor->u, anchor->v, anchor->r, anchor->g, anchor->b};
-    for (int attribute = 0; attribute < 5; ++attribute) {
-        int64_t dx = 0, dy = 0;
-        if (area) {
-            dx = ((int64_t)(bv[attribute] - av[attribute]) * (c->y - a->y) -
-                  (int64_t)(cv[attribute] - av[attribute]) * (b->y - a->y)) *
-                 4096 / area;
-            dy = ((int64_t)(cv[attribute] - av[attribute]) * (b->x - a->x) -
-                  (int64_t)(bv[attribute] - av[attribute]) * (c->x - a->x)) *
-                 4096 / area;
-        }
-        for (int vertex = 0; vertex < 3; ++vertex) {
-            vertices[vertex].polygon_gradient[attribute * 2] = (uint32_t)dx;
-            vertices[vertex].polygon_gradient[attribute * 2 + 1] = (uint32_t)dy;
-            float value = (float)(origin[attribute] * 4096 + 2048 +
-                                  (vertices[vertex].x - anchor->x) * dx +
-                                  (vertices[vertex].y - anchor->y) * dy) /
-                          4096.0f;
-            if (attribute < 2)
-                vertices[vertex].polygon_uv[attribute] = value;
-            else
-                vertices[vertex].polygon_rgb[attribute - 2] = value;
-        }
-    }
-}
 /* A future ownership-aware software consumer calls Take exactly once before
  * dispatch; these wrappers expose real data without enabling presentation. */
 int Psyz_CpuMaterialSample2x(unsigned px,unsigned py,uint16_t native,uint16_t out[4]) {
