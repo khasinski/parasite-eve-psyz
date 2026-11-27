@@ -1057,6 +1057,17 @@ int Psyz_VideoStats(PsyzVideoStats* stats) {
     return 0;
 }
 
+static void Expand555Row(u8* out, const u16* row, int width) {
+    for (int i = 0; i < width; ++i) {
+        u16 color = row[i];
+        for (int channel = 0; channel < 3; ++channel) {
+            u8 value = color & 31;
+            *out++ = (value << 3) | (value >> 2);
+            color >>= 5;
+        }
+    }
+}
+
 static unsigned char* AllocRgb888Region(
     int offset, int bufw, int x, int y, int w, int h) {
     const u16* fb = (const u16*)(0x40000000 | (uintptr_t)(edram_base + offset));
@@ -1064,19 +1075,8 @@ static unsigned char* AllocRgb888Region(
     if (!out) {
         return NULL;
     }
-    unsigned char* p = out;
-    for (int j = 0; j < h; j++) {
-        const u16* row = &fb[(y + j) * bufw + x];
-        for (int i = 0; i < w; i++) {
-            u16 c = row[i];
-            u8 r5 = c & 0x1F;
-            u8 g5 = (c >> 5) & 0x1F;
-            u8 b5 = (c >> 10) & 0x1F;
-            *p++ = (u8)((r5 << 3) | (r5 >> 2));
-            *p++ = (u8)((g5 << 3) | (g5 >> 2));
-            *p++ = (u8)((b5 << 3) | (b5 >> 2));
-        }
-    }
+    for (int j = 0; j < h; ++j)
+        Expand555Row(out + j * w * 3, fb + (y + j) * bufw + x, w);
     return out;
 }
 
@@ -1133,23 +1133,21 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
 }
 
 unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
-    // TODO feasibility of returning the edram pointer directly?
-    if (!is_init && !InitPlatform()) {
+    if (!is_init && !InitPlatform())
         return NULL;
-    }
-    WaitPrevFrameGpu();
-    int dump_w = FB_STRIDE;
-    int dump_h = (int)sceGeEdramGetSize() / (dump_w * 2);
-    unsigned char* out = AllocRgb888Region(0, dump_w, 0, 0, dump_w, dump_h);
-    if (!out) {
+    u8* out = malloc(PSX_VRAM_W * PSX_VRAM_H * 3);
+    if (!out)
         return NULL;
+    GeSyncCaughtUp();
+    u16 row[PSX_VRAM_W];
+    for (int y = 0; y < PSX_VRAM_H; ++y) {
+        VramLineRead(0, y, row, PSX_VRAM_W);
+        Expand555Row(out + y * PSX_VRAM_W * 3, row, PSX_VRAM_W);
     }
-    if (w) {
-        *w = dump_w;
-    }
-    if (h) {
-        *h = dump_h;
-    }
+    if (w)
+        *w = PSX_VRAM_W;
+    if (h)
+        *h = PSX_VRAM_H;
     return out;
 }
 

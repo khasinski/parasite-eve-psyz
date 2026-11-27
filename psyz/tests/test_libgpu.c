@@ -2029,6 +2029,28 @@ ZTEST(gpu, text_quad_is_stable_across_field_buffers) {
 #endif
 }
 
+ZTEST(gpu, vram_dump_uses_native_coordinates) {
+#ifndef __psyz
+    zskip("PsyZ VRAM dump API");
+#else
+    RECT rect = {831, 255, 2, 2};
+    u16 words[] = {0x001f, 0x03e0, 0x7c00, 0x7fff};
+    LoadImage(&rect, (u_long*)words);
+    DrawSync(0);
+    int width, height;
+    u8* pixels = Psyz_VideoAllocVramDump(&width, &height);
+    zassert_ptr_ne(NULL, pixels);
+    zassert_s32_eq(1024, width);
+    zassert_s32_eq(512, height);
+    for (int i = 0; i < 4; ++i) {
+        int offset = ((rect.y + i / 2) * width + rect.x + i % 2) * 3;
+        for (int channel = 0; channel < 3; ++channel)
+            zexpect_u8_eq(i == channel || i == 3 ? 255 : 0, pixels[offset + channel]);
+    }
+    free(pixels);
+#endif
+}
+
 ZTEST(gpu, rgb24_display_reads_packed_vram_bytes) {
     const int widths[] = {256, 320, 368, 512, 640};
     for (unsigned mode = 0; mode < sizeof(widths) / sizeof(widths[0]); ++mode) {
