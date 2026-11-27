@@ -403,6 +403,13 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count) {
     if(valid||camera_fallback)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;
         out->pgxp_pos[0]=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0]+interp_camera_half_x;
         out->pgxp_pos[1]=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1]+interp_camera_half_y;
+        /* A half-native-pixel camera step lands between render pixels at
+         * odd scales. Align all tiles to the same target pixel so raster
+         * interpolation cannot alternate UV rounding across their rows. */
+        if (p->background && internal_res > 1 && (internal_res & 1)) {
+            out->pgxp_pos[0] = SDL_floorf(out->pgxp_pos[0] * internal_res + 0.5f) / internal_res;
+            out->pgxp_pos[1] = SDL_floorf(out->pgxp_pos[1] * internal_res + 0.5f) / internal_res;
+        }
         out->pgxp_pos[2]=valid?2.0f/(1.0f/position[i][2]+1.0f/p->position[i][2]):position[i][2];}
     memcpy(p->position,position,count*sizeof(position[0]));p->frame=interp_frame;p->count=count;p->signature=signature;
 }
