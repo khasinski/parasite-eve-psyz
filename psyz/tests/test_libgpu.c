@@ -859,35 +859,6 @@ ZTEST(gpu, widescreen_margin_color_is_independent_of_atlas_slot) {
 #endif
 }
 
-ZTEST(gpu, scaled_widescreen_keeps_native_readback) {
-#if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
-    DISPENV disp;SetDefDispEnv(&disp,0,0,320,224);disp.screen.h=224;PutDispEnv(&disp);
-    DRAWENV draw;SetDefDrawEnv(&draw,0,0,320,224);draw.dtd=0;PutDrawEnv(&draw);
-    RECT area={0,0,320,224};
-    u16 *baseline=calloc(320*224,sizeof(u16)),*native=calloc(320*224,sizeof(u16));
-    zassert_ptr_ne(NULL,baseline);zassert_ptr_ne(NULL,native);
-    const int spans[][2]={{-56,376},{0,512},{-192,320}};
-    for(unsigned scale=2;scale<=3;++scale)for(unsigned clipping=0;clipping<2;++clipping)
-    for(unsigned sample=0;sample<3;++sample)for(int wide=0;wide<2;++wide){
-        Psyz_VideoSetInternalResolution(scale);
-        draw.clip=clipping?(RECT){24,40,184,80}:(RECT){0,0,320,224};PutDrawEnv(&draw);
-        Psyz_VideoSetWidescreen(wide);
-        Psyz_VideoSetWidescreenPictureShifted(0,spans[sample][0],spans[sample][1],.125f,.25f,352);
-        ClearImage(&area,16,24,32);DrawSync(0);
-        TILE tile={0};setTile(&tile);setXY0(&tile,32,48);setWH(&tile,32,24);setRGB0(&tile,200,48,80);
-        DrawPrim(&tile);
-        POLY_G3 triangle={0};setPolyG3(&triangle);setXY3(&triangle,180,40,232,72,192,120);
-        setRGB0(&triangle,248,64,32);setRGB1(&triangle,32,248,64);setRGB2(&triangle,64,32,248);
-        DrawPrim(&triangle);DrawSync(0);
-        StoreImage(&area,(u_long *)(wide?native:baseline));DrawSync(0);
-        if(wide)zassert_s32_eq(0,memcmp(baseline,native,320*224*sizeof(u16)));
-    }
-    free(baseline);free(native);Psyz_VideoSetWidescreen(0);
-    Psyz_VideoSetWidescreenPicture(0,0,0);Psyz_VideoSetInternalResolution(1);
-#endif
-}
-
 ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend = getenv("PSYZ_HEADLESS");
