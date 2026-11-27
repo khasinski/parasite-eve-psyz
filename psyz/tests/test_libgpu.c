@@ -1075,6 +1075,67 @@ ZTEST(gpu, widescreen_room_step_keeps_its_dither) {
 #endif
 }
 
+ZTEST(gpu, polygon_samples_selected_tile_from_memory_atlas) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *backend = getenv("PSYZ_HEADLESS");
+    if (!backend || strcmp(backend, "gpu")) zskip("requires headless GPU");
+    enum { width = 68, height = 136, pitch = width * 4 + 12 };
+    const uint64_t key = UINT64_C(0x6417b8a319ac72d0);
+    u8 *atlas = calloc(height, pitch);
+    zassert_ptr_ne(NULL, atlas);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            u8 *pixel = atlas + y * pitch + x * 4;
+            /* The native reference is green. The material is red on the
+             * left half of the tile and blue on the right. */
+            pixel[y >= 68 ? 1 : x < 34 ? 0 : 2] = 255;
+            pixel[3] = 255;
+        }
+    }
+    zassert_s32_eq(-1, Psyz_GpuLoadSpriteAtlasPixels(key, atlas, width, height, width * 4 - 1));
+    zassert_s32_eq(1, Psyz_GpuLoadSpriteAtlasPixels(key, atlas, width, height, pitch));
+    free(atlas);
+    DISPENV display;
+    DRAWENV draw;
+    SetDefDispEnv(&display, 0, 0, 320, 224);
+    display.screen.h = 224;
+    PutDispEnv(&display);
+    SetDefDrawEnv(&draw, 0, 0, 320, 224);
+    draw.dtd = 0;
+    PutDrawEnv(&draw);
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_GpuSetSpriteAtlasesEnabled(1);
+    u16 green[16 * 16];
+    for (int i = 0; i < 16 * 16; ++i) green[i] = 0x03e0;
+    RECT source = {512 + 32, 48, 16, 16};
+    LoadImage(&source, (u_long *)green);
+    DrawSync(0);
+    POLY_FT4 polygon = {0};
+    SetPolyF4Img(&polygon, 16, 16, 16, 16, 32, 48, GetTPage(2, 0, 512, 0), 0, 0);
+    setRGB0(&polygon, 128, 128, 128);
+    Psyz_GpuSelectSpriteAtlasTile(key, 0, 32, 48);
+    DrawPrim(&polygon);
+    int w, h;
+    u8 *frame = Psyz_VideoAllocRenderedFrame(&w, &h);
+    zassert_ptr_ne(NULL, frame);
+    zassert_s32_eq(1, w > 56 && h > 48);
+    const u8 *left = frame + (48 * w + 40) * 3;
+    const u8 *right = frame + (48 * w + 56) * 3;
+    zassert_s32_eq(1, left[0] > 200 && left[1] < 32 && left[2] < 32);
+    zassert_s32_eq(1, right[2] > 200 && right[0] < 32 && right[1] < 32);
+    free(frame);
+    RECT center = {20, 24, 2, 1};
+    u16 native[2];
+    StoreImage(&center, (u_long *)native);
+    DrawSync(0);
+    zassert_s32_eq(0x03e0, native[0] & 0x7fff);
+    Psyz_GpuResetSpriteAtlases();
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, hd_page_polygon_matches_reference_without_changing_native_vram) {
 #ifdef PSYZ_TEST_SDL_GPU
     const char *backend = getenv("PSYZ_HEADLESS");
