@@ -1129,6 +1129,22 @@ ZTEST(gpu, polygon_samples_selected_tile_from_memory_atlas) {
     StoreImage(&center, (u_long *)native);
     DrawSync(0);
     zassert_s32_eq(0x03e0, native[0] & 0x7fff);
+    /* A polygon selection followed by a sprite must leave that sprite native. */
+    draw.tpage = GetTPage(2, 0, 512, 0);
+    PutDrawEnv(&draw);
+    SPRT_16 sprite = {0};
+    setSprt16(&sprite);
+    setRGB0(&sprite, 128, 128, 128);
+    setXY0(&sprite, 16, 16);
+    setUV0(&sprite, 32, 48);
+    Psyz_GpuSelectSpriteAtlasTile(key, 0, 32, 48);
+    DrawPrim(&sprite);
+    frame = Psyz_VideoAllocRenderedFrame(&w, &h);
+    zassert_ptr_ne(NULL, frame);
+    zassert_s32_eq(1, w > 40 && h > 48);
+    left = frame + (48 * w + 40) * 3;
+    zassert_s32_eq(1, left[0] < 32 && left[1] > 200 && left[2] < 32);
+    free(frame);
     Psyz_GpuResetSpriteAtlases();
     Psyz_VideoSetInternalResolution(1);
 #else

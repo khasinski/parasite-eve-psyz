@@ -3729,7 +3729,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     bool isTile = (code & 0x40) && (code & 0x20);
     bool isTextured = (code & TEXTURED) != 0;
     bool isGouraud = (code & GOURAUD) != 0;
-    SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C) ? next_sprite_atlas : NULL;
+    SpriteAtlas *atlas=(isTile && isTextured && (code&~3)==0x7C && next_sprite_tile_u<0) ? next_sprite_atlas : NULL;
     SpriteAtlas *poly_atlas=(isPoly && isTextured && next_sprite_tile_u>=0) ? next_sprite_atlas : NULL;
     int poly_tile_u=next_sprite_tile_u,poly_tile_v=next_sprite_tile_v;
     unsigned atlas_cell=next_sprite_cell;
