@@ -2588,13 +2588,8 @@ ZTEST(gpu, swap_buffer) {
 }
 
 ZTEST(gpu, drawenv_clear_vram) {
-    const char* ci = getenv("CI");
-    const char* os = getenv("OS");
     u_short tpage, clut;
     DRAWENV drawEnv;
-    if (ci && strcmp(ci, "1") == 0 && os && strcmp(os, "linux") == 0) {
-        zskip("Skipped on Linux CI");
-    }
     if (LoadTim(img_4bpp, &tpage, &clut)) {
         return;
     }

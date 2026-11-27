@@ -1390,6 +1390,7 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
+    Draw_FlushBuffer();
     /* PS1 clears truncate each input channel to five bits before storage. */
     glClearColor((float)(r >> 3) / 31.0f, (float)(g >> 3) / 31.0f,
                  (float)(b >> 3) / 31.0f, 0.0f);
@@ -1412,6 +1413,7 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
+    Draw_FlushBuffer();
     size_t count = (size_t)rect->w * rect->h;
     u8* buf = GetVramConvertBuffer(count * 4);
     if (!buf) {
