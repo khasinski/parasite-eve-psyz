@@ -55,6 +55,11 @@ static const char vertex_shader_body[] = {
     "layout(location = 1) in vec4 tex;\n"
     "layout(location = 2) in vec4 color;\n"
     "layout(location = 3) in vec4 twin;\n"
+    "layout(location = 4) in vec2 polygonUV;\n"
+    "layout(location = 5) in uvec4 gradientUV;\n"
+    "uniform bool nativeGrid;\n"
+    "flat out uvec4 uvGradient;\n"
+    "flat out ivec4 uvOrigin;\n"
     "uniform vec2 resolution;\n"
     "uniform vec2 drawOffset;\n"
     "out vec4 vertexColor;\n"
@@ -73,11 +78,12 @@ static const char vertex_shader_body[] = {
     "flat out uvec4 texWindow;\n"   // GP0(E2h) as {and.xy, or.zw}
     "\n"
     "void main() {\n"
-    /* GL samples pixel centers; PS1 polygons sample integer coordinates. */
-    "    polygon = (uint(tex.w) & 0x2000u) != 0u ? 1u : 0u;\n"
-    "    vec2 samplePos = pos + vec2(polygon != 0u ? 0.5 : 0.0);\n"
-    "    float x = ((samplePos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
-    "    float y = ((samplePos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
+    "    polygon = uint(tex.w) & 0x2000u;\n"
+    "    float bias = polygon != 0u && nativeGrid ? 0.5 : 0.0;\n"
+    "    uvGradient = gradientUV;\n"
+    "    uvOrigin = ivec4(ivec2(pos + drawOffset), ivec2(polygonUV * 4096.0));\n"
+    "    float x = ((bias + pos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
+    "    float y = ((bias + pos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
     "    gl_Position = vec4(x, y, 0.0, 1.0);\n"
     // gouraud colors
     "    vertexColor = color;\n"
@@ -86,7 +92,7 @@ static const char vertex_shader_body[] = {
     "    uint texWord = uint(tex.w);\n"
     "    tpage = texWord & 0x1FFu;\n"
     "    dither = (texWord & 0x4000u) != 0u ? 1u : 0u;\n"
-    "    rawUV = tex.xy;\n"
+    "    rawUV = polygon != 0u ? polygonUV - (nativeGrid ? 0.0 : 0.5) : tex.xy;\n"
     // Determine texture mode and pre-compute parameters
     "    subPixelMask = 0u;\n"
     "    texelShift = 0u;\n"
@@ -128,17 +134,26 @@ static const char fragment_shader_body[] = {
     "flat in uint texelShift;\n"
     "flat in uint indexShift;\n"
     "flat in uint indexMask;\n"
-    "flat in uint polygon;\n"
     "flat in uint dither;\n"
     "flat in ivec2 pageBase;\n"
     "flat in uvec4 texWindow;\n"
     "uniform sampler2D texVram;\n"
+    "flat in uvec4 uvGradient;\n"
+    "flat in ivec4 uvOrigin;\n"
+    "flat in uint polygon;\n"
+    "uniform bool nativeGrid;\n"
     "uniform bool fullColor;\n"
     "\n"
     "uvec2 resolveTexel() {\n"
-    "    vec2 uv = rawUV + 1.0 / 512.0;\n"
-    /* Polygon positions already compensate for the half-pixel sample phase. */
-    "    if (polygon == 0u) uv -= 0.5 * (dFdx(rawUV) + dFdy(rawUV));\n"
+    "    vec2 uv = rawUV - 0.5 * (dFdx(rawUV) + dFdy(rawUV)) + 1.0 / 512.0;\n"
+    "    if (polygon != 0u) {\n"
+    "        uv = rawUV;\n"
+    "        if (nativeGrid) {\n"
+    "            uvec2 d = uvec2(ivec2(gl_FragCoord.xy) - uvOrigin.xy);\n"
+    "            uvec2 q = uvec2(uvOrigin.zw) + uvGradient.xz * d.x + uvGradient.yw * d.y;\n"
+    "            uv = vec2(ivec2(q) >> 12);\n"
+    "        }\n"
+    "    }\n"
     "    uvec2 texel = uvec2(clamp(floor(uv), vec2(0.0), vec2(255.0)));\n"
     "    return (texel & texWindow.xy) | texWindow.zw;\n"
     "}\n"
@@ -245,7 +260,7 @@ static GLuint shader_program = 0;
 static GLint uniform_resolution = 0;
 static GLint uniform_tex_vram = 0;
 static GLint uniform_draw_offset = 0;
-static GLint uniform_full_color = -1;
+static GLint uniform_full_color = -1, uniform_native_grid = -1;
 static GLuint vram_texture;
 static GLuint rgb24_texture, rgb24_fbo;
 static bool display_rgb24;
@@ -428,6 +443,7 @@ bool InitPlatform() {
     uniform_resolution = glGetUniformLocation(shader_program, "resolution");
     uniform_tex_vram = glGetUniformLocation(shader_program, "texVram");
     uniform_draw_offset = glGetUniformLocation(shader_program, "drawOffset");
+    uniform_native_grid = glGetUniformLocation(shader_program, "nativeGrid");
     uniform_full_color = glGetUniformLocation(shader_program, "fullColor");
 
     glUniform1i(uniform_tex_vram, 0);
@@ -1055,6 +1071,10 @@ static void Draw_InitBuffer() {
     glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(Vertex),
                           (void*)offsetof(Vertex, twin));
     glEnableVertexAttribArray(3);
+    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, polygon_uv));
+    glEnableVertexAttribArray(4);
+    glVertexAttribIPointer(5, 4, GL_UNSIGNED_INT, sizeof(Vertex), (void*)offsetof(Vertex, polygon_gradient));
+    glEnableVertexAttribArray(5);
     glBindVertexArray(0);
 }
 
@@ -1071,8 +1091,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     Vertex* v;
 
     // to ensure we always have space, we pretend we want to allocate a quad
-    // Gouraud read-ahead can write a colour into a fifth vertex slot.
-    Draw_EnsureBufferWillNotOverflow(5, 6);
+    // A quad needs separate interpolation gradients for its two triangles.
+    Draw_EnsureBufferWillNotOverflow(6, 6);
     v = vertex_cur;
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
@@ -1130,7 +1150,16 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     VRGBA(vertex_cur[3]) = VRGBA(vertex_cur[0]);
             }
 
-            SET_TC_ALL(vertex_cur, tpage | TPAGE_POLYGON, clut);
+            if (nVertices == 4) {
+                Vertex second[3] = {vertex_cur[1], vertex_cur[3], vertex_cur[2]};
+                memcpy(vertex_cur + 3, second, sizeof(second));
+                for (int i = 3; i < 6; ++i) index_cur[i] = n_vertices + i;
+                nVertices = 6;
+                SetPolygonAttributes(vertex_cur + 3);
+            }
+            SetPolygonAttributes(vertex_cur);
+            for (int i = 0; i < nVertices; ++i)
+                SET_TC(&vertex_cur[i], tpage | TPAGE_POLYGON, clut);
             Draw_EnqueueBuffer(nVertices, nIndices);
         } else {
             // shouldn't happen on a normal PSX application
@@ -1553,6 +1582,7 @@ void Draw_FlushBuffer(void) {
     }
 
     glUseProgram(shader_program);
+    glUniform1i(uniform_native_grid, internal_res == 1 && GetDrawGridXScale() == 1.0f);
     glUniform1i(uniform_full_color, dither_mode == PSYZ_DITHER_OFF);
     glBindVertexArray(VAO);
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
