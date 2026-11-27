@@ -1363,6 +1363,22 @@ static void check_cue_io_failure(int mode) {
     mount_cue();
     zexpect_s32_eq(CdlDataReady, CdControlB(CdlGetTN, NULL, result));
 }
+ZTEST(libcd, binary_data_rejects_cue_before_reading_more_lines) {
+    load_cue_single(1, 8, true);
+    FILE* file = fopen(cue, "ab");
+    zassert_ptr_ne(NULL, file);
+    static const char tail[] = "\nREM prefix\0binary\nREM later line\n";
+    zassert_s32_eq(sizeof(tail) - 1, fwrite(tail, 1, sizeof(tail) - 1, file));
+    zassert_s32_eq(0, fclose(file));
+    cue_fault_lines = cue_fault_closes = 0;
+    cue_fault_mode = 4; /* Count reads and closes without injecting a fault. */
+    zexpect_s32_eq(-1, Psyz_CdSetDiskPath(cue));
+    zexpect_s32_eq(1, cue_fault_closes);
+    zexpect_s32_eq(5, cue_fault_lines);
+    cue_fault_mode = 0;
+    u_char result[8];
+    zexpect_s32_eq(CdlNoIntr, CdControlB(CdlGetTN, NULL, result));
+}
 ZTEST(libcd, cue_read_error_rejects_partial_track_table) {
     check_cue_io_failure(1);
 }

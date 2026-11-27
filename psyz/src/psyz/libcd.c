@@ -226,7 +226,17 @@ static int parse_cue_file(const char* cue_path) {
         0; // Absolute sector where current file starts
 
     g_track_count = 0;
-    while ((errno = 0, fgets(full_line, sizeof(full_line), fp))) {
+    for (;;) {
+        /* fgets appends a NUL. A second NUL means the input contains binary data. */
+        memset(full_line, 0xff, sizeof(full_line));
+        errno = 0;
+        if (!fgets(full_line, sizeof(full_line), fp)) break;
+        size_t used = strlen(full_line) + 1;
+        if (memchr(full_line + used, 0, sizeof(full_line) - used)) {
+            ERRORF("Binary data in CUE file %s", cue_path);
+            fclose(fp);
+            return -1;
+        }
         char* line = str_trim(full_line);
         if (strncmp(line, "FILE", 4) == 0) {
             // Before switching to new file, calculate size of previous file
