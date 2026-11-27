@@ -1091,6 +1091,8 @@ ZTEST(gpu, hd_page_polygon_matches_reference_without_changing_native_vram) {
     zassert_ptr_ne(NULL, material);
     zassert_ptr_ne(NULL, reference);
     SDL_FillSurfaceRect(material, NULL, SDL_MapSurfaceRGB(material, 255, 0, 0));
+    SDL_Rect window = {512, 256, 256, 256};
+    SDL_FillSurfaceRect(material, &window, SDL_MapSurfaceRGB(material, 255, 255, 0));
     SDL_FillSurfaceRect(reference, NULL, SDL_MapSurfaceRGB(reference, 0, 255, 0));
     RECT source = {512, 0, 16, 16}, center = {24, 24, 2, 1};
     u_short page = GetTPage(2, 0, 512, 0);
@@ -1117,6 +1119,20 @@ ZTEST(gpu, hd_page_polygon_matches_reference_without_changing_native_vram) {
         StoreImage(&center, (u_long *)native);
         DrawSync(0);
         zassert_s32_eq(pixels[0], native[0] & 0x7fff);
+    }
+    const unsigned short mapping[] = {512, 256, 256};
+    for (int enabled = 1; enabled >= 0; --enabled) {
+        zassert_s32_eq(1, Psyz_GpuSetPageHdWindows(enabled ? mapping : NULL, enabled));
+        DrawPrim(&polygon);
+        int w, h;
+        u8 *frame = Psyz_VideoAllocRenderedFrame(&w, &h);
+        zassert_ptr_ne(NULL, frame);
+        zassert_s32_eq(1, w > 48 && h > 48);
+        const u8 *pixel = frame + (48 * w + 48) * 3;
+        zassert_s32_eq(1, pixel[0] > 200);
+        zassert_s32_eq(enabled, pixel[1] > 200);
+        zassert_s32_eq(1, pixel[2] < 32);
+        free(frame);
     }
     Psyz_GpuSetPageHd(0, 0, 0, NULL, NULL, 0, 0, 0);
     Psyz_VideoSetInternalResolution(1);
