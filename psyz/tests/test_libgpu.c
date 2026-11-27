@@ -2710,6 +2710,7 @@ ZTEST(gpu, rgb555_blend_rounding_and_overlap) {
     RECT region = {0, 0, width, height};
     LoadImage(&region, (u_long*)background);
     DrawSync(0);
+    unsigned submitted = 0;
     for (unsigned layer = 0; layer < 2; ++layer) {
         for (unsigned mode = 0; mode < 4; ++mode) {
             Psyz_GpuWriteGP0(_get_mode(1, 0, getTPage(0, mode, 0, 0)));
@@ -2746,7 +2747,7 @@ ZTEST(gpu, rgb555_blend_rounding_and_overlap) {
                     /* Retire cycled upload buffers periodically. The test
                      * needs all color combinations, not thousands of GPU
                      * staging buffers alive together on a software adapter. */
-                    if ((index & 127) == 127) {
+                    if (++submitted % 128 == 0) {
                         DrawSync(0);
                         StoreImage(&region, (u_long*)actual);
                         DrawSync(0);
