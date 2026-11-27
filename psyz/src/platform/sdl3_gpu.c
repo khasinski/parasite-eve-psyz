@@ -1836,10 +1836,20 @@ static u8 *title_reference;
 static int title_width, title_height;
 static char title_path[4096];
 static uint64_t title_hash;
-static unsigned title_generation, title_uploaded;
-static SDL_GPUTexture *title_texture;
-static SDL_GPUTransferBuffer *title_transfer;
-static unsigned title_texture_width, title_texture_height;
+typedef struct {
+    SDL_GPUTexture *texture;
+    SDL_GPUTransferBuffer *transfer;
+    unsigned width, height, generation;
+} DisplayImage;
+
+static DisplayImage title_gpu;
+static unsigned title_generation;
+
+static void ReleaseDisplayImage(DisplayImage *image) {
+    if (image->texture) SDL_ReleaseGPUTexture(device, image->texture);
+    if (image->transfer) SDL_ReleaseGPUTransferBuffer(device, image->transfer);
+    *image = (DisplayImage){0};
+}
 static bool title_present_active;
 
 /* CPU title enhancement is explicitly opt-in and never grants GPU atlas support. */
@@ -1925,36 +1935,49 @@ static SDL_Surface *BuildTitleDisplay(const u8 *rgb) {
     title_hash=hash;++title_generation;return title_output;
 }
 
-static SDL_GPUTexture *UploadTitleDisplay(SDL_Surface *surface) {
-    if (!title_texture || !title_transfer || title_texture_width!=(unsigned)surface->w || title_texture_height!=(unsigned)surface->h) {
-        if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
-        if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
-        title_texture=NULL;title_transfer=NULL;title_uploaded=0;
-        SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,.format=SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            .usage=SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=surface->w,.height=surface->h,.layer_count_or_depth=1,.num_levels=1};
-        title_texture=SDL_CreateGPUTexture(device,&info);
-        SDL_GPUTransferBufferCreateInfo transfer={.usage=SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=surface->w*surface->h*4};
-        title_transfer=title_texture?SDL_CreateGPUTransferBuffer(device,&transfer):NULL;
-        if (!title_texture || !title_transfer) {
-            if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
-            if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
-            title_texture=NULL;title_transfer=NULL;
-            title_texture_width=title_texture_height=0;
+static SDL_GPUTexture *UploadDisplayImage(DisplayImage *image, SDL_Surface *surface,
+                                          unsigned generation) {
+    unsigned width = surface->w, height = surface->h;
+    if (!image->texture || image->width != width || image->height != height) {
+        ReleaseDisplayImage(image);
+        SDL_GPUTextureCreateInfo info = {
+            .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = width, .height = height,
+            .layer_count_or_depth = 1, .num_levels = 1
+        };
+        SDL_GPUTransferBufferCreateInfo transfer = {
+            .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = width * height * 4
+        };
+        image->texture = SDL_CreateGPUTexture(device, &info);
+        image->transfer = SDL_CreateGPUTransferBuffer(device, &transfer);
+        if (!image->texture || !image->transfer) {
+            ReleaseDisplayImage(image);
             return NULL;
         }
-        title_texture_width=surface->w;title_texture_height=surface->h;
+        image->width = width;
+        image->height = height;
+    } else if (image->generation == generation) {
+        return image->texture;
     }
-    if (!title_texture || !title_transfer) return NULL;
-    if (title_uploaded==title_generation) return title_texture;
-    u8 *mapped=SDL_MapGPUTransferBuffer(device,title_transfer,true);if (!mapped) return NULL;
-    for (int y=0;y<surface->h;++y) memcpy(mapped+(size_t)y*surface->w*4,(u8 *)surface->pixels+(size_t)y*surface->pitch,(size_t)surface->w*4);
-    SDL_UnmapGPUTransferBuffer(device,title_transfer);
-    SDL_GPUCommandBuffer *cmd=AcquireCmd();if (!cmd) return NULL;
-    SDL_GPUCopyPass *copy=SDL_BeginGPUCopyPass(cmd);if (!copy) return NULL;
-    SDL_GPUTextureTransferInfo src={.transfer_buffer=title_transfer,.pixels_per_row=surface->w,.rows_per_layer=surface->h};
-    SDL_GPUTextureRegion dst={.texture=title_texture,.w=surface->w,.h=surface->h,.d=1};
-    SDL_UploadToGPUTexture(copy,&src,&dst,false);SDL_EndGPUCopyPass(copy);title_uploaded=title_generation;
-    return title_texture;
+
+    u8 *mapped = SDL_MapGPUTransferBuffer(device, image->transfer, true);
+    if (!mapped) return NULL;
+    for (unsigned y = 0; y < height; ++y)
+        memcpy(mapped + (size_t)y * width * 4,
+               (u8 *)surface->pixels + (size_t)y * surface->pitch, width * 4);
+    SDL_UnmapGPUTransferBuffer(device, image->transfer);
+    SDL_GPUCommandBuffer *cmd = AcquireCmd();
+    if (!cmd) return NULL;
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    if (!copy) return NULL;
+    SDL_GPUTextureTransferInfo src = {
+        .transfer_buffer = image->transfer, .pixels_per_row = width, .rows_per_layer = height
+    };
+    SDL_GPUTextureRegion dst = {.texture = image->texture, .w = width, .h = height, .d = 1};
+    SDL_UploadToGPUTexture(copy, &src, &dst, false);
+    SDL_EndGPUCopyPass(copy);
+    image->generation = generation;
+    return image->texture;
 }
 
 static SDL_GPUTexture* PrepareRgb24Display(void) {
@@ -1965,7 +1988,7 @@ static SDL_GPUTexture* PrepareRgb24Display(void) {
         return NULL;
     SDL_Surface *enhanced=BuildTitleDisplay(rgb);
     if (enhanced) {
-        SDL_GPUTexture *texture=UploadTitleDisplay(enhanced);
+        SDL_GPUTexture *texture=UploadDisplayImage(&title_gpu, enhanced, title_generation);
         if (texture) {free(rgb);title_present_active=true;return texture;}
     }
     if (!rgb24_display) {
@@ -2470,8 +2493,8 @@ static void PlatformBackend_Present(void) {
                 };
                 if (rgb24)
                     src = (SDL_GPUBlitRegion){.texture = rgb24,
-                                              .w = title_present_active ? title_texture_width : display_size.x,
-                                              .h = title_present_active ? title_texture_height : display_size.y};
+                                              .w = title_present_active ? title_gpu.width : display_size.x,
+                                              .h = title_present_active ? title_gpu.height : display_size.y};
                 float game_aspect =
                     GetCurrentGameAspectRatio(display_size.x, display_size.y);
                 if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
@@ -2756,10 +2779,8 @@ static void QuitPlatform(void) {
             pipe_clear = NULL;
         }
         Psyz_VideoSetRgb24Backdrop(NULL,NULL,0,0,0,0);
-        if (title_texture) SDL_ReleaseGPUTexture(device,title_texture);
-        if (title_transfer) SDL_ReleaseGPUTransferBuffer(device,title_transfer);
-        title_texture=NULL;title_transfer=NULL;title_uploaded=title_generation=0;
-        title_texture_width=title_texture_height=0;
+        ReleaseDisplayImage(&title_gpu);
+        title_generation = 0;
         ReleaseTransientDisplayTextures();
         Psyz_GpuResetInterpolation();
         if (rgb24_display) {
