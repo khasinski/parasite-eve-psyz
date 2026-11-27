@@ -1841,7 +1841,7 @@ ZTEST(gpu, geometry_metadata_survives_present_before_submission) {
 /* Keep the raw subrectangle blit as a diagnostic: its rounding varies by
  * backend. The origin-zero presentation used by the renderer must be stable. */
 ZTEST(gpu, presentation_crop_is_stable_across_field_buffers) {
-#if defined(__psyz) && !defined(__PSP__)
+#ifdef PSYZ_TEST_SDL_GPU
     SDL_GPUDevice* dev = SDL_CreateGPUDevice(
         SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV |
             SDL_GPU_SHADERFORMAT_DXIL,
@@ -1951,6 +1951,8 @@ ZTEST(gpu, presentation_crop_is_stable_across_field_buffers) {
     SDL_ReleaseGPUTransferBuffer(dev, upload);
     SDL_ReleaseGPUTexture(dev, src);
     SDL_DestroyGPUDevice(dev);
+#else
+    zskip("requires the SDL GPU presentation blit");
 #endif
 }
 
