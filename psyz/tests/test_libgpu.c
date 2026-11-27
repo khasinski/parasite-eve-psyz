@@ -206,6 +206,8 @@ ZTEST(gpu, untextured_geometry_keeps_interpolation_with_textured_neighbors) {
         Psyz_VideoSetGeometryCorrection(0);Psyz_VideoSetWidescreen(wide);
         Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
         Psyz_GpuSetFrameInterpolation(1);Psyz_GpuResetInterpolation();
+        zassert_s32_eq(1, Psyz_GpuGetFrameInterpolation());
+        zassert_s32_eq(scale, Psyz_VideoGetInternalResolution());
         u16 white[32*16];for(unsigned i=0;i<32*16;++i)white[i]=0x7fff;
         RECT texture={512,0,32,16};LoadImage(&texture,(u_long *)white);DrawSync(0);
         RECT clear={0,0,320,480};ClearImage(&clear,0,0,0);DrawSync(0);
@@ -236,6 +238,7 @@ ZTEST(gpu, untextured_geometry_keeps_interpolation_with_textured_neighbors) {
         for(unsigned sample=0;sample<3;++sample){
             if(sample==2){SetDefDispEnv(&display,0,240,320,240);PutDispEnv(&display);Psyz_GpuPrepareInterpolatedPresent(-1);}
             VSync(0);int w,h;unsigned char *pixels=Psyz_VideoAllocRenderedFrame(&w,&h);zassert_ptr_ne(NULL,pixels);
+            zassert_s32_eq(1, h >= (int)(90 * scale));
             red[sample]=green[sample]=w;
             for(unsigned y=20*scale;y<90*scale;++y)for(int x=0;x<w;++x){
                 unsigned char *p=pixels+((size_t)y*w+x)*3;
