@@ -41,6 +41,6 @@ jobs:
           make dependencies
           make clean
           make -j"$(nproc)" all || {
-            cat psyq400.map
+            if [ -f build/psyq400.map ]; then cat build/psyq400.map; fi
             exit 1
           }
