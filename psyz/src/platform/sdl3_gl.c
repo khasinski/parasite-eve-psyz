@@ -56,8 +56,14 @@ static const char vertex_shader_body[] = {
     "layout(location = 2) in vec4 color;\n"
     "layout(location = 3) in vec4 twin;\n"
     "layout(location = 4) in vec2 polygonUV;\n"
+    "layout(location = 6) in vec3 polygonRGB;\n"
+    "layout(location = 7) in uvec4 gradientRG;\n"
+    "layout(location = 8) in uvec2 gradientB;\n"
     "layout(location = 5) in uvec4 gradientUV;\n"
     "uniform bool nativeGrid;\n"
+    "flat out uvec3 rgbOrigin;\n"
+    "flat out uvec3 rgbDx;\n"
+    "flat out uvec3 rgbDy;\n"
     "flat out uvec4 uvGradient;\n"
     "flat out ivec4 uvOrigin;\n"
     "uniform vec2 resolution;\n"
@@ -80,6 +86,9 @@ static const char vertex_shader_body[] = {
     "void main() {\n"
     "    polygon = uint(tex.w) & 0x2000u;\n"
     "    float bias = polygon != 0u && nativeGrid ? 0.5 : 0.0;\n"
+    "    rgbOrigin = uvec3(ivec3(polygonRGB * 4096.0));\n"
+    "    rgbDx = uvec3(gradientRG.xz, gradientB.x);\n"
+    "    rgbDy = uvec3(gradientRG.yw, gradientB.y);\n"
     "    uvGradient = gradientUV;\n"
     "    uvOrigin = ivec4(ivec2(pos + drawOffset), ivec2(polygonUV * 4096.0));\n"
     "    float x = ((bias + pos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
@@ -87,6 +96,7 @@ static const char vertex_shader_body[] = {
     "    gl_Position = vec4(x, y, 0.0, 1.0);\n"
     // gouraud colors
     "    vertexColor = color;\n"
+    "    if (polygon != 0u) vertexColor.rgb = polygonRGB / 255.0;\n"
     // select the right texture coords based on the tpage
     "    clut = uint(tex.z);\n"
     "    uint texWord = uint(tex.w);\n"
@@ -138,6 +148,9 @@ static const char fragment_shader_body[] = {
     "flat in ivec2 pageBase;\n"
     "flat in uvec4 texWindow;\n"
     "uniform sampler2D texVram;\n"
+    "flat in uvec3 rgbOrigin;\n"
+    "flat in uvec3 rgbDx;\n"
+    "flat in uvec3 rgbDy;\n"
     "flat in uvec4 uvGradient;\n"
     "flat in ivec4 uvOrigin;\n"
     "flat in uint polygon;\n"
@@ -209,13 +222,20 @@ static const char fragment_shader_body[] = {
     // when a color has the 0x8000 bit left then it has the semitrans flag on
     "    bool colorSemiTrans = texColor.a > 0.0;"
     // PS1-accurate texture-color modulation: (tex5 * col8) >> 7
+    "    vec3 color8 = vertexColor.rgb * (textureMode == 0u ? 255.0 : 127.5);\n"
+    "    float bias = polygon == 0u ? 0.5 : 0.0;\n"
+    "    if (polygon != 0u && nativeGrid) {\n"
+    "        uvec2 delta = uvec2(ivec2(gl_FragCoord.xy) - uvOrigin.xy);\n"
+    "        color8 = vec3(ivec3(rgbOrigin + rgbDx * delta.x + rgbDy * delta.y)) / 4096.0;\n"
+    "        bias = 1.0 / 8192.0;\n"
+    "    }\n"
     "    vec3 modColor;\n"
     "    if (textureMode == 0u) {\n"
     // untextured: PS1 uses color directly, no modulation
-    "        modColor = texColor.rgb * vertexColor.rgb;\n"
+    "        modColor = (color8 + (polygon != 0u ? bias : 0.0)) / 255.0;\n"
     "    } else {\n"
     "        vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);\n"
-    "        vec3 col8 = min(floor(vertexColor.rgb * 127.5 + 0.5), "
+    "        vec3 col8 = min(floor(color8 + bias), "
     "vec3(255.0));\n"
     "        vec3 prod8 = min(tex5 * col8 / 16.0, vec3(255.0));\n"
     "        modColor = dither != 0u ? prod8 / 255.0\n"
@@ -1057,6 +1077,14 @@ static void Draw_InitBuffer() {
     glEnableVertexAttribArray(4);
     glVertexAttribIPointer(5, 4, GL_UNSIGNED_INT, sizeof(Vertex), (void*)offsetof(Vertex, polygon_gradient));
     glEnableVertexAttribArray(5);
+    glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, polygon_rgb));
+    glEnableVertexAttribArray(6);
+    glVertexAttribIPointer(7, 4, GL_UNSIGNED_INT, sizeof(Vertex),
+                           (void*)(offsetof(Vertex, polygon_gradient) + 4 * sizeof(unsigned)));
+    glEnableVertexAttribArray(7);
+    glVertexAttribIPointer(8, 2, GL_UNSIGNED_INT, sizeof(Vertex),
+                           (void*)(offsetof(Vertex, polygon_gradient) + 8 * sizeof(unsigned)));
+    glEnableVertexAttribArray(8);
     glBindVertexArray(0);
 }
 
