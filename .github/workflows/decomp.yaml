@@ -39,4 +39,8 @@ jobs:
         working-directory: decomp/
         run: |
           make dependencies
-          (make clean && make -j$(nproc) all) || cat psyq400.map
+          make clean
+          make -j"$(nproc)" all || {
+            cat psyq400.map
+            exit 1
+          }
