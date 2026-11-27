@@ -17,6 +17,12 @@ set(PSYZ_TEST_SOURCES
 )
 
 add_executable(${PROJECT_NAME} ${PSYZ_TEST_SOURCES})
+# Fixture setup and teardown use assert even in release test binaries.
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /UNDEBUG)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -UNDEBUG)
+endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_link_libraries(${PROJECT_NAME} PRIVATE ztest psyz)
 # The D3D12 tests keep native, scaled and interpolation textures resident at 8x.
