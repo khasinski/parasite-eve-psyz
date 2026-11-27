@@ -41,6 +41,7 @@ enum { GRAIN_EMPTY, GRAIN_RENDERING, GRAIN_READY };
 static struct {
     unsigned transfer_addr;
     u16 capture_pos;
+    short main_volume[2];
     VoiceState voice[PSYZ_SPU_NUM_VOICES];
     short cd_ring[CD_RING_FRAMES * N_CHANNELS];
     unsigned cd_ring_read;
@@ -139,6 +140,7 @@ static void spu_reset_state(int hot) {
     }
     spu.transfer_addr = 0;
     spu.capture_pos = 0;
+    spu.main_volume[0] = spu.main_volume[1] = 0;
     memset(spu.voice, 0, sizeof(spu.voice));
     memset(spu.cd_ring, 0, sizeof(spu.cd_ring));
     spu.cd_ring_read = spu.cd_ring_count = 0;
@@ -698,13 +700,17 @@ typedef struct {
 
 } Mixer;
 
+static short direct_volume(unsigned short reg) {
+    return (reg & 0x8000) ? 0 : (short)(reg << 1);
+}
+
 static void mixer_init(Mixer* m) {
     volatile SPU_RXX* rxx = &_spu_RXX->rxx;
     m->cd_on = rxx->spucnt & SPU_CTRL_MASK_CD_AUDIO_ENABLE;
     m->cd_vol_l = rxx->cd_vol.left;
     m->cd_vol_r = rxx->cd_vol.right;
-    m->main_l = clamp15(rxx->main_vol.left);
-    m->main_r = clamp15(rxx->main_vol.right);
+    m->main_l = direct_volume(rxx->main_vol.left);
+    m->main_r = direct_volume(rxx->main_vol.right);
     m->cd_idle = 0;
 }
 
@@ -737,8 +743,10 @@ static inline void mix_frame(
         left += (cd_l * m->cd_vol_l) >> 15;
         right += (cd_r * m->cd_vol_r) >> 15;
     }
-    out[0] = clamp16((left * m->main_l) >> 14);
-    out[1] = clamp16((right * m->main_r) >> 14);
+    out[0] = (clamp16(left) * spu.main_volume[0]) >> 15;
+    out[1] = (clamp16(right) * spu.main_volume[1]) >> 15;
+    spu.main_volume[0] = m->main_l;
+    spu.main_volume[1] = m->main_r;
 }
 
 static void capture_advance(unsigned frames) {
