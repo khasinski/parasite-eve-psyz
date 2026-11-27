@@ -653,6 +653,47 @@ static int TestSpriteAtlasCommand(const u_long *words,int count,void *unused) {
 }
 #endif
 
+ZTEST(gpu, movie_frame_replaces_only_its_display_page) {
+#ifdef PSYZ_TEST_SDL_GPU
+    const char *path = "movie-frame-test.bmp";
+    SDL_Surface *surface = SDL_CreateSurface(640, 480, SDL_PIXELFORMAT_RGBA32);
+    zassert_ptr_ne(NULL, surface);
+    SDL_FillSurfaceRect(surface, NULL, SDL_MapSurfaceRGB(surface, 255, 0, 0));
+    zassert_s32_eq(1, SDL_SaveBMP(surface, path));
+    SDL_DestroySurface(surface);
+    DISPENV display;
+    SetDefDispEnv(&display, 0, 0, 320, 240);
+    PutDispEnv(&display);
+    SetDispMask(1);
+    RECT rect = {0, 0, 320, 240};
+    ClearImage(&rect, 0, 248, 0);
+    DrawSync(0);
+    zassert_s32_eq(1, Psyz_VideoSetMovieFrame(0, path));
+    remove(path);
+    int width, height;
+    unsigned char *pixels = Psyz_VideoAllocRenderedFrame(&width, &height);
+    zassert_ptr_ne(NULL, pixels);
+    zassert_s32_eq(640, width);
+    zassert_s32_eq(480, height);
+    zassert_s32_eq(255, pixels[(width * 200 + 300) * 3]);
+    free(pixels);
+    RECT sample = {100, 100, 2, 1};
+    u_long words = 0;
+    StoreImage(&sample, &words);
+    zassert_s32_eq(0x03e0, words & 0xffff);
+    display.disp.y = 240;
+    PutDispEnv(&display);
+    pixels = Psyz_VideoAllocRenderedFrame(&width, &height);
+    zassert_ptr_ne(NULL, pixels);
+    zassert_s32_eq(320, width);
+    free(pixels);
+    zassert_s32_eq(0, Psyz_VideoSetMovieFrame(0, path));
+    Psyz_VideoSetMovieFrame(-1, NULL);
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
 ZTEST(gpu, rgb24_hd_backdrop_preserves_native_ui_and_vram) {
 #if defined(__psyz) && !defined(__PSP__)
     const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;

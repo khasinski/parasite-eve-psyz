@@ -8,6 +8,7 @@ void Psyz_GpuSelectSpriteAtlas(uint64_t key, unsigned int cell) { (void)key; (vo
 int Psyz_GpuGetSpriteAtlasesEnabled(void) {return 0;}
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled) {(void)enabled;}
 void Psyz_GpuResetSpriteAtlases(void) {}
+int Psyz_VideoSetMovieFrame(int y,const char *path) {(void)y;(void)path;return 0;}
 int Psyz_VideoSetRgb24Backdrop(const char *p,const unsigned char *r,int w,int h,int t,int b) {(void)p;(void)r;(void)w;(void)h;(void)t;(void)b;return 0;}
 #include <math.h>
 #include <stdbool.h>

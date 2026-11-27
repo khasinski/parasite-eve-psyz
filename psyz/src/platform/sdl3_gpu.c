@@ -1980,6 +1980,50 @@ static SDL_GPUTexture *UploadDisplayImage(DisplayImage *image, SDL_Surface *surf
     return image->texture;
 }
 
+typedef struct {
+    int y;
+    SDL_Surface *surface;
+    DisplayImage gpu;
+    unsigned generation;
+} MovieFrame;
+
+static MovieFrame movie_frames[2];
+
+static MovieFrame *FindMovieFrame(int y) {
+    for (unsigned i = 0; i < 2; ++i)
+        if (movie_frames[i].surface && movie_frames[i].y == y) return &movie_frames[i];
+    return NULL;
+}
+
+int Psyz_VideoSetMovieFrame(int page_y, const char *filename) {
+    if (page_y < 0) {
+        for (unsigned i = 0; i < 2; ++i) {
+            SDL_DestroySurface(movie_frames[i].surface);
+            ReleaseDisplayImage(&movie_frames[i].gpu);
+            movie_frames[i] = (MovieFrame){0};
+        }
+        return 0;
+    }
+    MovieFrame *frame = FindMovieFrame(page_y);
+    if (!frame) {
+        if (!filename) return 0;
+        for (unsigned i = 0; i < 2; ++i)
+            if (!movie_frames[i].surface) { frame = &movie_frames[i]; break; }
+    }
+    if (!frame) return 0;
+    SDL_DestroySurface(frame->surface);
+    frame->surface = NULL;
+    if (!filename || UseSoftwareBackend()) return 0;
+    SDL_Surface *source = LoadHdImage(filename);
+    if (!source) return 0;
+    if (source->w > 0 && source->w <= 4096 && source->h > 0 && source->h <= 4096)
+        frame->surface = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(source);
+    frame->y = page_y;
+    ++frame->generation;
+    return frame->surface != NULL;
+}
+
 static SDL_GPUTexture* PrepareRgb24Display(void) {
     u8* rgb = Sdl3Common_ReadRgb24(
         display_area.x, display_area.y, display_size.x, display_size.y);
@@ -2441,10 +2485,16 @@ static void PlatformBackend_Present(void) {
        native_movie_active||
 #endif
        game_speed!=1)Psyz_GpuResetInterpolation();
-    SDL_GPUTexture* rgb24 =
-        disp_on && display_rgb24 && !debug_show_vram && (ws_capture_active || can_present)
-            ? PrepareRgb24Display()
-            : NULL;
+    MovieFrame *movie = disp_on && !debug_show_vram ? FindMovieFrame(display_area.y) : NULL;
+    SDL_GPUTexture *rgb24 = NULL;
+    bool replacing_movie = false;
+    if (disp_on && !debug_show_vram && (ws_capture_active || can_present)) {
+        if (movie) {
+            rgb24 = UploadDisplayImage(&movie->gpu, movie->surface, movie->generation);
+            replacing_movie = rgb24 != NULL;
+        }
+        if (!rgb24 && display_rgb24) rgb24 = PrepareRgb24Display();
+    }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         finish_time = SDL_GetPerformanceCounter();
@@ -2493,11 +2543,12 @@ static void PlatformBackend_Present(void) {
                 };
                 if (rgb24)
                     src = (SDL_GPUBlitRegion){.texture = rgb24,
-                                              .w = title_present_active ? title_gpu.width : display_size.x,
-                                              .h = title_present_active ? title_gpu.height : display_size.y};
+                                              .w = replacing_movie ? movie->gpu.width : title_present_active ? title_gpu.width : display_size.x,
+                                              .h = replacing_movie ? movie->gpu.height : title_present_active ? title_gpu.height : display_size.y};
                 float game_aspect =
                     GetCurrentGameAspectRatio(display_size.x, display_size.y);
-                if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
+                if (replacing_movie) game_aspect = 4.0f / 3.0f;
+                else if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
 #ifdef PE_PS5_GPU_NATIVE
                 if(native_movie_active)game_aspect=4.0f/3.0f; /* Original PS1 video display aspect, independent of scene-wide mode. */
 #endif
@@ -2779,6 +2830,7 @@ static void QuitPlatform(void) {
             pipe_clear = NULL;
         }
         Psyz_VideoSetRgb24Backdrop(NULL,NULL,0,0,0,0);
+        Psyz_VideoSetMovieFrame(-1, NULL);
         ReleaseDisplayImage(&title_gpu);
         title_generation = 0;
         ReleaseTransientDisplayTextures();
@@ -2975,7 +3027,8 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     Draw_FlushBuffer();
     if (!UseSoftwareBackend())
         ApplyPendingInternalRes();
-    if (!UseSoftwareBackend() && display_rgb24 && title_image) {
+    MovieFrame *movie = disp_on && !debug_show_vram ? FindMovieFrame(display_area.y) : NULL;
+    if (!movie && !UseSoftwareBackend() && display_rgb24 && title_image) {
         u8 *native=Sdl3Common_ReadRgb24(display_area.x,display_area.y,display_size.x,display_size.y);
         SDL_Surface *enhanced=native?BuildTitleDisplay(native):NULL;free(native);
         if (enhanced) {
@@ -2985,14 +3038,14 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
             *w=enhanced->w;*h=enhanced->h;return pixels;
         }
     }
-    if (UseSoftwareBackend() || display_rgb24 ||
-        (!scaled_vram_render && !widescreen && !interp_present_mid)) {
+    if (!movie && (UseSoftwareBackend() || display_rgb24 ||
+        (!scaled_vram_render && !widescreen && !interp_present_mid))) {
         unsigned char* pixels = Psyz_VideoAllocCapturedFrame(w, h);
         if (!pixels)
             *w = *h = 0;
         return pixels;
     }
-    if ((!scaled_vram_render && !widescreen && !interp_present_mid) || display_area.x < 0 ||
+    if ((!movie && !scaled_vram_render && !widescreen && !interp_present_mid) || display_area.x < 0 ||
         display_area.y < 0 || display_size.x <= 0 || display_size.y <= 0 ||
         display_area.x > VRAM_W - display_size.x ||
         display_area.y > VRAM_H - display_size.y)
@@ -3001,8 +3054,14 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
     unsigned width = (unsigned)display_size.x * output_scale;
     unsigned height = (unsigned)display_size.y * output_scale;
     bool capture_widescreen = widescreen && !debug_show_vram;
-    if (capture_widescreen) {
-        width = (height * 16u + 4u) / 9u;
+    if (capture_widescreen || movie) {
+        if (movie) {
+            height = movie->surface->h;
+            width = (height * (widescreen ? 16u : 4u) + (widescreen ? 4u : 1u)) /
+                    (widescreen ? 9u : 3u);
+        } else {
+            width = (height * 16u + 4u) / 9u;
+        }
         if (!ws_capture || ws_capture_width != width ||
             ws_capture_height != height) {
             if (ws_capture)
@@ -3051,7 +3110,7 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         .y = (Uint32)(interp_present_mid?interp_next_y:display_area.y) * internal_res,
         .w = (Uint32)display_size.x * internal_res,
         .h = (Uint32)display_size.y * internal_res};
-    if (capture_widescreen)
+    if (capture_widescreen || movie)
         visible =
             (SDL_GPUBlitRegion){.texture = ws_capture, .w = width, .h = height};
     else if (antialiasing) {
