@@ -119,8 +119,13 @@ short ratan_tbl[] = {
     0x0000, 0x0000,
 };
 
+#ifdef __psyz
 int ratan2(int dx, int dy) {
     int ret;
+#else
+long ratan2(long dx, long dy) {
+    long ret;
+#endif
     int flag0;
     int flag1;
     int lookup;
