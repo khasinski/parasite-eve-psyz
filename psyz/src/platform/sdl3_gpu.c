@@ -3671,11 +3671,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     }
     display_double_height = mode->vertical_resolution;
     display_size.y = set_disp_vert * (display_double_height ? 2 : 1);
-    if (UseSoftwareBackend()) {
-        UpdateTargetFramerate(mode->pal ? VSYNC_PAL : VSYNC_NTSC);
-        return;
-    }
-    ApplyDisplayPendingChanges();
+    if (!UseSoftwareBackend())
+        ApplyDisplayPendingChanges();
 
     double new_target_fps = mode->pal ? VSYNC_PAL : VSYNC_NTSC;
     if (new_target_fps != target_frame_rate) {
